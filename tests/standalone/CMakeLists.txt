@@ -16,7 +16,14 @@
 
 cmake_minimum_required(VERSION 3.22)
 
-project(spatcore-standalone-tests VERSION 0.1.0 LANGUAGES C CXX)
+project(spatcore-standalone-tests VERSION 0.1.1 LANGUAGES C CXX)
+
+# spatcore consumer contract: on Apple with Makefile/Ninja generators the
+# OBJCXX compile rules must exist at the top level, because JUCE module
+# sources are .mm and attach to consumer targets (see spatcore/CMakeLists.txt).
+if(APPLE)
+    enable_language(OBJCXX)
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

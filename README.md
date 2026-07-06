@@ -28,11 +28,21 @@ each contract fails loudly if unmet:
 
 - **JUCE**: `juce::*` module targets must exist before `add_subdirectory(spatcore)`
   (bring your own JUCE via `add_subdirectory`).
+- **OBJCXX on Apple**: with the Makefile/Ninja generators, call
+  `enable_language(OBJCXX)` in your **top-level** CMakeLists before adding
+  spatcore — JUCE module sources are `.mm` on Apple and compile inside *your*
+  targets, and CMake only loads a language's compile rules into the enabling
+  directory scope and below. spatcore fails at configure with instructions if
+  this is missing. (The Xcode generator doesn't need it.)
 - **juce_simpleweb** (GPLv3): `juce_add_module()` it yourself — needed by the MCP
   transport in `spatcore-control`.
-- **hidapi**: set `SPATCORE_HIDAPI_INCLUDE_DIR` (headers only; you compile the
-  platform implementation) — needed by `spatcore-controllers`
-  (`SPATCORE_CONTROLLERS=OFF` drops the requirement).
+- **hidapi**: set `SPATCORE_HIDAPI_INCLUDE_DIR` to a directory containing
+  `hidapi/hidapi.h` (headers only; you compile the platform implementation) —
+  needed by `spatcore-controllers` (`SPATCORE_CONTROLLERS=OFF` drops the
+  requirement). A trimmed vendored copy and a full libusb/hidapi checkout both
+  work: spatcore stages the headers into a private include tree, so stray files
+  in that directory (e.g. hidapi's root `VERSION` file, which would otherwise
+  shadow libc++'s `<version>` on macOS) never reach the include path.
 - **roli_blocks_basics**: `juce_add_module()` — Lightpad support, also under
   `SPATCORE_CONTROLLERS`.
 

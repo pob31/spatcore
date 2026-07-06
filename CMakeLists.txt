@@ -24,10 +24,31 @@
 
 cmake_minimum_required(VERSION 3.22)
 
-project(spatcore VERSION 0.1.0 LANGUAGES C CXX)
+project(spatcore VERSION 0.1.1 LANGUAGES C CXX)
 
-# Metal backends (.mm) only exist on Apple.
+# Metal backends (.mm) are Objective-C++ — and on Apple, JUCE's module sources
+# are .mm too, attached to whichever target links the module, INCLUDING the
+# consumer's own app target. CMake loads a language's compile rules only into
+# the directory scope that enables it (and below), so enabling OBJCXX here
+# covers spatcore's targets but cannot cover the consumer's. With the
+# Makefile/Ninja generators the consumer must enable OBJCXX at its top level
+# BEFORE add_subdirectory(spatcore), or generation fails with the cryptic
+# "Missing variable is: CMAKE_OBJCXX_COMPILE_OBJECT". Fail at configure with
+# instructions instead. (The Xcode generator infers languages per file and
+# needs none of this.)
 if(APPLE)
+    if(NOT CMAKE_GENERATOR STREQUAL "Xcode" AND NOT DEFINED CMAKE_OBJCXX_COMPILE_OBJECT)
+        message(FATAL_ERROR
+            "spatcore: OBJCXX is not enabled in the consumer's top-level "
+            "CMakeLists. On Apple with the \"${CMAKE_GENERATOR}\" generator, add\n"
+            "    if(APPLE)\n"
+            "        enable_language(OBJCXX)\n"
+            "    endif()\n"
+            "after project() and BEFORE add_subdirectory(spatcore), so the "
+            "Objective-C++ compile rules exist in every directory that compiles "
+            ".mm sources (JUCE module sources are .mm on Apple and attach to the "
+            "consumer's own targets). See tests/standalone/CMakeLists.txt.")
+    endif()
     enable_language(OBJCXX)
 endif()
 
@@ -236,15 +257,34 @@ if(SPATCORE_CONTROLLERS)
             "ThirdParty/hidapi; see spatcore/tests/standalone/CMakeLists.txt.")
     endif()
 
+    if(NOT EXISTS "${SPATCORE_HIDAPI_INCLUDE_DIR}/hidapi/hidapi.h")
+        message(FATAL_ERROR
+            "spatcore: SPATCORE_HIDAPI_INCLUDE_DIR "
+            "(${SPATCORE_HIDAPI_INCLUDE_DIR}) does not contain hidapi/hidapi.h.")
+    endif()
+
     add_library(spatcore-controllers STATIC
         controllers/SpatcoreControllersCompileCheck.cpp
         controllers/touch/linux/EvdevTouchDevice.cpp
         controllers/touch/linux/EvdevTouchManager.cpp
     )
 
+    # Stage the hidapi headers into a private include tree rather than putting
+    # the consumer's directory itself on the include path. An official
+    # libusb/hidapi checkout has a VERSION file at its root; on case-insensitive
+    # filesystems (macOS) libc++'s internal `#include <version>` resolves to it
+    # and every TU in every target inheriting this PUBLIC include dir explodes.
+    # Staging keeps the documented contract ("a directory containing
+    # hidapi/hidapi.h" — a trimmed vendored copy and a full hidapi checkout both
+    # work) while guaranteeing nothing else leaks onto the include path.
+    set(_spatcore_hidapi_stage "${CMAKE_CURRENT_BINARY_DIR}/hidapi-include")
+    file(COPY "${SPATCORE_HIDAPI_INCLUDE_DIR}/hidapi"
+         DESTINATION "${_spatcore_hidapi_stage}"
+         FILES_MATCHING PATTERN "*.h")
+
     target_include_directories(spatcore-controllers PUBLIC
         "${SPATCORE_INCLUDE_ROOT}"
-        "${SPATCORE_HIDAPI_INCLUDE_DIR}")
+        "${_spatcore_hidapi_stage}")
 
     # JUCE module deps as measured from spatcore/controllers includes (2026-07):
     #   juce_graphics         streamdeck button/LCD rendering + JPEG packing,
