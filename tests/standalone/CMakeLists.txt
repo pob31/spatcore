@@ -18,12 +18,11 @@ cmake_minimum_required(VERSION 3.22)
 
 project(spatcore-standalone-tests VERSION 0.1.1 LANGUAGES C CXX)
 
-# spatcore consumer contract: on Apple with Makefile/Ninja generators the
-# OBJCXX compile rules must exist at the top level, because JUCE module
-# sources are .mm and attach to consumer targets (see spatcore/CMakeLists.txt).
-if(APPLE)
-    enable_language(OBJCXX)
-endif()
+# spatcore's consumer helpers (OBJCXX enable, juce_simpleweb fixups, ...) — the
+# same module apps use, so this reference wiring exercises the contract too.
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../../cmake")
+include(SpatcoreConsumer)
+spatcore_enable_consumer_languages()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -31,33 +30,15 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 set(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../..")
 
-# Consumer side of spatcore's consumer-provides-JUCE contract (same pattern
-# as Plugin/CMakeLists.txt): JUCE first, then the vendored simpleweb module.
+# Consumer-provides contract: JUCE first, then the simpleweb module (with its
+# stub + OpenSSL-strip fixups) via the helper.
 add_subdirectory("${REPO_ROOT}/ThirdParty/JUCE" "${CMAKE_CURRENT_BINARY_DIR}/juce" EXCLUDE_FROM_ALL)
-juce_add_module("${REPO_ROOT}/ThirdParty/juce_simpleweb")
+spatcore_add_juce_simpleweb("${REPO_ROOT}/ThirdParty/juce_simpleweb")
 
-# juce_simpleweb's .cpps include a Projucer-style "JuceHeader.h"; give every
-# target that compiles the module sources this minimal stub (Plugin/
-# CMakeLists.txt does the same via Source/JuceHeaderStub).
-target_include_directories(juce_simpleweb INTERFACE
-    "${CMAKE_CURRENT_SOURCE_DIR}/JuceHeaderStub")
-
-# The module header declares `windowsLibs: libssl,libcrypto` / `OSXLibs: ...`
-# unconditionally, but spatcore-control builds it with
-# SIMPLEWEB_SECURE_SUPPORTED=0 (plain HTTP/WS - no TLS code paths, no
-# OpenSSL). Strip the never-referenced import libs from the module's link
-# interface so consumers don't need an OpenSSL SDK (Plugin/CMakeLists.txt
-# does the same for macOS).
-get_target_property(_sw_libs juce_simpleweb INTERFACE_LINK_LIBRARIES)
-if(_sw_libs)
-    list(REMOVE_ITEM _sw_libs libssl libcrypto z)
-    set_target_properties(juce_simpleweb PROPERTIES INTERFACE_LINK_LIBRARIES "${_sw_libs}")
-endif()
-
-# Consumer side of spatcore-controllers' contracts: the ROLI BLOCKS module
-# for the Lightpad driver, and the vendored hidapi HEADERS for the HID
-# drivers (headers only - hid_* impls live in the final app, so the test
-# build never links a HID backend).
+# Controllers side: the ROLI BLOCKS module for the Lightpad driver, and the
+# hidapi HEADERS for the HID drivers. The tests compile the controller sources
+# but never link a HID backend (hid_* impls live in the final app), so expose
+# the headers rather than building the hidapi lib.
 juce_add_module("${REPO_ROOT}/ThirdParty/roli_blocks_basics")
 set(SPATCORE_HIDAPI_INCLUDE_DIR "${REPO_ROOT}/ThirdParty/hidapi")
 

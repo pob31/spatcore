@@ -61,6 +61,12 @@ option(SPATCORE_STANDALONE_TESTS
 option(SPATCORE_CONTROLLERS
     "Build spatcore-controllers (needs hidapi headers + roli_blocks_basics module)" ON)
 
+# Control plane (OSC + ValueTree state + MCP server). OFF-able because a
+# pure-audio consumer (or an audio-only build/example) may not want the
+# juce_simpleweb dependency the MCP transport needs.
+option(SPATCORE_CONTROL
+    "Build spatcore-control (needs the juce_simpleweb module)" ON)
+
 # ---------------------------------------------------------------------------
 # Consumer-provides-JUCE contract
 # ---------------------------------------------------------------------------
@@ -73,13 +79,14 @@ if(NOT TARGET juce::juce_core)
         "ThirdParty/JUCE.")
 endif()
 
-if(NOT TARGET juce_simpleweb)
+if(SPATCORE_CONTROL AND NOT TARGET juce_simpleweb)
     message(FATAL_ERROR
         "spatcore: no juce_simpleweb target (needed by spatcore-control's "
         "MCPTransport). The consumer must register the vendored module with "
-        "juce_add_module(<path>/juce_simpleweb) after adding JUCE. Inside "
-        "the WFS-DIY repo the module lives at ThirdParty/juce_simpleweb; see "
-        "spatcore/tests/standalone/CMakeLists.txt or Plugin/CMakeLists.txt.")
+        "juce_add_module(<path>/juce_simpleweb) after adding JUCE, or configure "
+        "with -DSPATCORE_CONTROL=OFF. Inside the WFS-DIY repo the module lives "
+        "at ThirdParty/juce_simpleweb; see spatcore/tests/standalone/"
+        "CMakeLists.txt or Plugin/CMakeLists.txt.")
 endif()
 
 include("${CMAKE_CURRENT_LIST_DIR}/cmake/SpatcoreCompileFlags.cmake")
@@ -171,6 +178,7 @@ spatcore_apply_compile_flags(spatcore-audio)
 # ---------------------------------------------------------------------------
 # spatcore-control
 # ---------------------------------------------------------------------------
+if(SPATCORE_CONTROL)
 add_library(spatcore-control STATIC
     control/osc/OSCIngestQueue.cpp
     control/osc/OSCRateLimiter.cpp
@@ -218,6 +226,7 @@ target_link_libraries(spatcore-control PUBLIC
 set_target_properties(spatcore-control PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 spatcore_apply_compile_flags(spatcore-control)
+endif()  # SPATCORE_CONTROL
 
 # ---------------------------------------------------------------------------
 # spatcore-controllers

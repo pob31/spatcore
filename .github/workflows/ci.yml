@@ -1,0 +1,44 @@
+name: CI
+
+# spatcore has no app of its own, so CI builds the minimal consumer example
+# (examples/minimal-app). It fetches its own JUCE + juce_simpleweb, so it
+# exercises the CMake-native consumer contract standalone — including the
+# Apple OBJCXX / Metal-backend compile path that regressed the first real
+# consumer (XOA) before this guard existed.
+
+on:
+  push:
+    branches: [main, "feature/**", "fix/**"]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  example:
+    name: minimal-app (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-2025,  name: windows }
+          - { os: macos-latest,  name: macos }
+          - { os: ubuntu-latest, name: linux }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install JUCE build deps (Linux)
+        if: matrix.name == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkg-config libasound2-dev \
+              libfreetype6-dev libfontconfig1-dev libgl1-mesa-dev libcurl4-openssl-dev
+
+      - name: Configure
+        run: cmake -S examples/minimal-app -B examples/minimal-app/build -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build (Debug)
+        run: cmake --build examples/minimal-app/build --config Debug --parallel
