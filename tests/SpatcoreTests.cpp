@@ -29,6 +29,8 @@
 #include "spatcore/dsp/DelayTargetSmoother.h"
 #include "spatcore/control/osc/OSCSerializer.h"
 #include "spatcore/control/osc/OSCParser.h"
+#include "spatcore/reverb/ReverbSDNAlgorithm.h"
+#include "spatcore/reverb/ReverbFDNAlgorithm.h"
 
 #include <cmath>
 #include <cstdio>
@@ -329,6 +331,134 @@ static void testGpuHostWorkPoolCrossGenBarrier()
 }
 
 //==============================================================================
+// SDN output level vs node count.
+//
+// Renders the algorithm's impulse response (node-feed impulse in, per-node wet
+// out) and integrates total output energy across all nodes. Historically the
+// SDN staging (1/N injection x (1+18/N)*0.25 output gain) made the reverb
+// drop several dB as the mesh grew — a 19-node venue mesh sat ~5-10 dB under
+// the documented 9-13 node sweet spot and far under FDN at the same wet level.
+// The output gain law k*N/sqrt(N-1) flattens the sparse-feed response vs N;
+// this test measures the curve and pins it.
+namespace sdnlevel {
+
+constexpr double kSr = 48000.0;
+constexpr int    kBlock = 512;
+
+static void ringGeometry (std::vector<spatcore::reverb::NodePosition>& nodes, int n)
+{
+    nodes.resize (static_cast<size_t> (n));
+    for (int i = 0; i < n; ++i)
+    {
+        const float a = juce::MathConstants<float>::twoPi * (float) i / (float) n;
+        nodes[(size_t) i] = { 4.0f * std::sin (a), 4.0f * std::cos (a), 3.0f };
+    }
+}
+
+// Total impulse-response energy summed over all node outputs, in dB.
+static double measureEnergyDb (spatcore::reverb::ReverbAlgorithm& algo,
+                               int numNodes, bool feedAllNodes, double seconds)
+{
+    const int totalSamples = (int) (kSr * seconds);
+    juce::AudioBuffer<float> in (numNodes, kBlock), out (numNodes, kBlock);
+    double energy = 0.0;
+    bool impulseSent = false;
+
+    for (int done = 0; done < totalSamples; done += kBlock)
+    {
+        in.clear();
+        out.clear();
+        if (! impulseSent)
+        {
+            const int last = feedAllNodes ? numNodes : 1;
+            for (int n = 0; n < last; ++n)
+                in.setSample (n, 0, 1.0f);
+            impulseSent = true;
+        }
+
+        algo.processBlock (in, out, kBlock);
+
+        for (int n = 0; n < numNodes; ++n)
+        {
+            const float* p = out.getReadPointer (n);
+            for (int s = 0; s < kBlock; ++s)
+                energy += (double) p[s] * (double) p[s];
+        }
+    }
+
+    return 10.0 * std::log10 (juce::jmax (energy, 1e-30));
+}
+
+static double sdnEnergyDb (int numNodes, bool feedAllNodes, double seconds = 2.0)
+{
+    spatcore::reverb::SDNAlgorithm sdn;
+    sdn.prepare (kSr, kBlock, numNodes);
+
+    std::vector<spatcore::reverb::NodePosition> nodes;
+    ringGeometry (nodes, numNodes);
+    sdn.updateGeometry (nodes);
+
+    spatcore::reverb::AlgorithmParameters params;
+    params.rt60 = 2.0f;
+    sdn.setParameters (params);
+
+    return measureEnergyDb (sdn, numNodes, feedAllNodes, seconds);
+}
+
+static double fdnEnergyDb (int numNodes, double seconds = 2.0)
+{
+    spatcore::reverb::FDNAlgorithm fdn;
+    fdn.prepare (kSr, kBlock, numNodes);
+
+    spatcore::reverb::AlgorithmParameters params;
+    params.rt60 = 2.0f;
+    fdn.setParameters (params);
+
+    // FDN nodes are independent; a single-node feed exercises one FDN.
+    return measureEnergyDb (fdn, numNodes, false, seconds);
+}
+
+} // namespace sdnlevel
+
+static void testSdnLevelVsNodeCount()
+{
+    using namespace sdnlevel;
+
+    const int counts[] = { 9, 11, 13, 19, 25, 32 };
+    constexpr int numCounts = (int) (sizeof (counts) / sizeof (counts[0]));
+
+    const double fdnRefDb  = fdnEnergyDb (11);
+    const double anchorDb  = sdnEnergyDb (11, false);
+    std::printf ("SDN level vs node count (impulse-response energy, rt60=2s):\n");
+    std::printf ("  FDN reference (any N, independent nodes): %+7.2f dB\n", fdnRefDb);
+
+    // Absolute anchor: the N=11 sweet-spot level is the calibration point of
+    // the k=0.1895 constant (chosen to preserve the pre-renormalization
+    // hand-tuned level). Moving it means deliberately recalibrating k.
+    CHECK (std::abs (anchorDb - (-6.0)) < 1.0);
+
+    // SDN should sit in the same loudness ballpark as FDN at the sweet spot.
+    CHECK (std::abs (anchorDb - fdnRefDb) < 3.0);
+
+    for (int i = 0; i < numCounts; ++i)
+    {
+        const int n = counts[i];
+        const double sparseDb = sdnEnergyDb (n, false);
+        const double denseDb  = sdnEnergyDb (n, true);
+        std::printf ("  N=%2d  sparse %+7.2f dB   dense %+7.2f dB\n",
+                     n, sparseDb, denseDb);
+
+        // Level must be ~flat vs node count (this was the venue bug: the old
+        // (1+18/N)*0.25 law drooped ~6 dB from N=9 to N=19).
+        CHECK (std::abs (sparseDb - anchorDb) < 1.5);
+
+        // Dense feed (all nodes hit with a unity impulse at once, input
+        // energy = N = 10*log10(N) dB) must not run away.
+        CHECK (denseDb < 10.0 * std::log10 ((double) n) + 3.0);
+    }
+}
+
+//==============================================================================
 int main()
 {
     try
@@ -340,6 +470,7 @@ int main()
         testRtThreadPriority();
         testGpuHostWorkPoolDeterminism();
         testGpuHostWorkPoolCrossGenBarrier();
+        testSdnLevelVsNodeCount();
     }
     catch (const std::exception& e)
     {

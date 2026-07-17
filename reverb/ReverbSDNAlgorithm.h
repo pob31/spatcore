@@ -72,9 +72,16 @@ public:
         toneCoeff = 1.0f - std::exp (-juce::MathConstants<float>::twoPi
                         * 8000.0f / static_cast<float> (sr));
 
-        // Output gain compensation: sparser networks need more boost
+        // Output gain compensation: k*N/sqrt(N-1) cancels the 1/N input
+        // injection and the sqrt(N-1) power-sum of node returns, so total
+        // returned energy stays ~flat vs node count (single-node-feed IR
+        // energy measured flat within ~1 dB for N=9..32; pinned by
+        // testSdnLevelVsNodeCount). k = 0.1895 preserves the previous
+        // hand-tuned level at the N=11 sweet spot; gain peaks at ~1.09 at
+        // the MAX_NODES=32 cap. Keep in sync with gpu/SdnHostConfig.h.
         if (numActiveNodes >= 2)
-            sdnOutputGain = (1.0f + 18.0f / static_cast<float> (numActiveNodes)) * 0.25f;
+            sdnOutputGain = 0.1895f * static_cast<float> (numActiveNodes)
+                            / std::sqrt (static_cast<float> (numActiveNodes - 1));
         else
             sdnOutputGain = 1.0f;
     }
@@ -550,7 +557,7 @@ private:
 
     // Output processing
     float toneCoeff = 0.65f;       // One-pole LPF coefficient (~8kHz at 48kHz)
-    float sdnOutputGain = 1.0f;    // Level compensation vs FDN/IR (-12dB flat cut)
+    float sdnOutputGain = 1.0f;    // k*N/sqrt(N-1) — N-invariant level compensation
 };
 
 } // namespace spatcore::reverb

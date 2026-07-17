@@ -73,7 +73,7 @@ public:
     // Global scalars.
     float diffusionCoeff = 0.0f;     // diffusion * 0.5
     float toneCoeff = 0.0f;          // one-pole 8 kHz LPF
-    float sdnOutputGain = 1.0f;      // (1 + 18/N) * 0.25 for N>=2
+    float sdnOutputGain = 1.0f;      // k*N/sqrt(N-1) for N>=2 (N-invariant level)
     float inputDistribution = 1.0f;  // 1/N
 
     // Last-seen geometry inputs (so an sdnScale-only param change can recompute
@@ -123,7 +123,11 @@ public:
 
         toneCoeff = 1.0f - std::exp (-TWO_PI * 8000.0f / (float) sr);
 
-        sdnOutputGain = numNodes >= 2 ? (1.0f + 18.0f / (float) numNodes) * 0.25f : 1.0f;
+        // N-invariant output compensation, bit-identical to
+        // SDNAlgorithm::prepare (see the derivation comment there).
+        sdnOutputGain = numNodes >= 2
+            ? 0.1895f * (float) numNodes / std::sqrt ((float) (numNodes - 1))
+            : 1.0f;
         inputDistribution = 1.0f / (float) numNodes;
 
         positions.clear();
