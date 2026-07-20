@@ -61,14 +61,12 @@ public:
         smootherDirect.resize(static_cast<size_t>(numInputs));
         smootherFR.resize(static_cast<size_t>(numInputs));
 
-        // Diffusion grain state (one per input): shared zone-mapped model, see
-        // FrDiffusionModel.h. Keys are per (input, output) so every routing
+        // Diffusion jitter state (one per input): shared Max-prototype model,
+        // see FrDiffusionModel.h. Keys are per (input, output) so every routing
         // pair has an independent noise stream.
-        frDiffusionState.resize(static_cast<size_t>(numInputs), 0.0f);
+        frDiffusionState.resize(static_cast<size_t>(numInputs));
         frJitterKey.resize(static_cast<size_t>(numInputs), 0u);
         frJitterCoeffs.resize(static_cast<size_t>(numInputs));
-        frJitterPrev.resize(static_cast<size_t>(numInputs), 0.0f);
-        frJitterCurr.resize(static_cast<size_t>(numInputs), 0.0f);
         frLastLevel.resize(static_cast<size_t>(numInputs), 0.0f);
 
         // Allocate FR filter enable flags and diffusion amounts (per input)
@@ -146,9 +144,12 @@ public:
         sampleCounter = 0;
 
         // Per-input noise stream keys: distinct per (input, output) so every
-        // routing pair's grain is an independent stream (see FrDiffusionModel.h).
+        // routing pair's jitter is an independent stream (see FrDiffusionModel.h).
         for (size_t i = 0; i < frJitterKey.size(); ++i)
+        {
             frJitterKey[i] = FrDiffusion::makeKey (static_cast<int> (i), outputChannelIndex);
+            FrDiffusion::resetState (frDiffusionState[i], frJitterKey[i]);
+        }
     }
 
     /** Set shared input buffer pointers (called once at prepare time). */
@@ -203,9 +204,8 @@ public:
             frHighShelfFilters[i].reset();
             frHFFilters[i].reset();
         }
-        std::fill(frDiffusionState.begin(), frDiffusionState.end(), 0.0f);
-        std::fill(frJitterPrev.begin(), frJitterPrev.end(), 0.0f);
-        std::fill(frJitterCurr.begin(), frJitterCurr.end(), 0.0f);
+        for (size_t i = 0; i < frDiffusionState.size(); ++i)
+            FrDiffusion::resetState(frDiffusionState[i], frJitterKey[i]);
         std::fill(frLastLevel.begin(), frLastLevel.end(), 0.0f);
     }
 
@@ -382,22 +382,15 @@ private:
         if (delayBufferLength == 0 || delayData == nullptr || frDelayData == nullptr)
             return;
 
-        // Per-block diffusion from the shared zone-map model. The noise is
-        // stepped ONCE PER BLOCK per input and ramped linearly across the
-        // block (GPU prev->curr semantics): per-sample stepping put a white
-        // micro-walk on the write position, which this scatter architecture
-        // turned into audible hiss (skipped/doubled cells).
-        ++frJitterBlockIndex;
+        // Per-block diffusion coefficients from the shared Max-prototype model.
+        // The jitter is stepped PER SAMPLE in the FR write branch below - the
+        // signal is slew-limited by the rampsmooth pole, so per-sample stepping
+        // is smooth (the old scatter-hiss concern applied to unsmoothed noise
+        // steps, which skipped/doubled write cells).
         for (size_t i = 0; i < frJitterCoeffs.size(); ++i)
-        {
             frJitterCoeffs[i] = FrDiffusion::computeCoeffs(
                 frDiffusionAmount[i].load(std::memory_order_acquire),
-                static_cast<float>(currentSampleRate), static_cast<float>(numSamples));
-            frJitterPrev[i] = frJitterCurr[i];
-            frJitterCurr[i] = FrDiffusion::step(frDiffusionState[i], frJitterBlockIndex,
-                                                frJitterKey[i], frJitterCoeffs[i]);
-        }
-        const float frJitterInvLen = 1.0f / static_cast<float>(numSamples);
+                static_cast<float>(currentSampleRate));
 
         // Precompute current delay values per input for interpolation
         float msToSamples = (float)currentSampleRate / 1000.0f;
@@ -468,6 +461,13 @@ private:
 
                 if (sharedFRHFAttenuation != nullptr)
                     frHFFilters[inIdx].setGainDb(sharedFRHFAttenuation[routingIndex]);
+            }
+            else
+            {
+                // FR tap silent this block: advance the diffusion stream in one
+                // O(1) span so it stays phase-consistent with active streams.
+                FrDiffusion::advanceSpan(frDiffusionState[inIdx], frJitterKey[inIdx],
+                                         frJitterCoeffs[inIdx], numSamples);
             }
         }
 
@@ -544,15 +544,16 @@ private:
                     // Smoothed FR delay + teleport gain envelope (independent smoother)
                     auto smoothedFr = smootherFR[inIdx].smoothedAt (currentSample);
 
-                    // Diffusion grain (shared model): block-stepped, ramped across
-                    // the block (GPU prev->curr semantics), added POST-smoother.
-                    const float frJitterT = static_cast<float> (sample + 1) * frJitterInvLen;
-                    const float jitterSamples = frJitterPrev[inIdx]
-                        + (frJitterCurr[inIdx] - frJitterPrev[inIdx]) * frJitterT;
+                    // Diffusion jitter (shared Max-prototype model): per-sample,
+                    // unipolar (delay only lengthens), added POST-smoother.
+                    const float jitterSamples = FrDiffusion::processSample(
+                        frDiffusionState[inIdx], frJitterKey[inIdx], frJitterCoeffs[inIdx]);
 
                     float frDelaySamples = smoothedFr.delay + jitterSamples;
                     if (frDelaySamples < 0.0f)
                         frDelaySamples = 0.0f;
+                    if (frDelaySamples > (float)(delayBufferLength - 2))
+                        frDelaySamples = (float)(delayBufferLength - 2);
 
                     // Calculate write position with FR delay offset
                     float exactWritePos = (float)writePosition + frDelaySamples;
@@ -638,12 +639,10 @@ private:
     // axis for DelayTargetSmoother::observe() / smoothedAt().
     std::int64_t sampleCounter = 0;
 
-    // FR diffusion grain (shared zone-mapped model, see FrDiffusionModel.h)
-    std::vector<float> frDiffusionState;          // one-pole LP value per input (the grain)
+    // FR diffusion jitter (shared Max-prototype model, see FrDiffusionModel.h)
+    std::vector<FrDiffusion::State> frDiffusionState; // per-input noise/amp/smooth stream state
     std::vector<uint32_t> frJitterKey;            // per-input noise stream key (folds output idx)
     std::vector<FrDiffusion::Coeffs> frJitterCoeffs; // per-input per-block coefficients
-    std::vector<float> frJitterPrev, frJitterCurr;   // block-boundary jitter (ramped per sample)
-    uint32_t frJitterBlockIndex = 0;                 // noise step index (one per block)
     std::vector<float> frLastLevel;               // previous block's FR level per input (engage detect)
     std::atomic<float>* frDiffusionAmount = nullptr; // Diffusion fraction 0..1 per input
     int storedNumInputs = 0;  // Store for cleanup
