@@ -222,6 +222,35 @@ public:
         diffusionCoeff = diffusion * 0.5f;
     }
 
+    /** Largest window of samples the nodes can be swept in parallel without any
+        node reading a delay-line cell another node writes inside that window.
+
+        Byte-for-byte the same bound as SDNAlgorithm::chunkSamplesForBlock — see
+        the derivation there. Both branches matter:
+          • s − s' = −D            → safe iff C <= D
+          • s − s' = MAX_DELAY − D → safe iff C <= MAX_DELAY − D  (ring wrap)
+        and D must be the EFFECTIVE delay, because a crossfading path reads both
+        the old and the new tap for the ~10 ms ramp.
+
+        On the GPU a chunk boundary is a KERNEL-LAUNCH boundary (the grid-wide
+        barrier), since the node-parallel kernel spreads nodes across blocks and
+        __syncthreads() only orders one block. */
+    int chunkSamplesForBlock (int numSamples) const
+    {
+        if (numNodes < 2 || (int) delayLength.size() < numPaths)
+            return 1;
+
+        int c = numSamples;
+        for (int p = 0; p < numPaths; ++p)
+        {
+            const int d = (crossfadeMix[(size_t) p] >= 1.0f)
+                            ? delayLength[(size_t) p]
+                            : std::min (delayLength[(size_t) p], targetDelayLength[(size_t) p]);
+            c = std::min (c, std::min (d, MAX_DELAY_SAMPLES - d));
+        }
+        return std::max (1, c);
+    }
+
     /** Advances the per-path crossfade once per block, latching the new delay on
         completion (SDNAlgorithm::processBlock post-block loop). Returns true if
         any path was crossfading at entry (its uploaded state changed). */
