@@ -284,6 +284,53 @@ bool CudaSdnBackend::prepare (int numNodes, int blockSize, double sampleRate)
                               m.cfg.inputDistribution, m.cfg.crossfadeRate,
                               0u, (uint32_t) m.blockSize };
 
+    // Warmup: run ONE sample through BOTH kernels, then wipe the state back to
+    // pristine. The first launch of a freshly loaded module pays a lazy-init
+    // stall (measured at 25-85 ms on the OB backend, which got the same
+    // treatment), and that is exactly the burst of underruns seen right after
+    // an engine (re)start. Both kernels need it, not just one: a session starts
+    // pre-geometry with every delay at 1, so it opens on the lockstep and only
+    // switches to the node-parallel kernel once real geometry arrives -- which
+    // would otherwise pay a SECOND first-launch stall mid-session, long after
+    // startup and with audio running.
+    //
+    // Warming the node-parallel kernel here races on the delay lines (the
+    // pre-geometry delays are far below any safe window), which is harmless and
+    // deliberate: every value it touches is zeroed immediately below, and the
+    // point is to fault in the code path, not to compute anything.
+    {
+        SdnParamsGpu warm = m.params;
+        warm.sampleOffset = 0u;
+        warm.chunkSamples = 1u;
+        void* wargs[] = {
+            &warm, &m.dInputs, &m.dOutputs, &m.dDelayLines,
+            &m.dDelayLength, &m.dTargetDelayLength, &m.dCrossfadeMix,
+            &m.dGainLow, &m.dGainMid, &m.dGainHigh,
+            &m.dDecayLowState, &m.dDecayHighState,
+            &m.dDiffuserDelays, &m.dDiffRings, &m.dDiffWritePos,
+            &m.dToneState, &m.dDcState
+        };
+        CK_RT (cudaMemset (m.dInputs, 0, (size_t) N * m.blockSize * sizeof (float)));
+        CK_DRV (cuLaunchKernel (m.kernel, 1, 1, 1, (unsigned int) N, 1, 1,
+                                0, (CUstream) m.stream, wargs, nullptr));
+        if (N >= 2 && m.kernelNodes != nullptr)
+            CK_DRV (cuLaunchKernel (m.kernelNodes, (unsigned int) N, 1, 1, 32u, 1, 1,
+                                    0, (CUstream) m.stream, wargs, nullptr));
+        CK_RT (cudaStreamSynchronize (m.stream));
+
+        // Restore pristine first-launch state, so the first audible block is
+        // bit-identical to a prepare() that never warmed up.
+        CK_RT (cudaMemset (m.dDelayLines,     0, (size_t) P * maxDelay * sizeof (float)));
+        CK_RT (cudaMemset (m.dDecayLowState,  0, (size_t) P * sizeof (float)));
+        CK_RT (cudaMemset (m.dDecayHighState, 0, (size_t) P * sizeof (float)));
+        CK_RT (cudaMemset (m.dDiffRings,    0, (size_t) N * D * maxDiff * sizeof (float)));
+        CK_RT (cudaMemset (m.dDiffWritePos, 0, (size_t) N * D * sizeof (int)));
+        CK_RT (cudaMemset (m.dToneState, 0, (size_t) N * sizeof (float)));
+        CK_RT (cudaMemset (m.dDcState,   0, (size_t) N * 2 * sizeof (float)));
+        CK_RT (cudaMemset (m.dOutputs,   0, (size_t) N * m.blockSize * sizeof (float)));
+        m.ringWritePos = 0;
+    }
+
     // Escape hatch: the node-parallel kernel is bit-identical to the lockstep,
     // so this only trades performance for the older mapping if it ever needs
     // ruling out in the field.
