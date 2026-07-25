@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ReverbAlgorithm.h"
+#include "../rt/AudioParallelFor.h"
 #include <array>
 #include <cmath>
 
@@ -131,82 +132,101 @@ public:
             outPtrs[n] = nodeOutputs.getWritePointer (n);
         }
 
-        // Synchronous lockstep: step every node together, sample by sample.
-        // Within a sample each node reads its incoming paths — cells written at
-        // strictly earlier samples, since every inter-node delay is >= 1 — and
-        // writes its outgoing paths for this sample, so the nodes are mutually
-        // independent at each tick. This is deterministic and matches the GPU
-        // backend bit-for-bit, unlike a node-parallel sweep over the whole block
-        // whose sub-block cross-node reads would race when a delay < block size.
-        for (int s = 0; s < numSamples; ++s)
+        // Chunked node-parallel sweep. Nodes couple ONLY through the inter-node
+        // delay lines: node n writes paths {n→*} and reads paths {*→n}, and each
+        // path is a strict single-producer/single-consumer channel. Inside a
+        // window of C samples where every EFFECTIVE delay is >= C (and the ring
+        // cannot alias — see chunkSamplesForBlock), no node can read a cell
+        // another node wrote in that same window, so nodes are mutually
+        // independent across the whole window rather than only per sample.
+        //
+        // Each node's arithmetic sequence is untouched (the Householder
+        // scattering reflects a node's own incoming vector and needs no other
+        // node's current sample; there is no shared accumulator or filter), so
+        // the result is BIT-IDENTICAL to the previous per-sample lockstep for
+        // any C the bound allows — and C = 1 reproduces that lockstep exactly.
+        const int chunk = chunkSamplesForBlock (numSamples);
+
+        for (int chunkStart = 0; chunkStart < numSamples; chunkStart += chunk)
         {
-            for (int n = 0; n < N; ++n)
+            const int chunkEnd = juce::jmin (numSamples, chunkStart + chunk);
+
+            auto processNode = [&] (int n)
             {
-                auto sn = static_cast<size_t> (n);
-                auto& incoming  = incomingSignals[sn];
-                auto& scattered = scatteredSignals[sn];
-
-                // 1. Read incoming from all paths leading to node n
-                int inCount = 0;
-                for (int i = 0; i < N; ++i)
+                for (int s = chunkStart; s < chunkEnd; ++s)
                 {
-                    if (i == n) continue;
-                    auto& path = paths[static_cast<size_t> (getPathIndex (i, n))];
-                    incoming[static_cast<size_t> (inCount)] = readFromDelayAt (path, s);
-                    inCount++;
+                    auto sn = static_cast<size_t> (n);
+                    auto& incoming  = incomingSignals[sn];
+                    auto& scattered = scatteredSignals[sn];
+
+                    // 1. Read incoming from all paths leading to node n
+                    int inCount = 0;
+                    for (int i = 0; i < N; ++i)
+                    {
+                        if (i == n) continue;
+                        auto& path = paths[static_cast<size_t> (getPathIndex (i, n))];
+                        incoming[static_cast<size_t> (inCount)] = readFromDelayAt (path, s);
+                        inCount++;
+                    }
+
+                    // 2. Householder scattering: X = (2/(N-1)) * sum(incoming)
+                    float sum = 0.0f;
+                    for (int i = 0; i < inCount; ++i)
+                        sum += incoming[static_cast<size_t> (i)];
+
+                    float X = (2.0f / static_cast<float> (N - 1)) * sum;
+
+                    for (int i = 0; i < inCount; ++i)
+                        scattered[static_cast<size_t> (i)] = X - incoming[static_cast<size_t> (i)];
+
+                    // 3. Apply diffusion to node input
+                    float diffused = inPtrs[n][s];
+                    if (diffusionCoeff > 0.0001f)
+                    {
+                        auto& nd = nodeDiffusers[sn];
+                        for (auto& stage : nd)
+                            diffused = stage.process (diffused, diffusionCoeff);
+                    }
+
+                    // 4. Write to outgoing delay lines (only this node writes to paths {n→*})
+                    float inputDistribution = 1.0f / static_cast<float> (N);
+                    int outIdx = 0;
+                    for (int i = 0; i < N; ++i)
+                    {
+                        if (i == n) continue;
+                        auto& path = paths[static_cast<size_t> (getPathIndex (n, i))];
+                        float signal = scattered[static_cast<size_t> (outIdx)] + diffused * inputDistribution;
+                        signal = path.decayFilter.process (signal);
+                        int writeIdx = (path.readBasePos + s) % MAX_DELAY_SAMPLES;
+                        path.delayLine[static_cast<size_t> (writeIdx)] = signal;
+                        outIdx++;
+                    }
+
+                    // 5. Output = sum of all scattered signals
+                    float output = 0.0f;
+                    for (int i = 0; i < inCount; ++i)
+                        output += scattered[static_cast<size_t> (i)];
+
+                    // 6. Output tone filter (one-pole LPF ~8kHz to soften harshness)
+                    auto& ns = nodeOutputStates[sn];
+                    ns.toneState += toneCoeff * (output - ns.toneState);
+                    output = ns.toneState;
+
+                    // 7. DC blocker: y = x - x_prev + 0.9995 * y_prev
+                    float dcOut = output - ns.dcX1 + 0.9995f * ns.dcY1;
+                    ns.dcX1 = output;
+                    ns.dcY1 = dcOut;
+
+                    // 8. Apply output gain compensation
+                    outPtrs[n][s] = dcOut * sdnOutputGain;
                 }
+            };
 
-                // 2. Householder scattering: X = (2/(N-1)) * sum(incoming)
-                float sum = 0.0f;
-                for (int i = 0; i < inCount; ++i)
-                    sum += incoming[static_cast<size_t> (i)];
-
-                float X = (2.0f / static_cast<float> (N - 1)) * sum;
-
-                for (int i = 0; i < inCount; ++i)
-                    scattered[static_cast<size_t> (i)] = X - incoming[static_cast<size_t> (i)];
-
-                // 3. Apply diffusion to node input
-                float diffused = inPtrs[n][s];
-                if (diffusionCoeff > 0.0001f)
-                {
-                    auto& nd = nodeDiffusers[sn];
-                    for (auto& stage : nd)
-                        diffused = stage.process (diffused, diffusionCoeff);
-                }
-
-                // 4. Write to outgoing delay lines (only this node writes to paths {n→*})
-                float inputDistribution = 1.0f / static_cast<float> (N);
-                int outIdx = 0;
-                for (int i = 0; i < N; ++i)
-                {
-                    if (i == n) continue;
-                    auto& path = paths[static_cast<size_t> (getPathIndex (n, i))];
-                    float signal = scattered[static_cast<size_t> (outIdx)] + diffused * inputDistribution;
-                    signal = path.decayFilter.process (signal);
-                    int writeIdx = (path.readBasePos + s) % MAX_DELAY_SAMPLES;
-                    path.delayLine[static_cast<size_t> (writeIdx)] = signal;
-                    outIdx++;
-                }
-
-                // 5. Output = sum of all scattered signals
-                float output = 0.0f;
-                for (int i = 0; i < inCount; ++i)
-                    output += scattered[static_cast<size_t> (i)];
-
-                // 6. Output tone filter (one-pole LPF ~8kHz to soften harshness)
-                auto& ns = nodeOutputStates[sn];
-                ns.toneState += toneCoeff * (output - ns.toneState);
-                output = ns.toneState;
-
-                // 7. DC blocker: y = x - x_prev + 0.9995 * y_prev
-                float dcOut = output - ns.dcX1 + 0.9995f * ns.dcY1;
-                ns.dcX1 = output;
-                ns.dcY1 = dcOut;
-
-                // 8. Apply output gain compensation
-                outPtrs[n][s] = dcOut * sdnOutputGain;
-            }
+            if (parallel != nullptr)
+                parallel->parallelFor (N, processNode);
+            else
+                for (int n = 0; n < N; ++n)
+                    processNode (n);
         }
 
         // Advance all writePos by numSamples (done once after the block)
@@ -228,10 +248,45 @@ public:
         }
     }
 
-    void setParallelFor (AudioParallelFor*) override
+    /** Largest window of samples that can be swept node-parallel without any
+        node reading a delay-line cell another node writes inside that window.
+
+        A collision on path p (written only by its source node, read only by its
+        sink) needs (base + s) ≡ (base + s' − D) (mod MAX_DELAY_SAMPLES) for two
+        samples s, s' in the window. With |s − s'| < C that is reachable two
+        ways, and BOTH must be excluded:
+          • s − s' = −D              → safe iff C <= D
+          • s − s' = MAX_DELAY − D   → safe iff C <= MAX_DELAY − D
+        The second is ring wraparound: it becomes reachable as D approaches the
+        8191 clamp (~14.3 m at sdnScale 4, 48 kHz). The old lockstep was immune
+        to it because program order put every read before the colliding write;
+        a parallel sweep is not, so it is easy to miss.
+
+        D must be the EFFECTIVE delay: while a path crossfades, readFromDelayAt
+        reads BOTH the old and new tap, so the shorter is live for the ~10 ms
+        ramp after any geometry or sdnScale change. Using targetDelayLength
+        alone would race for exactly those blocks. */
+    int chunkSamplesForBlock (int numSamples) const noexcept
     {
-        // SDN runs a synchronous lockstep over all nodes (inter-node coupling),
-        // so it does not use the block-level node thread pool.
+        int c = numSamples;
+        for (const auto& path : paths)
+        {
+            const int d = (path.crossfadeMix >= 1.0f)
+                            ? path.delayLength
+                            : juce::jmin (path.delayLength, path.targetDelayLength);
+            c = juce::jmin (c, juce::jmin (d, MAX_DELAY_SAMPLES - d));
+        }
+        return juce::jmax (1, c);
+    }
+
+    void setParallelFor (AudioParallelFor* pool) override
+    {
+        // SDN couples nodes through the inter-node delay lines, so it can only
+        // use the pool inside a window where every effective delay exceeds the
+        // window (see chunkSamplesForBlock). The pool is safe to hold here: a
+        // degenerate geometry simply collapses the window to 1 sample, which
+        // reproduces the old per-sample lockstep.
+        parallel = pool;
     }
 
     void setParameters (const AlgorithmParameters& params) override
@@ -550,6 +605,9 @@ private:
     std::vector<std::array<AllpassStage, NUM_DIFFUSERS_PER_NODE>> nodeDiffusers;
     std::vector<NodePosition> nodePositions;
     std::vector<NodeOutputState> nodeOutputStates;
+
+    // Node thread pool (non-owning), used per chunk — see processBlock.
+    AudioParallelFor* parallel = nullptr;
 
     // Per-node working buffers (thread-safe for parallel processing)
     std::array<std::vector<float>, MAX_NODES> incomingSignals;
