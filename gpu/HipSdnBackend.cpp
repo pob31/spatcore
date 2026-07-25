@@ -59,13 +59,20 @@ struct SdnParamsGpu
     float    sdnOutputGain;
     float    inputDistribution;
     float    crossfadeRate;
-};
+    uint32_t sampleOffset;   // KEEP IN SYNC with SdnParams in CudaSdnKernels.h
+    uint32_t chunkSamples;   // (compiled verbatim here — a missing field is a
+};                           //  silent struct-layout mismatch, not a build error)
+
+// Above this many chunks the per-launch overhead outweighs the CU spread, so
+// the block reverts to the single-launch lockstep.
+constexpr int kMaxSdnChunksPerBlock = 8;
 } // namespace
 
 struct HipSdnBackend::Impl
 {
     hipModule_t     module = nullptr;
-    hipFunction_t   kernel = nullptr;
+    hipFunction_t   kernel = nullptr;        // sdn_process       (lockstep, grid = 1)
+    hipFunction_t   kernelNodes = nullptr;   // sdn_process_nodes (grid = numNodes)
     hipStream_t stream = nullptr;
     hipEvent_t  syncEvent = nullptr;  // blocking-sync end-of-block wait (no spin)
 
@@ -98,6 +105,7 @@ struct HipSdnBackend::Impl
     void* dDcState = nullptr;
 
     int numNodes = 0, numPaths = 0, blockSize = 0;
+    bool nodeParallel = true;   // WFS_SDN_NODE_PARALLEL=0 forces the lockstep
     double sampleRate = 0.0;
     uint32_t ringWritePos = 0;
     bool needUpload = true;
@@ -188,6 +196,7 @@ bool HipSdnBackend::prepare (int numNodes, int blockSize, double sampleRate)
 
         CK_DRV (hipModuleLoadDataEx (&m.module, ptx.data(), 0, nullptr, nullptr));
         CK_DRV (hipModuleGetFunction (&m.kernel, m.module, "sdn_process"));
+        CK_DRV (hipModuleGetFunction (&m.kernelNodes, m.module, "sdn_process_nodes"));
     }
 
     const int N = m.numNodes;
@@ -256,7 +265,48 @@ bool HipSdnBackend::prepare (int numNodes, int blockSize, double sampleRate)
                               (uint32_t) m.cfg.maxDiffLen,
                               m.cfg.diffusionCoeff, m.cfg.toneCoeff, m.cfg.lowCoeff,
                               m.cfg.highCoeff, SdnHostConfig::DC_POLE, m.cfg.sdnOutputGain,
-                              m.cfg.inputDistribution, m.cfg.crossfadeRate };
+                              m.cfg.inputDistribution, m.cfg.crossfadeRate,
+                              0u, (uint32_t) m.blockSize };
+
+    // Warmup: one sample through BOTH kernels, then wipe the state back to
+    // pristine, so the first audible block is bit-identical to a prepare() that
+    // never warmed up. See the CUDA twin for why both kernels matter (a session
+    // opens pre-geometry on the lockstep and switches later, with audio live).
+    {
+        SdnParamsGpu warm = m.params;
+        warm.sampleOffset = 0u;
+        warm.chunkSamples = 1u;
+        void* wargs[] = {
+            &warm, &m.dInputs, &m.dOutputs, &m.dDelayLines,
+            &m.dDelayLength, &m.dTargetDelayLength, &m.dCrossfadeMix,
+            &m.dGainLow, &m.dGainMid, &m.dGainHigh,
+            &m.dDecayLowState, &m.dDecayHighState,
+            &m.dDiffuserDelays, &m.dDiffRings, &m.dDiffWritePos,
+            &m.dToneState, &m.dDcState
+        };
+        CK_RT (hipMemset (m.dInputs, 0, (size_t) N * m.blockSize * sizeof (float)));
+        CK_DRV (hipModuleLaunchKernel (m.kernel, 1, 1, 1, (unsigned int) N, 1, 1,
+                                       0, (hipStream_t) m.stream, wargs, nullptr));
+        if (N >= 2 && m.kernelNodes != nullptr)
+            CK_DRV (hipModuleLaunchKernel (m.kernelNodes, (unsigned int) N, 1, 1, 32u, 1, 1,
+                                           0, (hipStream_t) m.stream, wargs, nullptr));
+        CK_RT (hipStreamSynchronize (m.stream));
+
+        CK_RT (hipMemset (m.dDelayLines,     0, (size_t) P * maxDelay * sizeof (float)));
+        CK_RT (hipMemset (m.dDecayLowState,  0, (size_t) P * sizeof (float)));
+        CK_RT (hipMemset (m.dDecayHighState, 0, (size_t) P * sizeof (float)));
+        CK_RT (hipMemset (m.dDiffRings,    0, (size_t) N * D * maxDiff * sizeof (float)));
+        CK_RT (hipMemset (m.dDiffWritePos, 0, (size_t) N * D * sizeof (int)));
+        CK_RT (hipMemset (m.dToneState, 0, (size_t) N * sizeof (float)));
+        CK_RT (hipMemset (m.dDcState,   0, (size_t) N * 2 * sizeof (float)));
+        CK_RT (hipMemset (m.dOutputs,   0, (size_t) N * m.blockSize * sizeof (float)));
+        m.ringWritePos = 0;
+    }
+
+    // Read on this thread, never in processBlock (which runs on the reverb pump
+    // thread, where getenv is not something to call per block).
+    if (const char* e = std::getenv ("WFS_SDN_NODE_PARALLEL"))
+        m.nodeParallel = (std::string (e) != "0");
 
     ready = true;
     lastError.clear();
@@ -416,18 +466,46 @@ bool HipSdnBackend::processBlock (const float* const* inputs, float* const* outp
         &m.dToneState, &m.dDcState
     };
 
-    const hipError_t lr = hipModuleLaunchKernel (m.kernel,
-                                        1, 1, 1,
-                                        (unsigned int) N, 1, 1,
-                                        0, (hipStream_t) m.stream,
-                                        args, nullptr);
-    if (lr != hipSuccess)
+    // Mapping chosen per block, exactly as in the CUDA twin: node-parallel while
+    // the geometry keeps the parallel-safe window wide, else the lockstep (which
+    // is correct for ANY geometry, including the pre-geometry all-1 delays).
+    int chunk = m.blockSize;
+    bool useNodes = m.nodeParallel && N >= 2 && m.kernelNodes != nullptr;
+    if (useNodes)
     {
-        const char* s = nullptr;
-        hipDrvGetErrorString (lr, &s);
-        lastError = std::string ("HIP launch failed (sdn_process): ") + (s ? s : "unknown");
-        ready = false;
-        return false;
+        chunk = m.cfg.chunkSamplesForBlock (m.blockSize);
+        const int chunks = (m.blockSize + chunk - 1) / chunk;
+        if (chunks > kMaxSdnChunksPerBlock)
+        {
+            useNodes = false;
+            chunk = m.blockSize;
+        }
+    }
+
+    for (int off = 0; off < m.blockSize; off += chunk)
+    {
+        m.params.sampleOffset = (uint32_t) off;
+        m.params.chunkSamples = (uint32_t) std::min (chunk, m.blockSize - off);
+
+        const hipError_t lr = useNodes
+            ? hipModuleLaunchKernel (m.kernelNodes,
+                                     (unsigned int) N, 1, 1,   // one block per node
+                                     32u, 1, 1,                // one wavefront-width group
+                                     0, (hipStream_t) m.stream, args, nullptr)
+            : hipModuleLaunchKernel (m.kernel,
+                                     1, 1, 1,
+                                     (unsigned int) N, 1, 1,
+                                     0, (hipStream_t) m.stream, args, nullptr);
+        if (lr != hipSuccess)
+        {
+            const char* s = nullptr;
+            hipDrvGetErrorString (lr, &s);
+            lastError = std::string ("HIP launch failed (")
+                      + (useNodes ? "sdn_process_nodes" : "sdn_process") + "): "
+                      + (s ? s : "unknown");
+            ready = false;
+            return false;
+        }
     }
 
     PB_RT (hipMemcpyAsync (m.hOutputs, m.dOutputs, (size_t) N * m.blockSize * sizeof (float), hipMemcpyDeviceToHost, m.stream));

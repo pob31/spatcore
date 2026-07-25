@@ -13,8 +13,11 @@
     derived delays/crossfade and the inputs are uploaded host->device, and only
     the outputs are read back.
 
-    Dispatch: ONE block x numNodes threads (one per node), per-sample lockstep
-    with __syncthreads() — the network couples nodes within a block.
+    Dispatch is chosen per block between two bit-identical kernels (see
+    CudaSdnKernels.h): sdn_process_nodes (grid = numNodes, one warp each, so the
+    work spreads across SMs) while the geometry keeps the parallel-safe window
+    wide enough, else the original sdn_process lockstep (grid = 1, per-sample
+    __syncthreads()) which is correct for any geometry.
 */
 
 #if WFS_GPU_NATIVE && !defined(__APPLE__) && !defined(WFS_GPU_HIP) && !defined(WFS_GPU_PLUGINS)
@@ -36,6 +39,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -61,7 +65,13 @@ struct SdnParamsGpu
     float    sdnOutputGain;
     float    inputDistribution;
     float    crossfadeRate;
+    uint32_t sampleOffset;   // KEEP IN SYNC with SdnParams in CudaSdnKernels.h
+    uint32_t chunkSamples;
 };
+
+// Above this many chunks the per-launch overhead outweighs the SM spread, so
+// the block reverts to the single-launch lockstep.
+constexpr int kMaxSdnChunksPerBlock = 8;
 } // namespace
 
 struct CudaSdnBackend::Impl
@@ -69,7 +79,8 @@ struct CudaSdnBackend::Impl
     CUcontext    context = nullptr;
     CUdevice     cuDevice = 0;
     CUmodule     module = nullptr;
-    CUfunction   kernel = nullptr;
+    CUfunction   kernel = nullptr;        // sdn_process       (lockstep, grid = 1)
+    CUfunction   kernelNodes = nullptr;   // sdn_process_nodes (grid = numNodes)
     cudaStream_t stream = nullptr;
     cudaEvent_t  syncEvent = nullptr;  // blocking-sync end-of-block wait (no spin)
 
@@ -102,6 +113,9 @@ struct CudaSdnBackend::Impl
     void* dDcState = nullptr;
 
     int numNodes = 0, numPaths = 0, blockSize = 0;
+    bool nodeParallel = true;   // WFS_SDN_NODE_PARALLEL=0 forces the lockstep
+    bool trace = false;         // WFS_SDN_TRACE=1 logs each mapping change
+    bool tracedNodes = false; int tracedChunk = -1;
     double sampleRate = 0.0;
     uint32_t ringWritePos = 0;
     bool needUpload = true;
@@ -198,6 +212,7 @@ bool CudaSdnBackend::prepare (int numNodes, int blockSize, double sampleRate)
 
         CK_DRV (cuModuleLoadDataEx (&m.module, cubin.data(), 0, nullptr, nullptr));
         CK_DRV (cuModuleGetFunction (&m.kernel, m.module, "sdn_process"));
+        CK_DRV (cuModuleGetFunction (&m.kernelNodes, m.module, "sdn_process_nodes"));
     }
 
     const int N = m.numNodes;
@@ -266,7 +281,64 @@ bool CudaSdnBackend::prepare (int numNodes, int blockSize, double sampleRate)
                               (uint32_t) m.cfg.maxDiffLen,
                               m.cfg.diffusionCoeff, m.cfg.toneCoeff, m.cfg.lowCoeff,
                               m.cfg.highCoeff, SdnHostConfig::DC_POLE, m.cfg.sdnOutputGain,
-                              m.cfg.inputDistribution, m.cfg.crossfadeRate };
+                              m.cfg.inputDistribution, m.cfg.crossfadeRate,
+                              0u, (uint32_t) m.blockSize };
+
+    // Warmup: run ONE sample through BOTH kernels, then wipe the state back to
+    // pristine. The first launch of a freshly loaded module pays a lazy-init
+    // stall (measured at 25-85 ms on the OB backend, which got the same
+    // treatment), and that is exactly the burst of underruns seen right after
+    // an engine (re)start. Both kernels need it, not just one: a session starts
+    // pre-geometry with every delay at 1, so it opens on the lockstep and only
+    // switches to the node-parallel kernel once real geometry arrives -- which
+    // would otherwise pay a SECOND first-launch stall mid-session, long after
+    // startup and with audio running.
+    //
+    // Warming the node-parallel kernel here races on the delay lines (the
+    // pre-geometry delays are far below any safe window), which is harmless and
+    // deliberate: every value it touches is zeroed immediately below, and the
+    // point is to fault in the code path, not to compute anything.
+    {
+        SdnParamsGpu warm = m.params;
+        warm.sampleOffset = 0u;
+        warm.chunkSamples = 1u;
+        void* wargs[] = {
+            &warm, &m.dInputs, &m.dOutputs, &m.dDelayLines,
+            &m.dDelayLength, &m.dTargetDelayLength, &m.dCrossfadeMix,
+            &m.dGainLow, &m.dGainMid, &m.dGainHigh,
+            &m.dDecayLowState, &m.dDecayHighState,
+            &m.dDiffuserDelays, &m.dDiffRings, &m.dDiffWritePos,
+            &m.dToneState, &m.dDcState
+        };
+        CK_RT (cudaMemset (m.dInputs, 0, (size_t) N * m.blockSize * sizeof (float)));
+        CK_DRV (cuLaunchKernel (m.kernel, 1, 1, 1, (unsigned int) N, 1, 1,
+                                0, (CUstream) m.stream, wargs, nullptr));
+        if (N >= 2 && m.kernelNodes != nullptr)
+            CK_DRV (cuLaunchKernel (m.kernelNodes, (unsigned int) N, 1, 1, 32u, 1, 1,
+                                    0, (CUstream) m.stream, wargs, nullptr));
+        CK_RT (cudaStreamSynchronize (m.stream));
+
+        // Restore pristine first-launch state, so the first audible block is
+        // bit-identical to a prepare() that never warmed up.
+        CK_RT (cudaMemset (m.dDelayLines,     0, (size_t) P * maxDelay * sizeof (float)));
+        CK_RT (cudaMemset (m.dDecayLowState,  0, (size_t) P * sizeof (float)));
+        CK_RT (cudaMemset (m.dDecayHighState, 0, (size_t) P * sizeof (float)));
+        CK_RT (cudaMemset (m.dDiffRings,    0, (size_t) N * D * maxDiff * sizeof (float)));
+        CK_RT (cudaMemset (m.dDiffWritePos, 0, (size_t) N * D * sizeof (int)));
+        CK_RT (cudaMemset (m.dToneState, 0, (size_t) N * sizeof (float)));
+        CK_RT (cudaMemset (m.dDcState,   0, (size_t) N * 2 * sizeof (float)));
+        CK_RT (cudaMemset (m.dOutputs,   0, (size_t) N * m.blockSize * sizeof (float)));
+        m.ringWritePos = 0;
+    }
+
+    // Escape hatch: the node-parallel kernel is bit-identical to the lockstep,
+    // so this only trades performance for the older mapping if it ever needs
+    // ruling out in the field.
+    // Both env reads happen HERE, never in processBlock: that runs on the reverb
+    // pump thread, where getenv is not something to call per block.
+    if (const char* e = std::getenv ("WFS_SDN_NODE_PARALLEL"))
+        m.nodeParallel = (std::string (e) != "0");
+    m.trace = (std::getenv ("WFS_SDN_TRACE") != nullptr);
 
     ready = true;
     lastError.clear();
@@ -427,18 +499,58 @@ bool CudaSdnBackend::processBlock (const float* const* inputs, float* const* out
         &m.dToneState, &m.dDcState
     };
 
-    const CUresult lr = cuLaunchKernel (m.kernel,
-                                        1, 1, 1,
-                                        (unsigned int) N, 1, 1,
-                                        0, (CUstream) m.stream,
-                                        args, nullptr);
-    if (lr != CUDA_SUCCESS)
+    // Pick the mapping for THIS block. The node-parallel kernel needs a chunk
+    // window inside which no node reads a cell another node writes, and a chunk
+    // boundary costs a kernel launch, so it only pays while the geometry keeps
+    // the window wide. A degenerate or not-yet-received geometry collapses the
+    // window towards 1 sample; the lockstep handles that case in one launch and
+    // is bit-identical, so falling back costs nothing but the SM spread.
+    int chunk = m.blockSize;
+    bool useNodes = m.nodeParallel && N >= 2 && m.kernelNodes != nullptr;
+    if (useNodes)
     {
-        const char* s = nullptr;
-        cuGetErrorString (lr, &s);
-        lastError = std::string ("CUDA launch failed (sdn_process): ") + (s ? s : "unknown");
-        ready = false;
-        return false;
+        chunk = m.cfg.chunkSamplesForBlock (m.blockSize);
+        const int chunks = (m.blockSize + chunk - 1) / chunk;
+        if (chunks > kMaxSdnChunksPerBlock)
+        {
+            useNodes = false;
+            chunk = m.blockSize;
+        }
+    }
+
+    if (m.trace && (useNodes != m.tracedNodes || chunk != m.tracedChunk))
+    {
+        m.tracedNodes = useNodes; m.tracedChunk = chunk;
+        std::fprintf (stderr, "[sdn] mapping=%s chunk=%d/%d minDelay=%d\n",
+                      useNodes ? "node-parallel" : "lockstep", chunk, m.blockSize,
+                      m.cfg.numPaths > 0 ? *std::min_element (m.cfg.delayLength.begin(),
+                                                              m.cfg.delayLength.begin() + m.cfg.numPaths) : -1);
+    }
+
+    for (int off = 0; off < m.blockSize; off += chunk)
+    {
+        m.params.sampleOffset = (uint32_t) off;
+        m.params.chunkSamples = (uint32_t) std::min (chunk, m.blockSize - off);
+
+        const CUresult lr = useNodes
+            ? cuLaunchKernel (m.kernelNodes,
+                              (unsigned int) N, 1, 1,      // one block per node -> spread across SMs
+                              32u, 1, 1,                   // one warp; threads >= N-1 idle but must hit the barriers
+                              0, (CUstream) m.stream, args, nullptr)
+            : cuLaunchKernel (m.kernel,
+                              1, 1, 1,
+                              (unsigned int) N, 1, 1,
+                              0, (CUstream) m.stream, args, nullptr);
+        if (lr != CUDA_SUCCESS)
+        {
+            const char* s = nullptr;
+            cuGetErrorString (lr, &s);
+            lastError = std::string ("CUDA launch failed (")
+                      + (useNodes ? "sdn_process_nodes" : "sdn_process") + "): "
+                      + (s ? s : "unknown");
+            ready = false;
+            return false;
+        }
     }
 
     PB_RT (cudaMemcpyAsync (m.hOutputs, m.dOutputs, (size_t) N * m.blockSize * sizeof (float), cudaMemcpyDeviceToHost, m.stream));

@@ -372,19 +372,27 @@ public:
     /** Live pump telemetry for the active GPU reverb (message thread). The
         reverb runs its OWN async pipeline, independent of the direct-sound
         pump, so it needs its own readout. Fills underruns (cumulative) + the
-        peak pump ms since the last call (resets it) + the per-block budget ms,
-        and returns true only when a GPU reverb is actually live. */
-    bool getReverbGpuPumpStats (uint32_t& underruns, float& peakPumpMs, float& budgetMs)
+        peak pump ms since the last call (resets it) + the per-block budget ms
+        + the bound device name, and returns true only when a GPU reverb is
+        actually live.
+
+        deviceName matters for diagnosis: the reverb and the direct-sound path
+        can be bound to DIFFERENT GPUs, so without it a reverb pump overrun
+        cannot be attributed (GPU co-tenancy with the direct path vs host-side
+        contention) — exactly the ambiguity that blocked the 2026-07-25 SDN
+        investigation. */
+    bool getReverbGpuPumpStats (uint32_t& underruns, float& peakPumpMs, float& budgetMs,
+                                juce::String& deviceName)
     {
         juce::SpinLock::ScopedLockType lock (algorithmLock);
         budgetMs = sampleRate > 0.0 ? (float) (internalBlockSize / sampleRate * 1000.0) : 0.0f;
         auto* a = algorithm.get();
         if (auto* s = dynamic_cast<ReverbSDNAlgorithmGPU*> (a))
-        { if (! s->isReady()) return false; underruns = s->getUnderrunCount(); peakPumpMs = s->getAndResetPeakPumpMs(); return true; }
+        { if (! s->isReady()) return false; underruns = s->getUnderrunCount(); peakPumpMs = s->getAndResetPeakPumpMs(); deviceName = s->getDeviceName(); return true; }
         if (auto* f = dynamic_cast<ReverbFDNAlgorithmGPU*> (a))
-        { if (! f->isReady()) return false; underruns = f->getUnderrunCount(); peakPumpMs = f->getAndResetPeakPumpMs(); return true; }
+        { if (! f->isReady()) return false; underruns = f->getUnderrunCount(); peakPumpMs = f->getAndResetPeakPumpMs(); deviceName = f->getDeviceName(); return true; }
         if (auto* i = dynamic_cast<ReverbIRAlgorithmGPU*> (a))
-        { if (! i->isReady()) return false; underruns = i->getUnderrunCount(); peakPumpMs = i->getAndResetPeakPumpMs(); return true; }
+        { if (! i->isReady()) return false; underruns = i->getUnderrunCount(); peakPumpMs = i->getAndResetPeakPumpMs(); deviceName = i->getDeviceName(); return true; }
         return false;
     }
 

@@ -21,8 +21,11 @@
 
     Threading contract: single caller thread for processBlock() (the
     GpuAsyncPipeline pump). processBlock is synchronous (async copies + launch
-    on one stream, then cudaStreamSynchronize) - deadline isolation comes from
-    the pipeline above it, exactly as with the Metal backend.
+    on one stream, then a blocking-sync event wait — yields, no spin) -
+    deadline isolation comes from the pipeline above it, exactly as with the
+    Metal backend. With WFS_GPU_GRAPHS=1 the fixed per-block submission is
+    captured once into a CUDA graph at prepare() and replayed with a single
+    cuGraphLaunch per block (kernels and stream ordering identical).
 
     Latency compensation: pipelineLatencyMs is PRE-SUBTRACTED from every pair's
     delay (clamped at 0) at launch time, so arrival times match the CPU path for

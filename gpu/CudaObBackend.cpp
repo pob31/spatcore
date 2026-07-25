@@ -368,6 +368,24 @@ bool CudaObBackend::prepare (int numInputs, int numOutputs, int blockSize,
 
     ready = true;
     lastError.clear();
+
+    // Warmup launch: the first post-prepare processBlock pays a measured
+    // 25-85 ms lazy-init stall on this backend (device-side commit of the
+    // large pairAcc allocation + first-submission setup) — enough to blow
+    // through any pipeline depth cushion right after an engine (re)start,
+    // surfacing as an underrun burst in the first second. Run one silent
+    // block here on the setup thread, then restore pristine first-launch
+    // state so the first audible block is bit-identical to a fresh prepare()
+    // (reset() covers device state, frHost, writePos and the upload diet;
+    // frBasePrev is the one host-tracked value it does not re-arm).
+    {
+        std::vector<const float*> warmIn ((size_t) m.numIn, nullptr);
+        std::vector<float*> warmOut ((size_t) m.numOut, nullptr);
+        if (! processBlock (warmIn.data(), warmOut.data()))
+            return false;                    // lastError set, ready cleared
+        reset();
+        m.frBasePrev.assign ((size_t) m.numIn * (size_t) m.numOut, 1.0f);
+    }
     return true;
 }
 

@@ -61,6 +61,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -194,7 +196,152 @@ struct CudaWfsBackend::Impl
 #endif
 
     unsigned int threadsPerBlock = 256;
+
+    // CUDA graph path (opt-in via WFS_GPU_GRAPHS=1, read at prepare()): the
+    // CONSTANT per-block core — input H2D x2, K1, K2, output D2H — is captured
+    // ONCE into a graph and replayed with a single cuGraphLaunch per block.
+    // The M2 upload diet and the prev/curr ping-pong stay OUTSIDE the graph,
+    // exactly as on the legacy path: their (usually skipped) conditional
+    // matrix uploads are issued on the same stream right before the graph
+    // launch, so stream order — and therefore every value each kernel reads —
+    // is IDENTICAL to the legacy path. (A first cut graphed the matrix
+    // uploads unconditionally; measured on RTX 5070 + Tesla T4 that TRIPLED
+    // the per-block median — the diet's skipped copies dominate the saved
+    // launch overhead at 50 Hz matrix tick rates. Don't repeat that.)
+    // Per block only the WfsParams value (ring positions) and the prev/curr
+    // pointer slots vary; both are pushed with cuGraphExecKernelNodeSetParams
+    // reusing the CAPTURED node params (func/grid/ctx untouched — only the
+    // kernelParams array is ours, and SetParams deep-copies the pointed-to
+    // values at call time). The instantiated graph is pre-uploaded at
+    // prepare() so the first block does not pay lazy graph-init.
+    // Kernels, kernel arguments, and stream ordering are identical to the
+    // legacy path, so kernel hashes and golden baselines are unaffected.
+    cudaGraph_t     graph = nullptr;
+    cudaGraphExec_t graphExec = nullptr;
+    CUgraphNode     nodePairs = nullptr, nodeReduce = nullptr;
+    CUDA_KERNEL_NODE_PARAMS kpPairs = {}, kpReduce = {};
+    WfsParamsGpu    gp = {};              // stable storage read by SetParams
+    void*           gPrevArg[4] = {};     // per-block prev/curr slots, written
+    void*           gCurrArg[4] = {};     // from the diet's stagePair results
+    void*           gPairsArgs[18] = {};
+    void*           gReduceArgs[3] = {};
+
+    bool buildGraph();
+    void destroyGraph() noexcept;
 };
+
+// Capture the fixed per-block submission into an instantiated graph. Runs on
+// the prepare() thread with the context current and the stream idle; nothing
+// is executed during capture (endpoints/sizes are recorded, not data). Returns
+// false on any failure — the caller falls back to the legacy path.
+bool CudaWfsBackend::Impl::buildGraph()
+{
+    // Placeholder prev/curr: capture with the live slots; every block's
+    // SetParams overwrites these with the diet's actual prev/curr pointers
+    // before launch, so the captured values are never consumed.
+    for (int i = 0; i < 4; ++i)
+    {
+        Impl::PingPong* pp = (i == 0 ? &ppDelays : i == 1 ? &ppGains
+                              : i == 2 ? &ppFrDelays : &ppFrGains);
+        gCurrArg[i] = pp->slot[0];
+        gPrevArg[i] = pp->slot[0];
+    }
+    gp = WfsParamsGpu { (uint32_t) numIn, (uint32_t) numOut, (uint32_t) blockSize,
+                        ringCapacity, 0, 0, pairGroups, shelfCosW0, shelfSinW0 };
+
+    void* pairsArgsInit[18] = { &gp, &dIn, &dFrIn, &dRing, &dFrRing,
+                                &gPrevArg[0], &gCurrArg[0], &gPrevArg[1], &gCurrArg[1],
+                                &gPrevArg[2], &gCurrArg[2], &gPrevArg[3], &gCurrArg[3],
+                                &dHfAttenDb, &dFrHfAttenDb,
+                                &dShelfState, &dFrShelfState, &dScratch };
+    std::memcpy (gPairsArgs, pairsArgsInit, sizeof (pairsArgsInit));
+    void* reduceArgsInit[3] = { &gp, &dScratch, &dOut };
+    std::memcpy (gReduceArgs, reduceArgsInit, sizeof (reduceArgsInit));
+
+    if (cudaStreamBeginCapture (stream, cudaStreamCaptureModeThreadLocal) != cudaSuccess)
+        return false;
+
+    bool ok = true;
+    auto cap = [&ok] (cudaError_t e) { ok = ok && (e == cudaSuccess); };
+
+    // Constant core only: input H2D x2 -> K1 -> K2 -> output D2H. Matrix
+    // uploads (diet-gated) run OUTSIDE the graph, before each launch.
+    cap (cudaMemcpyAsync (dIn,   hIn,   (size_t) numIn * blockSize * sizeof (float), cudaMemcpyHostToDevice, stream));
+    cap (cudaMemcpyAsync (dFrIn, hFrIn, (size_t) numIn * blockSize * sizeof (float), cudaMemcpyHostToDevice, stream));
+
+    const unsigned int gridPairs = pairGroups + 2u * (unsigned int) numIn;
+    ok = ok && cuLaunchKernel (kernelPairs, gridPairs, 1, 1,
+                               threadsPerBlock, 1, 1, 0, (CUstream) stream,
+                               gPairsArgs, nullptr) == CUDA_SUCCESS;
+    ok = ok && cuLaunchKernel (kernelReduce, (unsigned int) numOut, 1, 1,
+                               threadsPerBlock, 1, 1, 0, (CUstream) stream,
+                               gReduceArgs, nullptr) == CUDA_SUCCESS;
+
+    cap (cudaMemcpyAsync (hOut, dOut, (size_t) numOut * blockSize * sizeof (float), cudaMemcpyDeviceToHost, stream));
+
+    cudaGraph_t captured = nullptr;
+    const cudaError_t endErr = cudaStreamEndCapture (stream, &captured);
+    if (endErr != cudaSuccess || ! ok || captured == nullptr)
+    {
+        if (captured != nullptr)
+            cudaGraphDestroy (captured);
+        return false;
+    }
+    graph = captured;
+
+    // Locate the two kernel nodes and keep their CAPTURED params verbatim
+    // (func / grid / block / ctx as recorded) — only the kernelParams array is
+    // repointed at our stable arg storage so per-block SetParams re-reads the
+    // updated WfsParams value.
+    size_t numNodes = 0;
+    if (cudaGraphGetNodes (graph, nullptr, &numNodes) != cudaSuccess || numNodes == 0)
+        return false;
+    std::vector<cudaGraphNode_t> nodes (numNodes);
+    if (cudaGraphGetNodes (graph, nodes.data(), &numNodes) != cudaSuccess)
+        return false;
+
+    for (cudaGraphNode_t n : nodes)
+    {
+        cudaGraphNodeType t {};
+        if (cudaGraphNodeGetType (n, &t) != cudaSuccess || t != cudaGraphNodeTypeKernel)
+            continue;
+        CUDA_KERNEL_NODE_PARAMS kp = {};
+        if (cuGraphKernelNodeGetParams ((CUgraphNode) n, &kp) != CUDA_SUCCESS)
+            return false;
+        if (kp.func == kernelPairs)
+        {
+            nodePairs = (CUgraphNode) n;
+            kpPairs = kp;
+            kpPairs.kernelParams = gPairsArgs;
+        }
+        else if (kp.func == kernelReduce)
+        {
+            nodeReduce = (CUgraphNode) n;
+            kpReduce = kp;
+            kpReduce.kernelParams = gReduceArgs;
+        }
+    }
+    if (nodePairs == nullptr || nodeReduce == nullptr)
+        return false;
+
+    if (cudaGraphInstantiate (&graphExec, graph, 0) != cudaSuccess)
+        return false;
+
+    // Pre-upload the instantiated graph so the first block does not pay the
+    // lazy device-side graph initialisation (measured 25-30 ms on the first
+    // cuGraphLaunch otherwise — enough to blow through any depth cushion).
+    if (cudaGraphUpload (graphExec, stream) != cudaSuccess)
+        return false;
+    return cudaStreamSynchronize (stream) == cudaSuccess;
+}
+
+void CudaWfsBackend::Impl::destroyGraph() noexcept
+{
+    if (graphExec != nullptr) { cudaGraphExecDestroy (graphExec); graphExec = nullptr; }
+    if (graph != nullptr)     { cudaGraphDestroy (graph);         graph = nullptr; }
+    nodePairs = nullptr;
+    nodeReduce = nullptr;
+}
 
 CudaWfsBackend::CudaWfsBackend (int deviceIndex) : impl (std::make_unique<Impl>()) { impl->deviceIndex = deviceIndex; }
 CudaWfsBackend::~CudaWfsBackend() { release(); }
@@ -371,6 +518,22 @@ bool CudaWfsBackend::prepare (int numInputs, int numOutputs, int blockSize,
         m.pool.prepare (workers, periodMs, periodMs);
     }
 
+    // Opt-in CUDA graph path (WFS_GPU_GRAPHS=1). Build failure is not a
+    // prepare() failure: fall back to the per-call legacy path with a note.
+    {
+        const char* env = std::getenv ("WFS_GPU_GRAPHS");
+        if (env != nullptr && env[0] == '1')
+        {
+            if (m.buildGraph())
+                std::fprintf (stderr, "note: wfs-cuda: CUDA graph submission enabled (WFS_GPU_GRAPHS=1)\n");
+            else
+            {
+                m.destroyGraph();
+                std::fprintf (stderr, "note: wfs-cuda: CUDA graph build failed - using legacy per-call submission\n");
+            }
+        }
+    }
+
     ready = true;
     lastError.clear();
     return true;
@@ -485,11 +648,15 @@ bool CudaWfsBackend::processBlock (const float* const* inputs, float* const* out
 #define PB_RT(call) do { cudaError_t _e = (call); if (_e != cudaSuccess) { \
     lastError = std::string ("CUDA runtime: ") + cudaGetErrorString (_e); ready = false; return false; } } while (0)
 
-    auto up = [&m] (void* dst, const float* src, size_t floats) {
-        return cudaMemcpyAsync (dst, src, floats * sizeof (float), cudaMemcpyHostToDevice, m.stream);
-    };
-    PB_RT (up (m.dIn,   m.hIn,   (size_t) m.numIn * m.blockSize));
-    PB_RT (up (m.dFrIn, m.hFrIn, (size_t) m.numIn * m.blockSize));
+    // Graph mode: the input H2D copies live inside the captured graph.
+    if (m.graphExec == nullptr)
+    {
+        auto up = [&m] (void* dst, const float* src, size_t floats) {
+            return cudaMemcpyAsync (dst, src, floats * sizeof (float), cudaMemcpyHostToDevice, m.stream);
+        };
+        PB_RT (up (m.dIn,   m.hIn,   (size_t) m.numIn * m.blockSize));
+        PB_RT (up (m.dFrIn, m.hFrIn, (size_t) m.numIn * m.blockSize));
+    }
 
     // Upload diet: memcmp each freshly staged matrix against its lastStaged
     // baseline. Unchanged => skip the upload AND the slot swap (prev == curr ==
@@ -551,6 +718,35 @@ bool CudaWfsBackend::processBlock (const float* const* inputs, float* const* out
                      m.ringCapacity, m.ringWritePos, m.ringValid,
                      m.pairGroups, m.shelfCosW0, m.shelfSinW0 };
 
+    if (m.graphExec != nullptr)
+    {
+        // Push the per-block variance (ring positions + the diet's prev/curr
+        // slot choices) into the captured kernel nodes, then replay the core
+        // (input H2D x2 -> K1 -> K2 -> output D2H) with one launch. Any
+        // conditional matrix uploads issued above are stream-ordered ahead of
+        // the graph, exactly as they precede the K1 launch on the legacy path.
+        m.gp = p;
+        m.gPrevArg[0] = dDelaysPrevArg;   m.gCurrArg[0] = dDelaysCurrArg;
+        m.gPrevArg[1] = dGainsPrevArg;    m.gCurrArg[1] = dGainsCurrArg;
+        m.gPrevArg[2] = dFrDelaysPrevArg; m.gCurrArg[2] = dFrDelaysCurrArg;
+        m.gPrevArg[3] = dFrGainsPrevArg;  m.gCurrArg[3] = dFrGainsCurrArg;
+
+        CUresult gr = cuGraphExecKernelNodeSetParams (m.graphExec, m.nodePairs, &m.kpPairs);
+        if (gr == CUDA_SUCCESS)
+            gr = cuGraphExecKernelNodeSetParams (m.graphExec, m.nodeReduce, &m.kpReduce);
+        if (gr == CUDA_SUCCESS)
+            gr = cuGraphLaunch (m.graphExec, (CUstream) m.stream);
+        if (gr != CUDA_SUCCESS)
+        {
+            const char* s = nullptr;
+            cuGetErrorString (gr, &s);
+            lastError = std::string ("CUDA graph launch failed: ") + (s ? s : "unknown");
+            ready = false;
+            return false;
+        }
+    }
+    else
+    {
     void* pairsArgs[] = { &p, &m.dIn, &m.dFrIn, &m.dRing, &m.dFrRing,
                           &dDelaysPrevArg, &dDelaysCurrArg, &dGainsPrevArg, &dGainsCurrArg,
                           &dFrDelaysPrevArg, &dFrDelaysCurrArg, &dFrGainsPrevArg, &dFrGainsCurrArg,
@@ -591,6 +787,7 @@ bool CudaWfsBackend::processBlock (const float* const* inputs, float* const* out
     }
 
     PB_RT (cudaMemcpyAsync (m.hOut, m.dOut, (size_t) m.numOut * m.blockSize * sizeof (float), cudaMemcpyDeviceToHost, m.stream));
+    }
     WFS_STAGE_MARK (stF);   // uploadIssue: H2D uploads + launches + D2H issue
     PB_RT (cudaEventRecord (m.syncEvent, m.stream));
     PB_RT (cudaEventSynchronize (m.syncEvent));   // blocking-sync event: yields, no spin
@@ -703,6 +900,8 @@ void CudaWfsBackend::release() noexcept
     freeDev (m.dHfAttenDb);    freeDev (m.dFrHfAttenDb);
     m.hfUploaded = false;
     m.frHfUploaded = false;
+
+    m.destroyGraph();
 
     if (m.syncEvent != nullptr) { cudaEventDestroy (m.syncEvent); m.syncEvent = nullptr; }
     if (m.stream != nullptr) { cudaStreamDestroy (m.stream); m.stream = nullptr; }
