@@ -83,9 +83,25 @@ if ($cuda -and (Test-Path (Join-Path $cuda "include\cuda.h")) -and (Get-Command 
 # CRT, see above). Resolve the SDK root from HIP_PATH (set by the HIP SDK shell)
 # or from hipcc's own location; the app is expected to run from a Developer
 # shell so clang++ finds the MSVC toolchain + Windows SDK via INCLUDE/LIB.
-if (Get-Command hipcc -ErrorAction SilentlyContinue) {
-    Write-Host "Building wfs_hip.dll ..."
-    $hipRoot  = if ($env:HIP_PATH) { $env:HIP_PATH } else { Split-Path (Split-Path (Get-Command hipcc).Source) }
+# Detection resolves the SDK by ROOT, not by hipcc being on PATH: the Windows
+# HIP SDK installer sets HIP_PATH but does NOT add its bin\ to PATH, so gating on
+# `Get-Command hipcc` silently skipped the HIP plugin on a machine that had the
+# SDK installed all along.
+$hipRoot = $null
+if ($env:HIP_PATH -and (Test-Path (Join-Path $env:HIP_PATH "bin\clang++.exe"))) {
+    $hipRoot = $env:HIP_PATH.TrimEnd('\')
+} elseif (Get-Command hipcc -ErrorAction SilentlyContinue) {
+    $hipRoot = Split-Path (Split-Path (Get-Command hipcc).Source)
+} else {
+    $latest = Get-ChildItem "C:\Program Files\AMD\ROCm" -Directory -ErrorAction SilentlyContinue |
+              Sort-Object Name -Descending | Select-Object -First 1
+    if ($latest -and (Test-Path (Join-Path $latest.FullName "bin\clang++.exe"))) {
+        $hipRoot = $latest.FullName
+    }
+}
+
+if ($hipRoot) {
+    Write-Host "Building wfs_hip.dll (HIP SDK: $hipRoot) ..."
     $hipClang = Join-Path $hipRoot "bin\clang++.exe"
     & $hipClang -shared -std=c++17 -O2 -fms-runtime-lib=dll -x c++ `
         -D__HIP_PLATFORM_AMD__=1 -DWFS_GPU_NATIVE=1 -DWFS_GPU_HIP=1 `
