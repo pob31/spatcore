@@ -34,6 +34,10 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>      // std::fprintf for the WFS_SDN_TRACE mapping log. Explicit
+                       // because Windows builds this TU with the HIP SDK's clang++
+                       // against the MSVC STL, which -- unlike libstdc++ -- does not
+                       // pull <cstdio> in transitively via the headers below.
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -106,6 +110,8 @@ struct HipSdnBackend::Impl
 
     int numNodes = 0, numPaths = 0, blockSize = 0;
     bool nodeParallel = true;   // WFS_SDN_NODE_PARALLEL=0 forces the lockstep
+    bool trace = false;         // WFS_SDN_TRACE=1 logs each mapping change
+    bool tracedNodes = false; int tracedChunk = -1;
     double sampleRate = 0.0;
     uint32_t ringWritePos = 0;
     bool needUpload = true;
@@ -307,6 +313,7 @@ bool HipSdnBackend::prepare (int numNodes, int blockSize, double sampleRate)
     // thread, where getenv is not something to call per block).
     if (const char* e = std::getenv ("WFS_SDN_NODE_PARALLEL"))
         m.nodeParallel = (std::string (e) != "0");
+    m.trace = (std::getenv ("WFS_SDN_TRACE") != nullptr);
 
     ready = true;
     lastError.clear();
@@ -480,6 +487,15 @@ bool HipSdnBackend::processBlock (const float* const* inputs, float* const* outp
             useNodes = false;
             chunk = m.blockSize;
         }
+    }
+
+    if (m.trace && (useNodes != m.tracedNodes || chunk != m.tracedChunk))
+    {
+        m.tracedNodes = useNodes; m.tracedChunk = chunk;
+        std::fprintf (stderr, "[sdn] mapping=%s chunk=%d/%d minDelay=%d\n",
+                      useNodes ? "node-parallel" : "lockstep", chunk, m.blockSize,
+                      m.cfg.numPaths > 0 ? *std::min_element (m.cfg.delayLength.begin(),
+                                                              m.cfg.delayLength.begin() + m.cfg.numPaths) : -1);
     }
 
     for (int off = 0; off < m.blockSize; off += chunk)
