@@ -163,6 +163,19 @@ target_link_libraries(spatcore-audio PUBLIC
     juce::juce_events
     juce::juce_core)
 
+# The five gpu/Metal*Backend.mm above call into Metal.framework, and NO JUCE
+# module pulls it in (juce_core supplies Foundation/Accelerate/QuartzCore, not
+# Metal - the app supplies it by hand via the .jucer extraLinkerFlags). Without
+# this, any consumer that odr-uses a Metal backend fails to link with undefined
+# _MTLCreateSystemDefaultDevice / _OBJC_CLASS_$_MTLCompileOptions.
+#
+# It has been latent rather than broken only because spatcore-audio is STATIC:
+# nothing referenced those objects, so the linker never extracted them from the
+# archive. PUBLIC so consumers (offline-render, spatcore-tests) inherit it.
+if(APPLE)
+    target_link_libraries(spatcore-audio PUBLIC "-framework Metal")
+endif()
+
 # Consumers may be shared objects (plugin formats); PIC is free on Win/mac
 # and required on Linux (see Plugin/CMakeLists.txt for the ld error text).
 set_target_properties(spatcore-audio PROPERTIES POSITION_INDEPENDENT_CODE ON)

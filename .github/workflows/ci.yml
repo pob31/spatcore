@@ -8,7 +8,17 @@ name: CI
 
 on:
   push:
-    branches: [main, "feature/**", "fix/**"]
+    # EVERY branch, deliberately. This used to be a prefix allowlist, and the
+    # allowlist was wrong without anyone noticing: it listed "feature/**" while
+    # the repo actually uses feat/ (feat/gpu-latency-sdn-parallel,
+    # feat/metal-sdn-node-parallel), so pushes to feature work ran no CI at all
+    # and only the pull_request trigger below fired. Any allowlist has that
+    # failure mode -- it is silent, and it hides exactly the branches still
+    # under development. "**" matches across "/" so nested names are covered.
+    #
+    # Tags are intentionally NOT triggered (a bare `push:` would include them):
+    # a tagged commit has already been built on its branch.
+    branches: ["**"]
   pull_request:
     branches: [main]
 
@@ -40,6 +50,30 @@ jobs:
           sudo apt-get install -y build-essential cmake pkg-config libasound2-dev \
               libfreetype6-dev libfontconfig1-dev libgl1-mesa-dev libcurl4-openssl-dev \
               libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxext-dev
+
+      # The five gpu/Metal*Backend.mm are compiled in TWO ObjC memory modes and
+      # must build in both:
+      #   non-ARC  the app (JUCE's pbxproj sets no CLANG_ENABLE_OBJC_ARC) and
+      #            this example (CMake defaults ARC off)
+      #   ARC      the Experiments/metal-*-test harnesses, which pass -fobjc-arc
+      #
+      # Nothing below catches the ARC leg: the minimal-app build exercises only
+      # the non-ARC one. That gap let a real bug live for weeks -- a lambda
+      # taking id<MTLBuffer> BY REFERENCE is fine without ARC, but under ARC the
+      # parameter defaults to __autoreleasing while callers pass __strong, which
+      # is a hard error. It broke MetalObBackend + MetalWfsBackend (3 and 4
+      # errors) and was invisible to every build in every repo.
+      #
+      # -fsyntax-only, so no Metal device and no link step: runs in seconds on
+      # any macOS runner and needs neither JUCE nor CMake.
+      - name: Metal backends compile under ARC and non-ARC
+        if: matrix.name == 'macos'
+        run: |
+          set -euo pipefail
+          echo "== non-ARC (app + minimal-app) =="
+          clang++ -std=c++17 -DWFS_GPU_NATIVE=1 -I gpu -fsyntax-only gpu/Metal*Backend.mm
+          echo "== ARC (Experiments harnesses) =="
+          clang++ -std=c++17 -fobjc-arc -DWFS_GPU_NATIVE=1 -I gpu -fsyntax-only gpu/Metal*Backend.mm
 
       - name: Configure
         run: cmake -S examples/minimal-app -B examples/minimal-app/build -DCMAKE_BUILD_TYPE=Debug

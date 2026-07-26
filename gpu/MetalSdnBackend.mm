@@ -2,8 +2,8 @@
     MetalSdnBackend implementation (Objective-C++).
 
     The MSL kernel source lives in MetalSdnKernels.h as a string literal,
-    compiled at prepare() into one pipeline state (sdn_process). The shared host
-    math (geometry->delays, decay gains, crossfade state) lives in SdnHostConfig;
+    compiled at prepare() into TWO pipeline states. The shared host math
+    (geometry->delays, decay gains, crossfade state) lives in SdnHostConfig;
     this file owns the Metal buffers and the dispatch.
 
     All buffers use shared storage (Apple Silicon unified memory). Persistent
@@ -13,9 +13,21 @@
     crossfade mix are uploaded whenever a param/geometry change or an in-flight
     crossfade makes them stale.
 
-    Dispatch: ONE threadgroup x numNodes threads (one per node), per-sample
-    lockstep with a device-memory barrier — the network couples nodes within a
-    block, so the whole network must live in one threadgroup.
+    Dispatch — two mappings, chosen per block (mirrors CudaSdnBackend.cpp):
+
+      sdn_process (lockstep)  1 threadgroup x numNodes threads, per-sample
+                              mem_device barrier. Correct for ANY geometry but
+                              occupies exactly one GPU core. The fallback.
+
+      sdn_process_nodes       numNodes threadgroups x 32 lanes, so the work
+                              spreads across cores. Valid only within a chunk of
+                              C samples where every effective delay is >= C
+                              (SdnHostConfig::chunkSamplesForBlock); the host
+                              launches ceil(blockSize/C) dispatches per block.
+
+    Both mappings are bit-identical, so falling back costs only the core spread.
+    WFS_SDN_NODE_PARALLEL=0 forces the lockstep; WFS_SDN_TRACE=1 logs mapping
+    changes. Both are read in prepare() — never getenv on the pump thread.
 */
 
 #include "MetalSdnBackend.h"
@@ -30,8 +42,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <vector>
 
 namespace spatcore::gpu {
@@ -39,6 +54,9 @@ namespace spatcore::gpu {
 namespace
 {
 // Host mirror of the kernel-side SdnParams - layout must match exactly.
+// KEEP IN SYNC with SdnParams in MetalSdnKernels.h (which static_asserts 64 too):
+// this travels through setBytes, so a mismatch is silent garbage, not a compile
+// error. HIP shipped exactly that bug.
 struct SdnParamsGpu
 {
     uint32_t numNodes;
@@ -55,16 +73,30 @@ struct SdnParamsGpu
     float    sdnOutputGain;
     float    inputDistribution;
     float    crossfadeRate;
+    uint32_t sampleOffset;   // first in-block sample of this chunk
+    uint32_t chunkSamples;   // samples in this chunk (== blockSize when unchunked)
 };
+static_assert (sizeof (SdnParamsGpu) == 64, "SdnParamsGpu/SdnParams layout drift");
+
+// Above this many chunks the per-dispatch overhead outweighs the core spread,
+// and the lockstep (one dispatch, any geometry) is the better mapping.
+constexpr int kMaxSdnChunksPerBlock = 8;
 } // namespace
 
 struct MetalSdnBackend::Impl
 {
     id<MTLDevice> device = nil;
     id<MTLCommandQueue> queue = nil;
-    id<MTLComputePipelineState> pso = nil;
+    id<MTLComputePipelineState> pso = nil;        // sdn_process       (lockstep)
+    id<MTLComputePipelineState> psoNodes = nil;   // sdn_process_nodes (grid = numNodes)
 
-    id<MTLBuffer> bParams = nil;
+    // Params live on the HOST and go out via setBytes (by copy) per dispatch --
+    // NOT in an MTLBuffer. A shared buffer mutated between dispatchThreadgroups
+    // calls would hand every chunk the LAST written sampleOffset/chunkSamples,
+    // because encode time != execute time: the CPU finishes all its writes
+    // before commit, and the GPU reads the buffer afterwards.
+    SdnParamsGpu params {};
+
     id<MTLBuffer> bInputs = nil, bOutputs = nil;
     id<MTLBuffer> bDelayLines = nil;
     id<MTLBuffer> bDelayLength = nil, bTargetDelayLength = nil, bCrossfadeMix = nil;
@@ -77,6 +109,11 @@ struct MetalSdnBackend::Impl
     double sampleRate = 0.0;
     uint32_t ringWritePos = 0;
     bool needUpload = true;   // re-upload the dynamic per-path buffers next launch
+
+    bool nodeParallel = true;   // WFS_SDN_NODE_PARALLEL=0 forces the lockstep
+    bool trace = false;         // WFS_SDN_TRACE=1 logs each mapping change
+    bool tracedNodes = false;
+    int  tracedChunk = -1;
 
     SdnHostConfig cfg;        // pump-thread owned after prepare
 
@@ -113,6 +150,9 @@ bool MetalSdnBackend::prepare (int numNodes, int blockSize, double sampleRate)
     m.numPaths = m.cfg.numPaths;
     m.ringWritePos = 0;
     m.needUpload = true;
+    m.nodeParallel = true;    // re-decided below; release() must not leave it latched off
+    m.tracedNodes = false;
+    m.tracedChunk = -1;
 
     @autoreleasepool
     {
@@ -125,10 +165,43 @@ bool MetalSdnBackend::prepare (int numNodes, int blockSize, double sampleRate)
         deviceName = std::string (m.device.name.UTF8String) + " (Metal)";
 
         NSError* err = nil;
+
+        // SAFE math, deliberately - do not drop this to speed the kernel up.
+        //
+        // Metal defaults fast math to ON, and that is not a wash here: it lets the
+        // compiler reassociate the two summation loops in sdn_process_nodes (clean
+        // reductions over a threadgroup array) differently from the lockstep's
+        // gather-interleaved accumulation, so the two mappings stop agreeing
+        // bit-for-bit. Measured on an M4 Pro: with fast math they diverge (~1e-7,
+        // the same order as the CPU/GPU delta); with safe math they are
+        // bit-identical, verified by Experiments/metal-sdn-test.
+        //
+        // Bit-exactness across the pair matters because the host switches mapping
+        // MID-SESSION (a session opens pre-geometry on the lockstep and moves to
+        // node-parallel once geometry arrives), and because CUDA/HIP are bit-exact
+        // across the same pair for free - NVRTC does not reassociate without
+        // --use_fast_math. Cost here is ~2% on the node-parallel path
+        // (1.254 -> 1.277 ms at 32 nodes x 256, against a 5.33 ms budget).
+        MTLCompileOptions* copts = [[MTLCompileOptions alloc] init];
+#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 150000
+        if (@available (macOS 15.0, *))
+            copts.mathMode = MTLMathModeSafe;
+        else
+#endif
+        {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            copts.fastMathEnabled = NO;      // pre-15 spelling of the same thing
+#pragma clang diagnostic pop
+        }
+
         id<MTLLibrary> lib = [m.device newLibraryWithSource:
                                   [NSString stringWithUTF8String: kSdnProcessKernelSource]
-                                                    options: nil
+                                                    options: copts
                                                       error: &err];
+#if ! __has_feature(objc_arc)
+        [copts release];   // the app builds these .mm without ARC; the harness with it
+#endif
         if (lib == nil)
         {
             lastError = std::string ("SDN kernel compile failed: ")
@@ -153,6 +226,19 @@ bool MetalSdnBackend::prepare (int numNodes, int blockSize, double sampleRate)
             return false;
         }
 
+        // Node-parallel twin. A failure here is NOT fatal: the lockstep is
+        // bit-identical and correct for any geometry, so fall back rather than
+        // refuse to prepare. maxTotalThreadsPerThreadgroup is a PER-PIPELINE
+        // property (a register-heavy kernel can sit below the device max), so it
+        // must be checked on this pipeline, not on m.pso -- exceeding it at
+        // dispatch throws on the pump thread, i.e. a hard crash in audio.
+        id<MTLFunction> fnNodes = [lib newFunctionWithName: @"sdn_process_nodes"];
+        if (fnNodes != nil)
+            m.psoNodes = [m.device newComputePipelineStateWithFunction: fnNodes error: &err];
+
+        if (m.psoNodes == nil || m.psoNodes.maxTotalThreadsPerThreadgroup < 32)
+            m.nodeParallel = false;
+
         m.queue = [m.device newCommandQueue];
 
         const int N = m.numNodes;
@@ -165,7 +251,6 @@ bool MetalSdnBackend::prepare (int numNodes, int blockSize, double sampleRate)
         auto mkF = [&](size_t floats) { return [m.device newBufferWithLength: floats * sizeof (float) options: shared]; };
         auto mkI = [&](size_t ints)   { return [m.device newBufferWithLength: ints  * sizeof (int)   options: shared]; };
 
-        m.bParams  = [m.device newBufferWithLength: sizeof (SdnParamsGpu) options: shared];
         m.bInputs  = mkF ((size_t) N * m.blockSize);
         m.bOutputs = mkF ((size_t) N * m.blockSize);
 
@@ -185,7 +270,7 @@ bool MetalSdnBackend::prepare (int numNodes, int blockSize, double sampleRate)
         m.bToneState = mkF ((size_t) N);
         m.bDcState   = mkF ((size_t) N * 2);
 
-        if (! (m.bParams && m.bInputs && m.bOutputs && m.bDelayLines && m.bDelayLength
+        if (! (m.bInputs && m.bOutputs && m.bDelayLines && m.bDelayLength
                && m.bTargetDelayLength && m.bCrossfadeMix && m.bGainLow && m.bGainMid
                && m.bGainHigh && m.bDecayLowState && m.bDecayHighState && m.bDiffuserDelays
                && m.bDiffRings && m.bDiffWritePos && m.bToneState && m.bDcState))
@@ -213,14 +298,88 @@ bool MetalSdnBackend::prepare (int numNodes, int blockSize, double sampleRate)
         memset (m.bToneState.contents, 0, m.bToneState.length);
         memset (m.bDcState.contents,   0, m.bDcState.length);
 
-        SdnParamsGpu p { (uint32_t) N, (uint32_t) m.numPaths, (uint32_t) m.blockSize,
-                         (uint32_t) SdnHostConfig::MAX_DELAY_SAMPLES, 0u,
-                         (uint32_t) m.cfg.maxDiffLen,
-                         m.cfg.diffusionCoeff, m.cfg.toneCoeff, m.cfg.lowCoeff,
-                         m.cfg.highCoeff, SdnHostConfig::DC_POLE, m.cfg.sdnOutputGain,
-                         m.cfg.inputDistribution, m.cfg.crossfadeRate };
-        memcpy (m.bParams.contents, &p, sizeof (p));
+        m.params = SdnParamsGpu { (uint32_t) N, (uint32_t) m.numPaths, (uint32_t) m.blockSize,
+                                  (uint32_t) SdnHostConfig::MAX_DELAY_SAMPLES, 0u,
+                                  (uint32_t) m.cfg.maxDiffLen,
+                                  m.cfg.diffusionCoeff, m.cfg.toneCoeff, m.cfg.lowCoeff,
+                                  m.cfg.highCoeff, SdnHostConfig::DC_POLE, m.cfg.sdnOutputGain,
+                                  m.cfg.inputDistribution, m.cfg.crossfadeRate,
+                                  0u, (uint32_t) m.blockSize };
+
+        // Warm up BOTH pipelines, then restore pristine state. The first dispatch
+        // of a pipeline pays driver setup + page faulting, and that is exactly the
+        // burst of underruns seen right after an engine (re)start. Both matter,
+        // not just the one that runs first: a session opens pre-geometry with
+        // every delay at 1 (so chunkSamplesForBlock collapses to 1 and the
+        // lockstep is chosen) and only switches to the node-parallel mapping once
+        // real geometry arrives -- which would otherwise pay a SECOND first-launch
+        // stall mid-session, with audio running.
+        //
+        // Warming the node-parallel kernel here races on the delay lines (the
+        // pre-geometry delays are far below any safe chunk window), which is
+        // harmless and deliberate: every value it touches is zeroed immediately
+        // below, and the point is to fault in the code path, not to compute.
+        if (N >= 2)
+        {
+            SdnParamsGpu warm = m.params;
+            warm.sampleOffset = 0u;
+            warm.chunkSamples = 1u;
+
+            id<MTLCommandBuffer> cb = [m.queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+
+            [enc setComputePipelineState: m.pso];
+            [enc setBytes: &warm length: sizeof (warm) atIndex: 0];
+            [enc setBuffer: m.bInputs            offset: 0 atIndex: 1];
+            [enc setBuffer: m.bOutputs           offset: 0 atIndex: 2];
+            [enc setBuffer: m.bDelayLines        offset: 0 atIndex: 3];
+            [enc setBuffer: m.bDelayLength       offset: 0 atIndex: 4];
+            [enc setBuffer: m.bTargetDelayLength offset: 0 atIndex: 5];
+            [enc setBuffer: m.bCrossfadeMix      offset: 0 atIndex: 6];
+            [enc setBuffer: m.bGainLow           offset: 0 atIndex: 7];
+            [enc setBuffer: m.bGainMid           offset: 0 atIndex: 8];
+            [enc setBuffer: m.bGainHigh          offset: 0 atIndex: 9];
+            [enc setBuffer: m.bDecayLowState     offset: 0 atIndex: 10];
+            [enc setBuffer: m.bDecayHighState    offset: 0 atIndex: 11];
+            [enc setBuffer: m.bDiffuserDelays    offset: 0 atIndex: 12];
+            [enc setBuffer: m.bDiffRings         offset: 0 atIndex: 13];
+            [enc setBuffer: m.bDiffWritePos      offset: 0 atIndex: 14];
+            [enc setBuffer: m.bToneState         offset: 0 atIndex: 15];
+            [enc setBuffer: m.bDcState           offset: 0 atIndex: 16];
+            [enc dispatchThreadgroups: MTLSizeMake (1, 1, 1)
+                  threadsPerThreadgroup: MTLSizeMake ((NSUInteger) N, 1, 1)];
+
+            if (m.psoNodes != nil)   // bindings persist across setComputePipelineState
+            {
+                [enc setComputePipelineState: m.psoNodes];
+                [enc setBytes: &warm length: sizeof (warm) atIndex: 0];
+                [enc dispatchThreadgroups: MTLSizeMake ((NSUInteger) N, 1, 1)
+                      threadsPerThreadgroup: MTLSizeMake (32, 1, 1)];
+            }
+
+            [enc endEncoding];
+            [cb commit];
+            [cb waitUntilCompleted];
+
+            // Restore pristine first-launch state, so the first audible block is
+            // bit-identical to a prepare() that never warmed up.
+            memset (m.bDelayLines.contents,     0, m.bDelayLines.length);
+            memset (m.bDecayLowState.contents,  0, m.bDecayLowState.length);
+            memset (m.bDecayHighState.contents, 0, m.bDecayHighState.length);
+            memset (m.bDiffRings.contents,      0, m.bDiffRings.length);
+            memset (m.bDiffWritePos.contents,   0, m.bDiffWritePos.length);
+            memset (m.bToneState.contents,      0, m.bToneState.length);
+            memset (m.bDcState.contents,        0, m.bDcState.length);
+            memset (m.bOutputs.contents,        0, m.bOutputs.length);
+            m.ringWritePos = 0;
+        }
     }
+
+    // Escape hatch + trace. Read HERE, never in processBlock: that runs on the
+    // reverb pump thread, where getenv is not something to call per block.
+    if (const char* e = std::getenv ("WFS_SDN_NODE_PARALLEL"))
+        m.nodeParallel = m.nodeParallel && (std::string (e) != "0");
+    m.trace = (std::getenv ("WFS_SDN_TRACE") != nullptr);
 
     ready = true;
     lastError.clear();
@@ -339,12 +498,11 @@ bool MetalSdnBackend::processBlock (const float* const* inputs, float* const* ou
             memcpy (m.bGainMid.contents,  m.cfg.gainMid.data(),  (size_t) P * sizeof (float));
             memcpy (m.bGainHigh.contents, m.cfg.gainHigh.data(), (size_t) P * sizeof (float));
 
-            auto* pp = (SdnParamsGpu*) m.bParams.contents;
-            pp->diffusionCoeff = m.cfg.diffusionCoeff;
-            pp->lowCoeff = m.cfg.lowCoeff;
-            pp->highCoeff = m.cfg.highCoeff;
-            pp->sdnOutputGain = m.cfg.sdnOutputGain;
-            pp->crossfadeRate = m.cfg.crossfadeRate;
+            m.params.diffusionCoeff = m.cfg.diffusionCoeff;
+            m.params.lowCoeff = m.cfg.lowCoeff;
+            m.params.highCoeff = m.cfg.highCoeff;
+            m.params.sdnOutputGain = m.cfg.sdnOutputGain;
+            m.params.crossfadeRate = m.cfg.crossfadeRate;
             m.needUpload = false;
         }
 
@@ -359,13 +517,48 @@ bool MetalSdnBackend::processBlock (const float* const* inputs, float* const* ou
         }
 
         // Block-start write head.
-        ((SdnParamsGpu*) m.bParams.contents)->ringWritePos = m.ringWritePos;
+        m.params.ringWritePos = m.ringWritePos;
+
+        // Pick the mapping for THIS block. The node-parallel kernel needs a chunk
+        // window inside which no node reads a cell another node writes, and a
+        // chunk boundary costs a dispatch, so it only pays while the geometry
+        // keeps the window wide. A degenerate or not-yet-received geometry
+        // collapses the window towards 1 sample; the lockstep handles that in one
+        // dispatch and is bit-identical, so falling back costs only the spread.
+        int chunk = m.blockSize;
+        bool useNodes = m.nodeParallel && N >= 2 && m.psoNodes != nil;
+        if (useNodes)
+        {
+            chunk = m.cfg.chunkSamplesForBlock (m.blockSize);
+            const int chunks = (m.blockSize + chunk - 1) / chunk;
+            if (chunks > kMaxSdnChunksPerBlock)
+            {
+                useNodes = false;
+                chunk = m.blockSize;
+            }
+        }
+
+        if (m.trace && (useNodes != m.tracedNodes || chunk != m.tracedChunk))
+        {
+            m.tracedNodes = useNodes; m.tracedChunk = chunk;
+            std::fprintf (stderr, "[sdn] mapping=%s chunk=%d/%d minDelay=%d\n",
+                          useNodes ? "node-parallel" : "lockstep", chunk, m.blockSize,
+                          m.cfg.numPaths > 0 ? *std::min_element (m.cfg.delayLength.begin(),
+                                                                  m.cfg.delayLength.begin() + m.cfg.numPaths) : -1);
+        }
 
         id<MTLCommandBuffer> cb = [m.queue commandBuffer];
+        // SERIAL encoder, and that is load-bearing: Metal orders successive
+        // dispatchThreadgroups on a serial encoder and makes each one's side
+        // effects visible to the next, which is exactly the launch boundary the
+        // node-parallel chunk contract requires (memoryBarrierWithScope: is
+        // "allowed, but ignored" on a serial encoder -- it has nothing to add).
+        // NEVER switch this to computeCommandEncoderWithDispatchType:
+        // MTLDispatchTypeConcurrent: chunk k+1's gather would race chunk k's
+        // scatter and the SDN would go quietly, non-deterministically wrong.
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
 
-        [enc setComputePipelineState: m.pso];
-        [enc setBuffer: m.bParams            offset: 0 atIndex: 0];
+        [enc setComputePipelineState: useNodes ? m.psoNodes : m.pso];
         [enc setBuffer: m.bInputs            offset: 0 atIndex: 1];
         [enc setBuffer: m.bOutputs           offset: 0 atIndex: 2];
         [enc setBuffer: m.bDelayLines        offset: 0 atIndex: 3];
@@ -383,8 +576,20 @@ bool MetalSdnBackend::processBlock (const float* const* inputs, float* const* ou
         [enc setBuffer: m.bToneState         offset: 0 atIndex: 15];
         [enc setBuffer: m.bDcState           offset: 0 atIndex: 16];
 
-        [enc dispatchThreadgroups: MTLSizeMake (1, 1, 1)
-            threadsPerThreadgroup: MTLSizeMake ((NSUInteger) N, 1, 1)];
+        const MTLSize tgCount = useNodes ? MTLSizeMake ((NSUInteger) N, 1, 1)
+                                         : MTLSizeMake (1, 1, 1);
+        const MTLSize tgSize  = useNodes ? MTLSizeMake (32, 1, 1)
+                                         : MTLSizeMake ((NSUInteger) N, 1, 1);
+
+        for (int off = 0; off < m.blockSize; off += chunk)
+        {
+            m.params.sampleOffset = (uint32_t) off;
+            m.params.chunkSamples = (uint32_t) std::min (chunk, m.blockSize - off);
+            // BY COPY, per dispatch. A shared MTLBuffer mutated between dispatches
+            // would give EVERY dispatch the last-written value (see Impl::params).
+            [enc setBytes: &m.params length: sizeof (SdnParamsGpu) atIndex: 0];
+            [enc dispatchThreadgroups: tgCount threadsPerThreadgroup: tgSize];
+        }
 
         [enc endEncoding];
         [cb commit];
@@ -421,12 +626,13 @@ void MetalSdnBackend::release() noexcept
     auto& m = *impl;
     @autoreleasepool
     {
-        m.bParams = m.bInputs = m.bOutputs = nil;
+        m.bInputs = m.bOutputs = nil;
         m.bDelayLines = m.bDelayLength = m.bTargetDelayLength = m.bCrossfadeMix = nil;
         m.bGainLow = m.bGainMid = m.bGainHigh = nil;
         m.bDecayLowState = m.bDecayHighState = nil;
         m.bDiffuserDelays = m.bDiffRings = m.bDiffWritePos = nil;
         m.bToneState = m.bDcState = nil;
+        m.psoNodes = nil;
         m.pso = nil;
         m.queue = nil;
         m.device = nil;
