@@ -8,7 +8,12 @@ name: CI
 
 on:
   push:
-    branches: [main, "feature/**", "fix/**"]
+    # "feat/**" is the prefix this repo actually uses (feat/gpu-latency-sdn-parallel,
+    # feat/metal-sdn-node-parallel); "feature/**" has never matched a real branch,
+    # so before this line every push to feature work skipped CI entirely and only
+    # the pull_request trigger below ran. Both kept: renaming a trigger is not
+    # worth breaking anyone's muscle memory.
+    branches: [main, "feat/**", "feature/**", "fix/**"]
   pull_request:
     branches: [main]
 
