@@ -8,12 +8,17 @@ name: CI
 
 on:
   push:
-    # "feat/**" is the prefix this repo actually uses (feat/gpu-latency-sdn-parallel,
-    # feat/metal-sdn-node-parallel); "feature/**" has never matched a real branch,
-    # so before this line every push to feature work skipped CI entirely and only
-    # the pull_request trigger below ran. Both kept: renaming a trigger is not
-    # worth breaking anyone's muscle memory.
-    branches: [main, "feat/**", "feature/**", "fix/**"]
+    # EVERY branch, deliberately. This used to be a prefix allowlist, and the
+    # allowlist was wrong without anyone noticing: it listed "feature/**" while
+    # the repo actually uses feat/ (feat/gpu-latency-sdn-parallel,
+    # feat/metal-sdn-node-parallel), so pushes to feature work ran no CI at all
+    # and only the pull_request trigger below fired. Any allowlist has that
+    # failure mode -- it is silent, and it hides exactly the branches still
+    # under development. "**" matches across "/" so nested names are covered.
+    #
+    # Tags are intentionally NOT triggered (a bare `push:` would include them):
+    # a tagged commit has already been built on its branch.
+    branches: ["**"]
   pull_request:
     branches: [main]
 
