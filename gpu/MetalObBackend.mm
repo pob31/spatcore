@@ -455,9 +455,16 @@ bool MetalObBackend::processBlock (const float* const* inputs, float* const* out
         // reading either slot while we write it. (Shared storage: a skipped
         // memcpy leaves the slot's previous contents intact — CUDA skip
         // semantics exactly.)
+        // __strong on the by-reference id params is required, not decorative:
+        // under -fobjc-arc a reference-to-id parameter defaults to __autoreleasing
+        // while the callers below pass __strong locals, which is a hard error.
+        // The app builds these .mm WITHOUT ARC (JUCE's pbxproj sets no
+        // CLANG_ENABLE_OBJC_ARC) so it never sees it, but the Experiments
+        // harnesses build WITH ARC -- and the qualifier is a no-op in non-ARC
+        // mode, so this keeps both modes compiling.
         auto stagePair = [matrix] (Impl::PingPong& pp, const float* staged,
                                    std::vector<float>& last,
-                                   id<MTLBuffer>& prevArg, id<MTLBuffer>& currArg)
+                                   __strong id<MTLBuffer>& prevArg, __strong id<MTLBuffer>& currArg)
         {
             const size_t bytes = (size_t) matrix * sizeof (float);
             if (pp.everUploaded && std::memcmp (staged, last.data(), bytes) == 0)

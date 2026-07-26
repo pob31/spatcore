@@ -388,9 +388,11 @@ bool MetalWfsBackend::processBlock (const float* const* inputs, float* const* ou
         // reading either slot while we write it. (Shared storage: a skipped
         // memcpy leaves the slot's previous contents intact — the CUDA skip
         // semantics exactly.)
+        // __strong required for ARC builds (the Experiments harnesses); a no-op
+        // without ARC (the app). See the twin comment in MetalObBackend.mm.
         auto stagePair = [matrix] (Impl::PingPong& pp, const float* staged,
                                    std::vector<float>& last,
-                                   id<MTLBuffer>& prevArg, id<MTLBuffer>& currArg)
+                                   __strong id<MTLBuffer>& prevArg, __strong id<MTLBuffer>& currArg)
         {
             const size_t bytes = (size_t) matrix * sizeof (float);
             if (pp.everUploaded && std::memcmp (staged, last.data(), bytes) == 0)
