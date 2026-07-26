@@ -6,15 +6,39 @@
     other native kernels). KEEP IN SYNC with CudaSdnKernels.h — the two strings
     implement the byte-identical algorithm; only the language scaffolding differs.
 
-    sdn_process — one coupled Scattering Delay Network across all nodes, a
-    sample-exact port of the synchronous SDNAlgorithm::processBlock
-    (Source/DSP/ReverbSDNAlgorithm.h). The network is recurrent and couples
-    nodes within a block (an inter-node delay can be shorter than the block), so
-    the whole block runs sample-by-sample inside ONE launch, with all per-path /
-    per-node state persisting across launches in device buffers.
+    TWO kernels, bit-identical to each other and selected per block by the host
+    (mirroring CudaSdnKernels.h):
 
-    Mapping: ONE THREADGROUP, one THREAD per node (N <= 16). A node-thread owns
-    its node's diffuser + tone/DC output state; the per-path delay lines and
+    sdn_process       — the original lockstep. ONE threadgroup, one THREAD per
+                        node (N <= MAX_NODES = 32), one barrier per sample. That
+                        barrier must stay mem_device: thread n writes
+                        delayLines[pathIndex(n,i)] at sample s and thread i reads
+                        it at s+1, which is cross-thread DEVICE traffic that
+                        mem_threadgroup does NOT order. Correct for ANY geometry,
+                        including single-sample inter-node delays, but it occupies
+                        exactly one GPU core. Retained as the fallback.
+
+    sdn_process_nodes — grid = numNodes threadgroups (so the work spreads across
+                        cores), 32 lanes each, one lane per path. Requires the
+                        host to launch it in chunks of C samples where every
+                        effective delay is >= C (SdnHostConfig::
+                        chunkSamplesForBlock); inside such a window nodes are
+                        mutually independent, so no cross-threadgroup barrier is
+                        needed. A chunk boundary is a DISPATCH boundary — on
+                        Metal a serial compute encoder orders successive
+                        dispatchThreadgroups and makes each one's side effects
+                        visible to the next, which is the analogue of a CUDA
+                        kernel-launch boundary. See MetalSdnBackend.mm.
+
+    Both process [sampleOffset, sampleOffset + chunkSamples) of the block. All
+    sample-derived quantities stay BLOCK-relative — ringWritePos advances once
+    per block, and the crossfade term is mix + crossfadeRate * s — so s must
+    remain the absolute in-block index, not the in-chunk one.
+
+    A sample-exact port of the synchronous SDNAlgorithm::processBlock
+    (spatcore/reverb/ReverbSDNAlgorithm.h). The network is recurrent and couples
+    nodes within a block (an inter-node delay can be shorter than the block).
+    A node owns its diffuser + tone/DC output state; the per-path delay lines and
     3-band decay-filter state live in device buffers indexed by pathIndex.
 
     Per sample (CPU op order preserved exactly):
@@ -60,7 +84,16 @@ struct SdnParams
     float sdnOutputGain;     // (1 + 18/N) * 0.25
     float inputDistribution; // 1/N
     float crossfadeRate;     // global; 1/(sr*0.01) while crossfading
+    uint  sampleOffset;      // first in-block sample of this chunk
+    uint  chunkSamples;      // samples in this chunk (== blockSize when unchunked)
 };
+
+// This struct exists TWICE (here and SdnParamsGpu in MetalSdnBackend.mm) and it
+// travels through setBytes, so a field-order or size mismatch is not a compile
+// error anywhere — it is silent garbage. HIP shipped exactly that bug. 16
+// consecutive 4-byte scalars pack with no padding: 64 bytes, align 4.
+static_assert (sizeof (SdnParams) == 64,
+               "SdnParams must match SdnParamsGpu in MetalSdnBackend.mm (16 x 4-byte scalars)");
 
 inline uint sdnPathIndex (uint from, uint to, uint n)
 {
@@ -112,8 +145,9 @@ kernel void sdn_process (
     device float* dr0 = diffRings + (ulong) (n * NUM_DIFFUSERS + 0u) * p.maxDiffLen;
     device float* dr1 = diffRings + (ulong) (n * NUM_DIFFUSERS + 1u) * p.maxDiffLen;
 
-    for (uint s = 0; s < p.blockSize; ++s)
+    for (uint sc = 0; sc < p.chunkSamples; ++sc)
     {
+        const uint s = p.sampleOffset + sc;   // block-relative (see header note)
         const int base = (int) (p.ringWritePos + s);
 
         // 1. read incoming from every path i->n; Householder sum.
@@ -206,5 +240,181 @@ kernel void sdn_process (
     dcState[n * 2u + 1u] = dcY1;
     diffWritePos[n * NUM_DIFFUSERS + 0u] = dfWp0;
     diffWritePos[n * NUM_DIFFUSERS + 1u] = dfWp1;
+}
+
+/*
+    Node-parallel twin. grid = numNodes threadgroups, 32 lanes each.
+
+    BIT-EXACT vs sdn_process. The two accumulations that fix the result -- sumIn
+    over the incoming vector and the Householder output sum -- keep their exact
+    path order and stay on a single lane. What is parallelised is the MEMORY
+    traffic on either side of them: the N-1 gather loads and the N-1 scatter
+    read-modify-writes, one path per lane. Anything recursive across samples
+    (diffusers, tone, DC blocker) is inherently serial and stays on lane 0, which
+    publishes its result through threadgroup memory.
+
+    Two barriers per sample, both intra-threadgroup and therefore cheap:
+      A  after the cooperative gather, before lane 0 reads all of sIncoming
+      B  after lane 0 publishes sX/sDiffused, before the others read them
+    mem_threadgroup is the right scope for BOTH: they only publish threadgroup
+    data. The gather's device READS need no fence (a read is not a side effect
+    anyone must observe), and the scatter's device WRITES are read by other
+    threadgroups only in a LATER chunk, which the dispatch boundary orders.
+    No third barrier is needed to protect sIncoming from the next iteration:
+    lane 0's full-vector read happens before B, and every other lane rewrites
+    only its own slot after B.
+
+    The barriers sit OUTSIDE the `t < inCount` guards on purpose -- at N = 32,
+    lane 31 does no work but must still reach A and B or the threadgroup hangs.
+*/
+kernel void sdn_process_nodes (
+    constant SdnParams&   p                 [[buffer(0)]],
+    const device float*   inputs            [[buffer(1)]],
+    device float*         outputs           [[buffer(2)]],
+    device float*         delayLines        [[buffer(3)]],
+    const device int*     delayLength       [[buffer(4)]],
+    const device int*     targetDelayLength [[buffer(5)]],
+    const device float*   crossfadeMix      [[buffer(6)]],
+    const device float*   gainLow           [[buffer(7)]],
+    const device float*   gainMid           [[buffer(8)]],
+    const device float*   gainHigh          [[buffer(9)]],
+    device float*         decayLowState     [[buffer(10)]],
+    device float*         decayHighState    [[buffer(11)]],
+    const device int*     diffuserDelays    [[buffer(12)]],
+    device float*         diffRings         [[buffer(13)]],
+    device int*           diffWritePos      [[buffer(14)]],
+    device float*         toneState         [[buffer(15)]],
+    device float*         dcState           [[buffer(16)]],
+    uint n [[threadgroup_position_in_grid]],
+    uint t [[thread_position_in_threadgroup]])
+{
+    const uint N = p.numNodes;
+    if (n >= N)
+        return;                       // threadgroup-uniform: whole group leaves, barrier-safe
+    const uint inCount = N - 1u;
+
+    // Threadgroup, not a per-lane array: the lockstep's float incoming[32] is
+    // indexed by a runtime-bounded loop, so it cannot live in registers.
+    threadgroup float sIncoming[32];
+    threadgroup float sX;
+    threadgroup float sDiffused;
+
+    const uint   MAXD = p.maxDelaySamples;
+    const int    iMAXD = (int) MAXD;
+    const float  invN = p.inputDistribution;
+    const float  twoOverNm1 = 2.0f / (float) (N - 1u);
+    const float  c = p.diffusionCoeff;
+    const bool   doDiffuse = (c > 0.0001f);
+
+    // Slot t of the incoming vector is source node (t < n ? t : t + 1), and the
+    // scatter walks the destinations in that same order, so one index serves
+    // both -- exactly the k / outIdx correspondence of the lockstep.
+    const uint peer = (t < n) ? t : t + 1u;
+
+    float toneSt = toneState[n];
+    float dcX1   = dcState[n * 2u + 0u];
+    float dcY1   = dcState[n * 2u + 1u];
+    int   dfWp0  = diffWritePos[n * NUM_DIFFUSERS + 0u];
+    int   dfWp1  = diffWritePos[n * NUM_DIFFUSERS + 1u];
+    const int diffLen0 = diffuserDelays[n * NUM_DIFFUSERS + 0u];
+    const int diffLen1 = diffuserDelays[n * NUM_DIFFUSERS + 1u];
+    device float* dr0 = diffRings + (ulong) (n * NUM_DIFFUSERS + 0u) * p.maxDiffLen;
+    device float* dr1 = diffRings + (ulong) (n * NUM_DIFFUSERS + 1u) * p.maxDiffLen;
+
+    for (uint sc = 0; sc < p.chunkSamples; ++sc)
+    {
+        const uint s = p.sampleOffset + sc;   // block-relative (see header note)
+        const int base = (int) (p.ringWritePos + s);
+
+        // -- gather: one incoming path per lane -----------------------------
+        if (t < inCount)
+        {
+            const uint pidx = sdnPathIndex (peer, n, N);
+            const float mix = crossfadeMix[pidx];
+            float val;
+            if (mix >= 1.0f)
+            {
+                int rp = (base - delayLength[pidx]) % iMAXD;
+                if (rp < 0) rp += iMAXD;
+                val = delayLines[(ulong) pidx * MAXD + (uint) rp];
+            }
+            else
+            {
+                int orp = (base - delayLength[pidx]) % iMAXD;
+                if (orp < 0) orp += iMAXD;
+                int nrp = (base - targetDelayLength[pidx]) % iMAXD;
+                if (nrp < 0) nrp += iMAXD;
+                const float oldS = delayLines[(ulong) pidx * MAXD + (uint) orp];
+                const float newS = delayLines[(ulong) pidx * MAXD + (uint) nrp];
+                const float m = fmin (1.0f, mix + p.crossfadeRate * (float) s);
+                val = oldS * (1.0f - m) + newS * m;
+            }
+            sIncoming[t] = val;
+        }
+        threadgroup_barrier (mem_flags::mem_threadgroup);            // barrier A
+
+        // -- serial core: summation order is the bit-exactness contract ------
+        if (t == 0u)
+        {
+            float sumIn = 0.0f;
+            for (uint i = 0u; i < inCount; ++i)
+                sumIn += sIncoming[i];
+            const float X = twoOverNm1 * sumIn;
+
+            float output = 0.0f;
+            for (uint i = 0u; i < inCount; ++i)
+                output += (X - sIncoming[i]);
+
+            float diffused = inputs[n * p.blockSize + s];
+            if (doDiffuse)
+            {
+                { float delayed = dr0[(uint) dfWp0]; float v = diffused - c * delayed;
+                  dr0[(uint) dfWp0] = v; if (++dfWp0 >= diffLen0) dfWp0 = 0; diffused = delayed + c * v; }
+                { float delayed = dr1[(uint) dfWp1]; float v = diffused - c * delayed;
+                  dr1[(uint) dfWp1] = v; if (++dfWp1 >= diffLen1) dfWp1 = 0; diffused = delayed + c * v; }
+            }
+
+            toneSt += p.toneCoeff * (output - toneSt);
+            const float toned = toneSt;
+            const float dcOut = toned - dcX1 + p.dcPole * dcY1;
+            dcX1 = toned;
+            dcY1 = dcOut;
+            outputs[n * p.blockSize + s] = dcOut * p.sdnOutputGain;
+
+            sX = X;
+            sDiffused = diffused;
+        }
+        threadgroup_barrier (mem_flags::mem_threadgroup);            // barrier B
+
+        // -- scatter: one outgoing path per lane -----------------------------
+        if (t < inCount)
+        {
+            const uint writePos = (uint) (base % iMAXD);
+            const uint pidx = sdnPathIndex (n, peer, N);
+            const float signal = (sX - sIncoming[t]) + sDiffused * invN;
+
+            float lowS  = decayLowState[pidx];
+            float highS = decayHighState[pidx];
+            lowS  += p.lowCoeff  * (signal - lowS);
+            highS += p.highCoeff * (signal - highS);
+            const float low  = lowS;
+            const float high = signal - highS;
+            const float mid  = highS - lowS;
+            const float outSig = low * gainLow[pidx] + mid * gainMid[pidx] + high * gainHigh[pidx];
+            decayLowState[pidx]  = lowS;
+            decayHighState[pidx] = highS;
+
+            delayLines[(ulong) pidx * MAXD + writePos] = outSig;
+        }
+    }
+
+    if (t == 0u)
+    {
+        toneState[n] = toneSt;
+        dcState[n * 2u + 0u] = dcX1;
+        dcState[n * 2u + 1u] = dcY1;
+        diffWritePos[n * NUM_DIFFUSERS + 0u] = dfWp0;
+        diffWritePos[n * NUM_DIFFUSERS + 1u] = dfWp1;
+    }
 }
 )MSL";
