@@ -84,6 +84,15 @@ struct ChangeRecord
         queryable history (mcp.get_ai_change_history still returns it);
         only its toast presence goes away. */
     bool isSelfCorrected = false;
+
+    /** False for records that document an action which cannot be reversed
+        — writing files to disk being the motivating case. Such a record
+        still belongs in the history (the operator should be able to see
+        that the AI saved their session), but the undo engine must step
+        over it rather than attempt a revert, and it must not invalidate
+        redo history. Defaults to true: a record is undoable unless the
+        tool that produced it says otherwise. */
+    bool undoable = true;
 };
 
 /** Thread-safe ring buffer of AI change records. Capacity is fixed at

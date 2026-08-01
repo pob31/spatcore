@@ -1,5 +1,6 @@
 #include "MCPDispatcher.h"
 #include <juce_events/juce_events.h>
+#include <algorithm>
 
 namespace spatcore::control::mcp
 {
@@ -35,9 +36,11 @@ MCPDispatcher::MCPDispatcher (ServerIdentity serverIdentity,
 }
 
 juce::String MCPDispatcher::handleRequest (const juce::String& body,
-                                           const juce::String& clientIP,
-                                           int clientPort)
+                                           const RequestContext& context)
 {
+    const juce::String& clientIP = context.clientIP;
+    const int clientPort = context.clientPort;
+
     // Parse the body as JSON. Anything that isn't an object → -32700.
     juce::var parsed = juce::JSON::fromString (body);
     auto* obj = asObject (parsed);
@@ -85,11 +88,24 @@ juce::String MCPDispatcher::handleRequest (const juce::String& body,
 // initialize / initialized
 //==============================================================================
 
-juce::String MCPDispatcher::handleInitialize (const juce::var& id, const juce::var& /*params*/)
+juce::String MCPDispatcher::handleInitialize (const juce::var& id, const juce::var& params)
 {
-    // The client's protocolVersion in params is informational for Phase 1;
-    // we always advertise our supported revision and let MCP's negotiation
-    // logic on the client side accept or reject.
+    // Version negotiation, per the MCP spec: if the client asked for a
+    // revision we support, answer with that same revision so it can hold
+    // its own behaviour steady. Otherwise answer with our latest and let
+    // the client decide whether it can live with it.
+    juce::String requestedVersion;
+    if (auto* paramsObj = asObject (params))
+        requestedVersion = paramsObj->getProperty ("protocolVersion").toString().trim();
+
+    const juce::String negotiatedVersion = protocol::isSupported (requestedVersion)
+                                               ? requestedVersion
+                                               : juce::String (protocol::kLatest);
+
+    if (requestedVersion.isNotEmpty() && ! protocol::isSupported (requestedVersion))
+        mcpLogger.logInfo ("Client requested unsupported protocol revision "
+                           + requestedVersion + "; offering " + negotiatedVersion);
+
     auto serverInfo = std::make_unique<juce::DynamicObject>();
     serverInfo->setProperty ("name",    identity.name);
     serverInfo->setProperty ("version", identity.version);
@@ -110,7 +126,7 @@ juce::String MCPDispatcher::handleInitialize (const juce::var& id, const juce::v
     capabilities->setProperty ("prompts",   juce::var (promptsCap.release()));
 
     auto result = std::make_unique<juce::DynamicObject>();
-    result->setProperty ("protocolVersion", juce::String (kProtocolVersion));
+    result->setProperty ("protocolVersion", negotiatedVersion);
     result->setProperty ("capabilities",    juce::var (capabilities.release()));
     result->setProperty ("serverInfo",      juce::var (serverInfo.release()));
 
@@ -138,17 +154,26 @@ juce::String MCPDispatcher::handleInitialized()
 
 juce::String MCPDispatcher::handleToolsList (const juce::var& id)
 {
-    // Order the response by (tier DESC, name ASC). Several MCP clients
-    // truncate tools/list to a fixed cap (commonly ~100-256) before
-    // surfacing the tools to the model. With 393 tools registered, an
-    // alphabetical-only response pushes tier-3 (e.g.
-    // system_i_o_set_input_channels at position 311) out of the visible
-    // window, making tier-3 destructive operations effectively
-    // unreachable. Putting tier-3 first (7 tools), tier-2 next (29),
-    // tier-1 last keeps the rare-but-critical operations visible even
-    // under aggressive truncation. Within each tier, alphabetical for
-    // stable ordering across calls.
-    auto descriptors = registry.all();  // copy so we can sort without mutating the registry
+    // Only advertise descriptors marked listable. The app hides its
+    // bulk auto-generated per-parameter tools this way: they stay fully
+    // callable by name via tools/call, but keeping them out of the
+    // catalog is what took this response from ~240KB to ~34KB (measured
+    // in WFS-DIY: 416 registered, 35 listed). Anything hidden is still
+    // discoverable — the app's parameter registry reports the owning tool
+    // name for every parameter.
+    std::vector<ToolDescriptor> descriptors = registry.all();  // copy: we sort and filter it
+    const int totalRegistered = static_cast<int> (descriptors.size());
+
+    descriptors.erase (std::remove_if (descriptors.begin(), descriptors.end(),
+                                       [] (const ToolDescriptor& d) { return ! d.listable; }),
+                       descriptors.end());
+    const int hiddenCount = totalRegistered - static_cast<int> (descriptors.size());
+
+    // Order by (tier DESC, name ASC). Several MCP clients truncate
+    // tools/list before surfacing it to the model, so putting the
+    // destructive tier-3 operations first keeps them visible even under
+    // aggressive truncation. Within each tier, alphabetical for stable
+    // ordering across calls — which also helps client-side prompt caching.
     std::sort (descriptors.begin(), descriptors.end(),
                [] (const ToolDescriptor& a, const ToolDescriptor& b)
                {
@@ -182,6 +207,9 @@ juce::String MCPDispatcher::handleToolsList (const juce::var& id)
     auto serverState = std::make_unique<juce::DynamicObject>();
     serverState->setProperty ("ai_enabled",           tierEnforcement.isAIEnabled());
     serverState->setProperty ("critical_actions_allowed", tierEnforcement.isSafetyGateOpen());
+    // Tell clients that a callable-but-unlisted surface exists, so an AI
+    // that reads _meta knows the catalog is curated rather than complete.
+    serverState->setProperty ("hidden_tool_count", hiddenCount);
     result->setProperty ("_meta", juce::var (serverState.release()));
 
     return makeJsonRpcResult (id, juce::var (result.release()));
@@ -287,10 +315,14 @@ juce::String MCPDispatcher::handleToolsCall (const juce::var& id, const juce::va
     if (recordPtr != nullptr && result.success)
     {
         ringBuffer.push (record);
+
         // Standard undo/redo: a fresh state-modifying tool call invalidates
-        // any pending redo history. Phase 5a wires this up; the undo engine
-        // owns the redo ring.
-        undoEngine.onNewStateModifyingRecord();
+        // any pending redo history. Records flagged non-undoable are the
+        // exception — they exist to leave an audit trail for actions that
+        // can't be reverted (a disk write, say), so they must not discard
+        // redo history the operator can still legitimately use.
+        if (record.undoable)
+            undoEngine.onNewStateModifyingRecord();
     }
 
     if (! result.success)

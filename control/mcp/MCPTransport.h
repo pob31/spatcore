@@ -3,6 +3,8 @@
 #include <juce_core/juce_core.h>
 #include <juce_simpleweb/juce_simpleweb.h>
 #include "MCPLogSink.h"
+#include "MCPProtocolVersions.h"
+#include "MCPRequestContext.h"
 
 namespace spatcore::control::mcp
 {
@@ -25,17 +27,21 @@ class MCPTransport : public SimpleWebSocketServerBase::RequestHandler
 {
 public:
     using HandlerCallback = std::function<juce::String (const juce::String& body,
-                                                         const juce::String& clientIP,
-                                                         int clientPort)>;
+                                                         const RequestContext& context)>;
 
     explicit MCPTransport (MCPLogSink& mcpLogger);
     ~MCPTransport() override;
 
-    /** Start listening on the given port. Returns true if the listener
-        thread was launched. Actual bind success is not waited for here;
-        callers can poll isRunning() after a brief delay if they need
-        certainty. The port may be 0 (let OS assign), but the MCP UX
-        assumes a known port for client config. */
+    /** Start listening on the given port.
+
+        Returns false — and leaves isRunning() false — when the port cannot
+        be bound, which in practice means another process already holds it.
+        The check is a pre-bind probe rather than a confirmation from the
+        server thread: see the implementation comment for why the listener
+        route is deliberately not used here.
+
+        The port may be 0 (let OS assign), but the MCP UX assumes a known
+        port for client config, so the probe is skipped in that case. */
     bool start (int port, bool loopbackOnly);
 
     /** Stop accepting new connections and tear down the io_context. */

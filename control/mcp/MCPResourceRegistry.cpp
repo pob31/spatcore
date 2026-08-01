@@ -147,6 +147,16 @@ namespace
             "tools/dialogs, and disambiguations the AI should remember (Input/Source/Channel as synonyms; "
             "Hackoustics = Floor Reflections; Live Source Tamer = Live Source Damping; AutomOtion vs Move; etc.). "
             "Fetch once at session start to ground vocabulary."
+        },
+        {
+            "wfs://knowledge/tool_catalog",
+            "knowledge_tool_catalog.md",
+            "MCP tool catalog and vocabulary",
+            "The tools available on this server, grouped by what you are trying to do (inspect state, write "
+            "values, manage channels, undo, save). Also carries the scope and domain vocabulary used by "
+            "mcp_describe_parameters filters, and explains why the per-parameter tools do not appear in "
+            "tools/list even though they remain callable. Read this when the connect-time instructions are "
+            "not enough to plan a task."
         }
     };
 } // anonymous namespace

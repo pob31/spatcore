@@ -914,12 +914,16 @@ def derive_schema(row: CSVRow, tool_name: str,
 
 # ----------------------------------------------------------------- tier confirm
 
+# Kept to one line: this text is duplicated verbatim into every tier-2 and
+# tier-3 schema, so each word costs ~36x in the emitted manifest. The full
+# handshake rules live in the connect-time instructions and in
+# knowledge_tool_catalog.md, which is where a model should learn them once.
+# The hand-written twin in Source/Network/MCP/tools/SetParameterTool.h should
+# match this wording.
 CONFIRM_PROPERTY_DESCRIPTION = (
-    "Confirmation token returned by the previous call to this tool. "
-    "Tier 2 and Tier 3 tools require a two-step handshake: the first call "
-    "returns a confirmation_token in tier_enforcement; re-call with confirm "
-    "set to that token (within 30 seconds) to actually execute. Omit on the "
-    "first call."
+    "Tier-2/3 confirm token: the first call returns "
+    "tier_enforcement.confirmation_token; re-call with confirm set to it "
+    "within 30 s. Omit on the first call."
 )
 
 
@@ -1204,6 +1208,15 @@ def hash_inputs(csv_dir: Path, override_files: list[Path]) -> str:
         if of.exists():
             h.update(of.name.encode())
             h.update(_normalized_bytes(of))
+    # Hash this generator's own source too. Descriptions, schema shapes and
+    # the confirm-token text are all baked in here, so a change to any of
+    # them must invalidate the manifest — otherwise the idempotency fast
+    # path below sees unchanged CSVs, skips regeneration, and quietly leaves
+    # the old text on disk until someone happens to edit a spreadsheet.
+    generator_source = Path(__file__)
+    if generator_source.exists():
+        h.update(b"__generator__")
+        h.update(_normalized_bytes(generator_source))
     return h.hexdigest()
 
 

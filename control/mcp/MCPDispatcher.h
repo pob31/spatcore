@@ -9,6 +9,8 @@
 #include "MCPResourceRegistry.h"
 #include "MCPPromptRegistry.h"
 #include "MCPTierEnforcement.h"
+#include "MCPProtocolVersions.h"
+#include "MCPRequestContext.h"
 
 namespace spatcore::control::mcp
 {
@@ -55,8 +57,7 @@ public:
         for malformed input — the transport layer should never have to
         synthesize a response itself. */
     juce::String handleRequest (const juce::String& body,
-                                const juce::String& clientIP,
-                                int clientPort);
+                                const RequestContext& context);
 
     /** Block until the message-thread tool execution completes. Tunable
         if a workflow legitimately needs longer (snapshot-load can be
@@ -102,10 +103,6 @@ private:
 
     std::atomic<bool> initialized { false };  // flips true after `initialize` succeeds
     int toolTimeoutMs = 5000;
-
-    // MCP spec revision we negotiate with. Static text — bumped when the
-    // wire-level changes adopted by the project shift to a newer revision.
-    static constexpr const char* kProtocolVersion = "2024-11-05";
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MCPDispatcher)
 };

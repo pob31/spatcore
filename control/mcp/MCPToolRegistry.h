@@ -64,6 +64,17 @@ struct ToolDescriptor
         to classify them. */
     int tier = 1;
 
+    /** Whether the tool appears in tools/list.
+
+        False means "callable but not advertised": tools/call still
+        resolves the name normally, it just doesn't consume catalog space.
+        This exists for large auto-generated tool families where listing
+        every entry would swamp a model's context — the app is expected to
+        provide another way to discover them (a parameter registry that
+        names the owning tool, say). Defaults to true so a tool is never
+        hidden by accident. */
+    bool listable = true;
+
     std::function<ToolResult (const juce::var& args, ChangeRecord* record)> handler;
 };
 

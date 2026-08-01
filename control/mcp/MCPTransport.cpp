@@ -19,8 +19,56 @@ namespace
         // tightest CORS posture is the only safety we have.
         h.emplace ("Access-Control-Allow-Origin", loopbackOnly ? "*" : "null");
         h.emplace ("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
-        h.emplace ("Access-Control-Allow-Headers", "Content-Type, Authorization");
+        // MCP-Protocol-Version must be listed: from spec revision 2025-06-18
+        // clients send it on every post-initialize request, and a browser
+        // client would otherwise fail preflight before reaching us.
+        h.emplace ("Access-Control-Allow-Headers",
+                   "Content-Type, Authorization, MCP-Protocol-Version");
         return h;
+    }
+
+    constexpr const char* kProtocolVersionHeader = "MCP-Protocol-Version";
+
+    /** Probe whether `port` can be bound before handing it to SimpleWeb.
+
+        SimpleWeb reports bind failures only by calling
+        Listener::serverInitError on its own server thread. Taking that
+        route previously crashed at app teardown: `webSocketListeners` is a
+        plain juce::ListenerList, so removing a listener from the message
+        thread while the server thread is inside .call() is a data race, and
+        the juce::String argument is constructed on the server thread from a
+        listener that may already be gone. Rather than re-introduce that
+        hazard for a callback that fires exactly once, we ask the OS the
+        same question up front, on the calling thread, with no shared state.
+
+        The trade-off is honest: this is a probe, not a confirmation, so a
+        port stolen in the microseconds between probe and real bind would
+        still slip through. It catches the failure that actually happens
+        (another process already listening), which is all the UI needs to
+        stop claiming the server is up when it isn't.
+
+        One platform nuance worth knowing before trusting this too far:
+        `createListener` sets SO_REUSEADDR everywhere except Windows
+        (juce_Socket.cpp, guarded by `#if ! JUCE_WINDOWS`), while SimpleWeb
+        binds with allowAddressReuse=false. An active listener fails the
+        bind either way, on every platform — that is the case we care about.
+        But on macOS/Linux a port held only in TIME_WAIT can pass this probe
+        and then fail SimpleWeb's stricter bind, which lands back on the old
+        silent-failure behaviour. Not a regression, just not a full fix
+        there. */
+    bool canBindPort (int port, bool loopbackOnly)
+    {
+        if (port <= 0)
+            return true;  // 0 means "let the OS choose" — nothing to probe.
+
+        juce::StreamingSocket probe;
+        const juce::String localAddress = loopbackOnly ? juce::String ("127.0.0.1")
+                                                       : juce::String();
+        if (! probe.createListener (port, localAddress))
+            return false;
+
+        probe.close();
+        return true;
     }
 }
 
@@ -36,17 +84,24 @@ bool MCPTransport::start (int port, bool loopbackOnly)
     if (running.load())
         stop();
 
+    // Verify the port is free before spawning the server thread. Without
+    // this the call below always "succeeds" — SimpleWeb swallows the bind
+    // error on its own thread — and the UI shows a listening server that
+    // never accepted a connection.
+    if (! canBindPort (port, loopbackOnly))
+    {
+        boundPort = 0;
+        running = false;
+        mcpLogger.logError ("MCP server failed to start: port " + juce::String (port)
+                            + " is already in use. MCP clients will not be able to connect.");
+        return false;
+    }
+
     server = std::make_unique<SimpleWebSocketServer>();
     server->addHTTPRequestHandler (this);
 
     const juce::String localAddress = loopbackOnly ? juce::String ("127.0.0.1") : juce::String();
 
-    // SimpleWebSocketServerBase::start spawns the listener thread synchronously.
-    // Bind failures land in the io_context error path; surfacing them via
-    // the Listener interface introduced cross-thread juce::String access
-    // that crashed at app teardown — until a bind-verification path that
-    // doesn't require listener-inheritance is designed, callers should
-    // poll isRunning() after a brief delay if they need certainty.
     server->start (port, /*wsSuffix*/ "", localAddress, /*allowAddressReuse*/ false);
 
     boundPort = port;
@@ -123,9 +178,45 @@ bool MCPTransport::handleHTTPRequest (std::shared_ptr<HttpServer::Response> resp
     }
 
     // POST /mcp — read body, hand to dispatcher, return its JSON-RPC envelope.
+    RequestContext context;
+    context.clientIP   = resolveClientIP (request);
+    context.clientPort = resolveClientPort (request);
+
+    // Spec revision 2025-06-18 onwards: clients send MCP-Protocol-Version on
+    // every request after initialize. Reject an unsupported value here, with
+    // HTTP 400 as the spec prescribes, so the dispatcher only ever sees
+    // revisions it can honour. An absent header is fine — that means an
+    // older client, and RequestContext supplies the mandated fallback.
+    if (auto it = request->header.find (kProtocolVersionHeader); it != request->header.end())
+    {
+        context.protocolVersionHeader = juce::String (it->second).trim();
+
+        if (context.protocolVersionHeader.isNotEmpty()
+            && ! protocol::isSupported (context.protocolVersionHeader))
+        {
+            mcpLogger.logError ("Rejected request with unsupported "
+                                + juce::String (kProtocolVersionHeader) + ": "
+                                + context.protocolVersionHeader);
+
+            auto error = std::make_unique<juce::DynamicObject>();
+            error->setProperty ("code", -32600);
+            error->setProperty ("message",
+                                "Unsupported MCP-Protocol-Version: "
+                                + context.protocolVersionHeader
+                                + ". Supported: " + protocol::supportedList());
+
+            auto envelope = std::make_unique<juce::DynamicObject>();
+            envelope->setProperty ("jsonrpc", "2.0");
+            envelope->setProperty ("id", juce::var());
+            envelope->setProperty ("error", juce::var (error.release()));
+
+            writeJson (response, SimpleWeb::StatusCode::client_error_bad_request,
+                       juce::JSON::toString (juce::var (envelope.release()), true));
+            return true;
+        }
+    }
+
     juce::String body = juce::String (request->content.string());
-    juce::String clientIP = resolveClientIP (request);
-    int clientPort = resolveClientPort (request);
 
     HandlerCallback cb;
     {
@@ -148,7 +239,7 @@ bool MCPTransport::handleHTTPRequest (std::shared_ptr<HttpServer::Response> resp
     juce::String responseBody;
     try
     {
-        responseBody = cb (body, clientIP, clientPort);
+        responseBody = cb (body, context);
     }
     catch (const std::exception& e)
     {
