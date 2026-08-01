@@ -10,12 +10,13 @@ submodule by multiple apps (WFS-DIY, and the planned XOA and Tight-WFS).
 | Directory | Contents |
 |---|---|
 | `rt/` | Realtime primitives: lock-free rings, fork-join pool, RT thread priority (MMCSS/mach/SCHED_FIFO), `RtSnapshot<T>` message→RT hand-off |
-| `dsp/` | Biquads, smoothers, speed limiter, tracking filter, FR diffusion model, LFO waveforms, level detectors |
+| `dsp/` | Biquads + their shared magnitude-response math, multi-channel EQ bank and the 6-band per-output EQ processor, smoothers, speed limiter, tracking filter, FR diffusion model, LFO waveforms, level detectors |
 | `wfs/` | WFS renderers: CPU gather/scatter processors + the GPU-pipeline renderer wrappers |
 | `reverb/` | Reverb engine + FDN / SDN / IR algorithms (CPU and GPU variants), pre/post processing, feed thread |
 | `gpu/` | Multi-vendor GPU compute: CUDA / HIP / Metal backends for 5 kernel families, runtime kernel compilation (NVRTC/hipRTC), async pipeline, device manager, vendor-plugin factory, JUCE-free host work pool |
 | `control/` | `osc/` wire codec + transports + ingest queues, `state/` ValueTree parameter store + XML persistence, `mcp/` MCP server core (JSON-RPC transport, dispatcher, tool registry, tier enforcement) |
 | `controllers/` | Hardware controller device layer: SpaceMouse, Stream Deck+, ROLI Lightpad, evdev touch |
+| `ui/` | Shared GUI widgets: the interactive EQ curve display (ValueTree-backed, undoable) and the per-band toggle. Palette and localised strings are injected by the consuming app through provider callbacks, so spatcore stays app-agnostic |
 | `tools/` | `gpu/` per-vendor plugin build scripts, `codegen/` CSV→MCP tool generator core |
 | `tests/` | Standalone unit tests + the wiring to build them |
 | `docs/` | The architecture analyses and boundary decisions this extraction was built from |
@@ -23,8 +24,8 @@ submodule by multiple apps (WFS-DIY, and the planned XOA and Tight-WFS).
 ## Consuming
 
 spatcore builds as CMake static libraries (`spatcore-audio`, `spatcore-control`,
-`spatcore-controllers`). The consumer provides the third-party dependencies —
-each contract fails loudly if unmet:
+`spatcore-controllers`, `spatcore-ui`). The consumer provides the third-party
+dependencies — each contract fails loudly if unmet:
 
 - **JUCE**: `juce::*` module targets must exist before `add_subdirectory(spatcore)`
   (bring your own JUCE via `add_subdirectory`).
@@ -45,6 +46,10 @@ each contract fails loudly if unmet:
   shadow libc++'s `<version>` on macOS) never reach the include path.
 - **roli_blocks_basics**: `juce_add_module()` — Lightpad support, also under
   `SPATCORE_CONTROLLERS`.
+
+`spatcore-ui` needs no extra dependency (its JUCE modules ship with JUCE), but
+it does link `juce_gui_basics` — which `spatcore-audio` deliberately never does,
+so the audio layer stays usable headless. `SPATCORE_UI=OFF` drops it entirely.
 
 Compile flags: `cmake/SpatcoreCompileFlags.cmake` pins the optimization and
 floating-point flags the bit-exactness gates were baselined with.

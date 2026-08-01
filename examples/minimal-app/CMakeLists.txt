@@ -4,9 +4,11 @@
 # contract standalone (no parent app repo). It builds spatcore-audio, whose
 # Metal .mm backends compile on macOS — the exact path (the top-level OBJCXX
 # requirement) that regressed the first real consumer (XOA) before this guard
-# existed. It fetches only JUCE, so spatcore's CI stays self-contained and
-# robust; the control/controllers wiring (juce_simpleweb, hidapi) is exercised
-# by the downstream app CIs (XOA, Tight-WFS), which build the full stack.
+# existed — plus spatcore-ui, so the header-only GUI widgets get compiled on all
+# three platforms too. It fetches only JUCE, so spatcore's CI stays
+# self-contained and robust; the control/controllers wiring (juce_simpleweb,
+# hidapi) is exercised by the downstream app CIs (XOA, Tight-WFS), which build
+# the full stack.
 #
 # Build (from the spatcore repo root):
 #   cmake -S examples/minimal-app -B examples/minimal-app/build
@@ -16,7 +18,7 @@
 
 cmake_minimum_required(VERSION 3.22)
 
-project(spatcore-minimal-app VERSION 0.1.1 LANGUAGES C CXX)
+project(spatcore-minimal-app VERSION 0.2.0 LANGUAGES C CXX)
 
 get_filename_component(SPATCORE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
 
@@ -42,13 +44,20 @@ FetchContent_Declare(JUCE
     GIT_SHALLOW    TRUE)
 FetchContent_MakeAvailable(JUCE)
 
-# Audio only: spatcore-audio depends on nothing but JUCE. Turning control and
-# controllers OFF keeps this example's dependency set to JUCE alone.
+# Audio + UI: both depend on nothing but JUCE itself. Turning control and
+# controllers OFF keeps this example's dependency set to JUCE alone (they need
+# juce_simpleweb / roli_blocks_basics / hidapi from the consumer).
+#
+# spatcore-ui is ON so the 3-OS CI actually compiles the shared widget headers
+# on Windows, macOS and Linux — the same reason spatcore-audio is here. It costs
+# the Linux job nothing: the workflow already installs the X11/freetype/
+# fontconfig dev packages, because JUCE's juceaide links juce_gui_basics.
 set(SPATCORE_CONTROL     OFF)
 set(SPATCORE_CONTROLLERS OFF)
+set(SPATCORE_UI          ON)
 add_subdirectory("${SPATCORE_ROOT}" "${CMAKE_CURRENT_BINARY_DIR}/spatcore")
 
 juce_add_console_app(spatcore-minimal-app)
 target_sources(spatcore-minimal-app PRIVATE main.cpp)
-target_link_libraries(spatcore-minimal-app PRIVATE spatcore-audio)
+target_link_libraries(spatcore-minimal-app PRIVATE spatcore-audio spatcore-ui)
 spatcore_apply_compile_flags(spatcore-minimal-app)

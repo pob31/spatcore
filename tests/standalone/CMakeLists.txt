@@ -16,7 +16,7 @@
 
 cmake_minimum_required(VERSION 3.22)
 
-project(spatcore-standalone-tests VERSION 0.1.1 LANGUAGES C CXX)
+project(spatcore-standalone-tests VERSION 0.2.0 LANGUAGES C CXX)
 
 # spatcore's consumer helpers (OBJCXX enable, juce_simpleweb fixups, ...) — the
 # same module apps use, so this reference wiring exercises the contract too.

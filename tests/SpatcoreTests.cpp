@@ -15,6 +15,14 @@
       4. control/osc parser+serializer   OSCSerializer::serializeMessage ->
                                  OSCParser::parseMessage roundtrip + byte-stable
                                  re-serialization
+      5. dsp/ shared parametric EQ   MultiChannelEQBank neutrality (bit-exact)
+                                 and enable semantics; bank == a hand-rolled
+                                 std::array of biquads (bit-exact); the static
+                                 calculateCoefficients() is provably the
+                                 coefficient set the audio path runs;
+                                 biquadMagnitudeDb sanity + a golden coefficient
+                                 table for both filter classes; OutputEQProcessor
+                                 neutral at defaults
 */
 
 // OSCParser.h / OSCSerializer.h use juce::OSC* types but (verbatim-moved,
@@ -22,19 +30,32 @@
 // the app provides juce_osc first, and so do we.
 #include <juce_osc/juce_osc.h>
 
+// Both biquad headers clamp their parameters with std::min/std::max but include
+// only <cmath> themselves (in the app they get <algorithm> transitively from
+// JUCE). MultiChannelEQBank.h works around that for its own filter include;
+// ReverbBiquadFilter.h is reached directly from here, so make it visible first.
+#include <algorithm>
+
 #include "spatcore/rt/LockFreeRingBuffer.h"
 #include "spatcore/rt/RtSnapshot.h"
 #include "spatcore/rt/RtThreadPriority.h"
 #include "spatcore/gpu/GpuHostWorkPool.h"
 #include "spatcore/dsp/DelayTargetSmoother.h"
+#include "spatcore/dsp/BiquadResponse.h"
+#include "spatcore/dsp/OutputEQBiquadFilter.h"
+#include "spatcore/dsp/ReverbBiquadFilter.h"
+#include "spatcore/dsp/MultiChannelEQBank.h"
+#include "spatcore/dsp/OutputEQProcessor.h"
 #include "spatcore/control/osc/OSCSerializer.h"
 #include "spatcore/control/osc/OSCParser.h"
 #include "spatcore/reverb/ReverbSDNAlgorithm.h"
 #include "spatcore/reverb/ReverbFDNAlgorithm.h"
 
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 static int failures = 0;
@@ -459,6 +480,779 @@ static void testSdnLevelVsNodeCount()
 }
 
 //==============================================================================
+// Shared parametric EQ: BiquadResponse / OutputEQBiquadFilter /
+// ReverbBiquadFilter / MultiChannelEQBank / OutputEQProcessor.
+//
+// The bank is the piece WFS-DIY's OutputEQProcessor and XOA's
+// SpeakerCompProcessor both migrate onto, and the static calculateCoefficients()
+// is what the GUI response curves draw from. Two properties have to hold or the
+// extraction is a regression:
+//   - a neutral EQ is BIT-transparent (the golden-render gate compares renders
+//     byte-for-byte, so "close enough" is a failure);
+//   - display math and audio math are the same math (a second copy of the
+//     cookbook formulas drifts, historically on the shelves' S parameter).
+namespace eqtests {
+
+constexpr int    kNumBands = 6;
+constexpr double kSampleRate = 48000.0;
+
+//==============================================================================
+/** One band's worth of parameters, in the plain-int shape mapping the filters
+    document (no app enums cross the spatcore boundary). */
+struct BandSetting
+{
+    int   shape;
+    float freq, gainDb, q, slope;
+};
+
+//==============================================================================
+/** Direct-form-I reference biquad: a transcription of the filter classes'
+    processSample(). Everything that pins "the coefficients the GUI is shown are
+    the coefficients the audio path runs" compares against this, so the
+    difference-equation expression below must stay character-identical to the one
+    in OutputEQBiquadFilter.h / ReverbBiquadFilter.h — including the operand
+    order, which is what makes the comparison bit-exact rather than approximate. */
+struct RefBiquad
+{
+    void setCoefficients (const spatcore::dsp::BiquadCoefficients& c) noexcept
+    {
+        b0 = c.b0; b1 = c.b1; b2 = c.b2; a1 = c.a1; a2 = c.a2;
+    }
+
+    float processSample (float input) noexcept
+    {
+        float output = b0 * input + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+        x2 = x1;
+        x1 = input;
+        y2 = y1;
+        y1 = output;
+        return output;
+    }
+
+    float b0 = 1.0f, b1 = 0.0f, b2 = 0.0f, a1 = 0.0f, a2 = 0.0f;
+    float x1 = 0.0f, x2 = 0.0f, y1 = 0.0f, y2 = 0.0f;
+};
+
+//==============================================================================
+/** A non-trivial signal seeded with the values a "harmless" identity multiply
+    would silently damage, so a bit-exact comparison against it actually bites:
+
+      - a NEGATIVE ZERO. Running it through the identity biquad yields
+        1*(-0) + 0*0 + 0*0 - 0*0 - 0*0 == +0.0f, a different bit pattern. This is
+        the value that catches a bank which "processes" a shape-0 band instead of
+        skipping it.
+      - two DENORMALS, which an FTZ/DAZ-armed multiply flushes to zero. They are
+        constexpr so the compiler materialises the bit patterns directly —
+        computing them at run time could flush them before they ever reach the
+        buffer.
+      - two LARGE values, to catch a scaling slip that rounds off in the noise
+        floor of an epsilon compare.
+*/
+static std::vector<float> makeAwkwardSignal (int numSamples)
+{
+    constexpr float tinyDenormal  = std::numeric_limits<float>::denorm_min();
+    constexpr float smallDenormal = std::numeric_limits<float>::min() * 0.5f;
+
+    std::vector<float> v (static_cast<size_t> (std::max (0, numSamples)), 0.0f);
+
+    for (size_t i = 0; i < v.size(); ++i)
+        v[i] = 0.37f * std::sin (0.11f * static_cast<float> (i))
+             + 0.13f * std::sin (1.90f * static_cast<float> (i) + 0.7f);
+
+    if (v.size() >= 8)
+    {
+        v[0] = std::copysign (0.0f, -1.0f);   // negative zero
+        v[1] = tinyDenormal;
+        v[2] = smallDenormal;
+        v[3] = 1.0e7f;
+        v[4] = -1.0e7f;
+        v[5] = 0.0f;
+    }
+
+    return v;
+}
+
+static bool bitEqualBlock (const std::vector<float>& a, const std::vector<float>& b) noexcept
+{
+    return a.size() == b.size()
+        && std::memcmp (a.data(), b.data(), a.size() * sizeof (float)) == 0;
+}
+
+//==============================================================================
+/** Six bands that all do something, used to drive the bank and its hand-rolled
+    twin through the same parameter sequence. Shapes are the OutputEQBiquadFilter
+    mapping: 1 LowCut, 2 LowShelf, 3 Peak, 4 BandPass, 5 HighShelf, 6 HighCut,
+    7 AllPass. */
+static const BandSetting kTickA[kNumBands] =
+{
+    { 1,   80.0f,  0.0f, 0.707f, 0.7f },
+    { 2,  250.0f,  6.0f, 0.7f,   0.7f },
+    { 3, 1000.0f, -9.0f, 3.0f,   0.7f },
+    { 5, 5000.0f,  4.0f, 0.7f,   0.5f },
+    { 6, 9000.0f,  0.0f, 0.707f, 0.7f },
+    { 7, 1500.0f,  0.0f, 0.5f,   0.7f },
+};
+
+static const BandSetting kTickB[kNumBands] =
+{
+    { 1,  120.0f,  0.0f, 1.2f,   0.7f },
+    { 2,  250.0f,  6.0f, 0.7f,   0.7f },   // unchanged -> exercises the no-change short circuit
+    { 3,  900.0f,  6.0f, 0.8f,   0.7f },
+    { 4, 3000.0f,  0.0f, 1.5f,   0.7f },
+    { 0, 5000.0f,  4.0f, 0.7f,   0.5f },   // a band switched OFF mid-sequence
+    { 7, 1500.0f,  0.0f, 0.5f,   0.7f },
+};
+
+//==============================================================================
+/** Runs one shape through both paths and requires bit-identical output:
+      - a prepare()/setParameters()-configured filter instance, and
+      - RefBiquad fed the coefficients the STATIC calculateCoefficients() returns
+        for the very same arguments.
+    Templated because OutputEQBiquadFilter and ReverbBiquadFilter expose the same
+    surface with different shape numbering. */
+template <typename FilterType>
+static void checkCoefficientsDriveAudio (const char* label, const BandSetting& s, double sampleRate)
+{
+    FilterType f;
+    f.prepare (sampleRate);
+    f.setParameters (s.shape, s.freq, s.gainDb, s.q, s.slope);
+    CHECK (f.getShape() == s.shape);
+    CHECK (f.isActive() == (s.shape != 0));
+
+    const auto coeffs = FilterType::calculateCoefficients (s.shape, s.freq, s.gainDb,
+                                                           s.q, s.slope, sampleRate);
+    CHECK (coeffs.active == (s.shape != 0));
+
+    constexpr int n = 128;
+    std::vector<float> audio (static_cast<size_t> (n), 0.0f);
+    std::vector<float> want  (static_cast<size_t> (n), 0.0f);
+    audio[0] = 1.0f;   // unit impulse -> the filter's impulse response
+
+    // Reference first: processBlock() rewrites `audio` in place.
+    RefBiquad ref;
+    ref.setCoefficients (coeffs);
+    for (size_t i = 0; i < want.size(); ++i)
+        want[i] = ref.processSample (audio[i]);
+
+    f.processBlock (audio.data(), n);
+
+    const bool identical = bitEqualBlock (audio, want);
+    CHECK (identical);
+
+    if (! identical)
+        std::fprintf (stderr,
+                      "  %s shape %d (%.1f Hz, %.1f dB, Q %.3f, S %.3f, %.0f Hz SR): "
+                      "impulse response differs from the static coefficients\n",
+                      label, s.shape, s.freq, s.gainDb, s.q, s.slope, sampleRate);
+
+    for (float v : audio)
+        CHECK (std::isfinite (v));
+}
+
+//==============================================================================
+/** A pinned (parameters -> coefficients) row. Expected values were computed by
+    hand from the cookbook formulas in the headers, in float precision, and are
+    compared with a tolerance loose enough for last-bit libm differences across
+    compilers but far tighter than any real formula change. */
+struct GoldenCase
+{
+    int    shape;
+    float  freq, gainDb, q, slope;
+    double sampleRate;
+    float  b0, b1, b2, a1, a2;
+};
+
+constexpr float kCoeffTolerance = 1.0e-5f;
+
+static void checkGolden (const char* label, const GoldenCase& g,
+                         const spatcore::dsp::BiquadCoefficients& c)
+{
+    const bool ok = std::abs (c.b0 - g.b0) <= kCoeffTolerance
+                 && std::abs (c.b1 - g.b1) <= kCoeffTolerance
+                 && std::abs (c.b2 - g.b2) <= kCoeffTolerance
+                 && std::abs (c.a1 - g.a1) <= kCoeffTolerance
+                 && std::abs (c.a2 - g.a2) <= kCoeffTolerance;
+
+    CHECK (ok);
+
+    if (! ok)
+        std::fprintf (stderr,
+                      "  %s shape %d (%.1f Hz, %.1f dB, Q %.3f, S %.3f, %.0f Hz SR)\n"
+                      "    want b %.9g %.9g %.9g   a %.9g %.9g\n"
+                      "    got  b %.9g %.9g %.9g   a %.9g %.9g\n",
+                      label, g.shape, g.freq, g.gainDb, g.q, g.slope, g.sampleRate,
+                      g.b0, g.b1, g.b2, g.a1, g.a2,
+                      c.b0, c.b1, c.b2, c.a1, c.a2);
+}
+
+} // namespace eqtests
+
+//==============================================================================
+// 1. Bank neutrality. A prepared bank whose bands are all shape 0, and a bank
+// whose channel is disabled, must both leave the buffer BIT-identical — not
+// "inaudibly close". The WFS-DIY golden-render gate compares rendered files
+// byte-for-byte, so a spurious identity multiply (y = 1.0f*x + 0*... ) is a
+// regression even though it is mathematically a no-op: it turns a negative zero
+// into a positive zero, and flushes denormals under FTZ/DAZ.
+static void testMultiChannelEQBankNeutrality()
+{
+    using namespace eqtests;
+
+    const auto input = makeAwkwardSignal (256);
+    const int  n     = static_cast<int> (input.size());
+
+    // The awkward values must actually be awkward, or this test proves nothing.
+    CHECK (std::signbit (input[0]) && input[0] == 0.0f);
+    CHECK (input[1] > 0.0f && input[1] < std::numeric_limits<float>::min());
+    CHECK (input[2] > 0.0f && input[2] < std::numeric_limits<float>::min());
+
+    // (a) Channel ENABLED, every band pushed at shape 0 (OFF).
+    {
+        spatcore::dsp::MultiChannelEQBank<kNumBands> bank;
+        bank.prepare (kSampleRate, 4);
+        CHECK (bank.getNumChannels() == 4);
+
+        bank.setChannelEnabled (1, true);
+        CHECK (bank.isChannelEnabled (1));
+
+        for (int b = 0; b < kNumBands; ++b)
+            bank.pushBandParameters (1, b, 0, 1000.0f, 6.0f, 1.0f, 0.7f);
+
+        auto buffer = input;
+        bank.processChannel (1, buffer.data(), n);
+        CHECK (bitEqualBlock (buffer, input));
+    }
+
+    // (b) Channel DISABLED (the state prepare() leaves every channel in).
+    {
+        spatcore::dsp::MultiChannelEQBank<kNumBands> bank;
+        bank.prepare (kSampleRate, 4);
+        CHECK (! bank.isChannelEnabled (0));
+
+        auto buffer = input;
+        bank.processChannel (0, buffer.data(), n);
+        CHECK (bitEqualBlock (buffer, input));
+    }
+
+    // Out-of-range indices are silent no-ops, not faults: a stale channel count
+    // arriving from the message thread must never reach the audio thread.
+    {
+        spatcore::dsp::MultiChannelEQBank<kNumBands> bank;
+        bank.prepare (kSampleRate, 2);
+
+        CHECK (! bank.isChannelEnabled (-1));
+        CHECK (! bank.isChannelEnabled (99));
+        bank.setChannelEnabled (99, true);
+        CHECK (! bank.isChannelEnabled (99));
+        bank.pushBandParameters (99, 0, 3, 1000.0f, 6.0f, 1.0f, 0.7f);
+        bank.pushBandParameters (0, 99, 3, 1000.0f, 6.0f, 1.0f, 0.7f);
+        bank.pushBandParameters (0, -1, 3, 1000.0f, 6.0f, 1.0f, 0.7f);
+
+        auto buffer = input;
+        bank.processChannel (99, buffer.data(), n);
+        bank.processChannel (0, nullptr, n);
+        bank.processChannel (0, buffer.data(), 0);
+        CHECK (bitEqualBlock (buffer, input));
+    }
+}
+
+//==============================================================================
+// 2. Enable semantics — the "disabled channel forces shape 0" contract and the
+// push ORDERING it implies. Both apps push the enable flag and then the bands,
+// unconditionally, from a timer tick; pushing them the other way round latches
+// the previous enable state into the coefficients for one tick. This test pins
+// that: parameters pushed while disabled leave the channel a pass-through even
+// after it is later enabled, and only a re-push makes it active.
+static void testMultiChannelEQBankEnableSemantics()
+{
+    using namespace eqtests;
+
+    const auto input = makeAwkwardSignal (256);
+    const int  n     = static_cast<int> (input.size());
+
+    spatcore::dsp::MultiChannelEQBank<kNumBands> bank;
+    bank.prepare (kSampleRate, 2);
+    CHECK (! bank.isChannelEnabled (0));
+
+    // Push real, non-zero shapes while the channel is DISABLED. Every band must
+    // be forced to shape 0.
+    for (int b = 0; b < kNumBands; ++b)
+        bank.pushBandParameters (0, b, kTickA[b].shape, kTickA[b].freq,
+                                 kTickA[b].gainDb, kTickA[b].q, kTickA[b].slope);
+
+    {
+        auto buffer = input;
+        bank.processChannel (0, buffer.data(), n);
+        CHECK (bitEqualBlock (buffer, input));   // disabled -> processChannel no-ops
+    }
+
+    // Enabling WITHOUT re-pushing must still be a pass-through: the forced
+    // shape 0 is latched in the coefficients, not re-derived at process time.
+    // (This is exactly the one-tick artefact the ordering contract avoids.)
+    bank.setChannelEnabled (0, true);
+    CHECK (bank.isChannelEnabled (0));
+
+    {
+        auto buffer = input;
+        bank.processChannel (0, buffer.data(), n);
+        CHECK (bitEqualBlock (buffer, input));
+    }
+
+    // Re-pushing the SAME parameters now that the channel is enabled must make
+    // it active.
+    for (int b = 0; b < kNumBands; ++b)
+        bank.pushBandParameters (0, b, kTickA[b].shape, kTickA[b].freq,
+                                 kTickA[b].gainDb, kTickA[b].q, kTickA[b].slope);
+
+    {
+        auto buffer = input;
+        bank.processChannel (0, buffer.data(), n);
+        CHECK (! bitEqualBlock (buffer, input));
+
+        for (float v : buffer)
+            CHECK (std::isfinite (v));
+    }
+
+    // Channel 1 was never touched: per-channel state really is independent.
+    {
+        auto buffer = input;
+        bank.processChannel (1, buffer.data(), n);
+        CHECK (bitEqualBlock (buffer, input));
+    }
+
+    // Disabling again silences the chain at the process() gate, and a push made
+    // while disabled once more forces the bands back to OFF.
+    bank.setChannelEnabled (0, false);
+
+    for (int b = 0; b < kNumBands; ++b)
+        bank.pushBandParameters (0, b, kTickA[b].shape, kTickA[b].freq,
+                                 kTickA[b].gainDb, kTickA[b].q, kTickA[b].slope);
+
+    bank.setChannelEnabled (0, true);
+
+    {
+        auto buffer = input;
+        bank.processChannel (0, buffer.data(), n);
+        CHECK (bitEqualBlock (buffer, input));
+    }
+}
+
+//==============================================================================
+// 3. Bank equivalence. One bank channel and a hand-rolled
+// std::array<OutputEQBiquadFilter, 6> — the shape both WFS-DIY's
+// OutputEQProcessor and XOA's SpeakerCompProcessor had before the extraction —
+// fed the same parameter sequence and the same audio must produce BIT-identical
+// output. This is the test that says the migrations onto the shared bank are
+// renders-unchanged.
+static void testMultiChannelEQBankEquivalence()
+{
+    using namespace eqtests;
+
+    spatcore::dsp::MultiChannelEQBank<kNumBands> bank;
+    bank.prepare (kSampleRate, 3);
+    bank.setChannelEnabled (2, true);
+
+    std::array<spatcore::dsp::OutputEQBiquadFilter, kNumBands> hand;
+    for (auto& f : hand)
+        f.prepare (kSampleRate);
+
+    auto pushBoth = [&] (const BandSetting* tick)
+    {
+        for (int b = 0; b < kNumBands; ++b)
+        {
+            bank.pushBandParameters (2, b, tick[b].shape, tick[b].freq,
+                                     tick[b].gainDb, tick[b].q, tick[b].slope);
+            hand[static_cast<size_t> (b)].setParameters (tick[b].shape, tick[b].freq,
+                                                         tick[b].gainDb, tick[b].q,
+                                                         tick[b].slope);
+        }
+    };
+
+    auto processHand = [&] (float* samples, int numSamples)
+    {
+        for (int b = 0; b < kNumBands; ++b)
+            hand[static_cast<size_t> (b)].processBlock (samples, numSamples);
+    };
+
+    const auto noise = makeAwkwardSignal (192);
+    const int  n     = static_cast<int> (noise.size());
+
+    // Parameter sequence: tick A, tick A again (no-change short circuit), then
+    // tick B — including a band switched OFF mid-stream. Filter state carries
+    // across the blocks on both sides, so a divergence anywhere accumulates.
+    const BandSetting* const ticks[] = { kTickA, kTickA, kTickB, kTickB };
+
+    bool sawActiveOutput = false;
+
+    for (const BandSetting* tick : ticks)
+    {
+        pushBoth (tick);
+
+        for (int block = 0; block < 3; ++block)
+        {
+            auto viaBank = noise;
+            auto viaHand = noise;
+
+            bank.processChannel (2, viaBank.data(), n);
+            processHand (viaHand.data(), n);
+
+            CHECK (bitEqualBlock (viaBank, viaHand));
+
+            if (! bitEqualBlock (viaBank, noise))
+                sawActiveOutput = true;
+
+            for (float v : viaBank)
+                CHECK (std::isfinite (v));
+        }
+    }
+
+    // Guard against the whole comparison being trivially satisfied by two
+    // pass-throughs.
+    CHECK (sawActiveOutput);
+}
+
+//==============================================================================
+// 4. The static calculateCoefficients() IS the audio path. The filters do not
+// expose their coefficients, so this is verified behaviourally: an impulse
+// through a setParameters()-configured filter, and the same impulse through a
+// direct-form-I difference equation driven by the static call's return value,
+// must match bit-for-bit. Every shape of BOTH classes (their shape numbering
+// differs on purpose) at representative parameters, across three sample rates.
+// This is what stops the GUI response curve and the audio path drifting apart.
+static void testBiquadCoefficientsMatchAudioPath()
+{
+    using namespace eqtests;
+
+    // OutputEQBiquadFilter: 0 OFF, 1 LowCut, 2 LowShelf, 3 Peak, 4 BandPass,
+    // 5 HighShelf, 6 HighCut, 7 AllPass.
+    static const BandSetting outputCases[] =
+    {
+        { 0, 1000.0f,  0.0f, 0.707f, 0.7f },
+        { 1,  120.0f,  0.0f, 0.707f, 0.7f },
+        { 2,  250.0f,  6.0f, 0.7f,   0.7f },
+        { 2,  250.0f, -6.0f, 0.7f,   0.4f },
+        { 3, 1000.0f,  9.0f, 3.0f,   0.7f },
+        { 3, 1000.0f, -9.0f, 0.5f,   0.7f },
+        { 4, 2000.0f,  0.0f, 1.5f,   0.7f },
+        { 5, 5000.0f,  6.0f, 0.7f,   0.5f },
+        { 5, 5000.0f, -3.0f, 0.7f,   1.0f },
+        { 6, 8000.0f,  0.0f, 0.707f, 0.7f },
+        { 7, 1000.0f,  0.0f, 0.5f,   0.7f },
+    };
+
+    // ReverbBiquadFilter: 0 OFF, 1 LowCut, 2 LowShelf, 3 Peak, 4 HighShelf,
+    // 5 HighCut, 6 BandPass — deliberately NOT the Output EQ order.
+    static const BandSetting reverbCases[] =
+    {
+        { 0, 1000.0f,  0.0f, 0.707f, 0.7f },
+        { 1,   80.0f,  0.0f, 0.707f, 0.7f },
+        { 2,  200.0f,  4.0f, 0.7f,   0.8f },
+        { 2,  200.0f, -4.0f, 0.7f,   0.3f },
+        { 3,  800.0f,  9.0f, 3.0f,   0.7f },
+        { 3,  800.0f, -9.0f, 0.5f,   0.7f },
+        { 4, 4000.0f,  5.0f, 0.7f,   1.0f },
+        { 4, 4000.0f, -5.0f, 0.7f,   0.6f },
+        { 5, 6000.0f,  0.0f, 0.707f, 0.7f },
+        { 6, 1500.0f,  0.0f, 1.5f,   0.7f },
+    };
+
+    static const double rates[] = { 44100.0, 48000.0, 96000.0 };
+
+    for (double sr : rates)
+    {
+        for (const auto& c : outputCases)
+            checkCoefficientsDriveAudio<spatcore::dsp::OutputEQBiquadFilter> ("OutputEQ", c, sr);
+
+        for (const auto& c : reverbCases)
+            checkCoefficientsDriveAudio<spatcore::dsp::ReverbBiquadFilter> ("ReverbEQ", c, sr);
+    }
+
+    // Shape 0 and a degenerate sample rate both design to the inactive identity.
+    for (const auto& c : { spatcore::dsp::OutputEQBiquadFilter::calculateCoefficients (0, 1000.0f, 6.0f, 1.0f, 0.7f, kSampleRate),
+                           spatcore::dsp::OutputEQBiquadFilter::calculateCoefficients (3, 1000.0f, 6.0f, 1.0f, 0.7f, 0.0),
+                           spatcore::dsp::ReverbBiquadFilter::calculateCoefficients   (0, 1000.0f, 6.0f, 1.0f, 0.7f, kSampleRate),
+                           spatcore::dsp::ReverbBiquadFilter::calculateCoefficients   (3, 1000.0f, 6.0f, 1.0f, 0.7f, -1.0) })
+    {
+        CHECK (! c.active);
+        CHECK (bitEqualFloat (c.b0, 1.0f));
+        CHECK (bitEqualFloat (c.b1, 0.0f));
+        CHECK (bitEqualFloat (c.b2, 0.0f));
+        CHECK (bitEqualFloat (c.a1, 0.0f));
+        CHECK (bitEqualFloat (c.a2, 0.0f));
+    }
+
+    // Out-of-range shapes clamp exactly as setParameters() clamps them, so a
+    // caller feeding raw parameter values agrees with the audio path.
+    {
+        const auto hi   = spatcore::dsp::OutputEQBiquadFilter::calculateCoefficients (99, 1000.0f, 0.0f, 0.5f, 0.7f, kSampleRate);
+        const auto ap   = spatcore::dsp::OutputEQBiquadFilter::calculateCoefficients (7,  1000.0f, 0.0f, 0.5f, 0.7f, kSampleRate);
+        CHECK (bitEqualFloat (hi.b0, ap.b0) && bitEqualFloat (hi.a2, ap.a2));
+
+        const auto lo   = spatcore::dsp::OutputEQBiquadFilter::calculateCoefficients (-5, 1000.0f, 0.0f, 0.5f, 0.7f, kSampleRate);
+        CHECK (! lo.active);
+
+        // Frequency / Q / gain clamps are idempotent.
+        const auto wild    = spatcore::dsp::ReverbBiquadFilter::calculateCoefficients (3, 1.0e9f, 400.0f, 1.0e6f, 1.0e6f, kSampleRate);
+        const auto clamped = spatcore::dsp::ReverbBiquadFilter::calculateCoefficients (3, 20000.0f, 24.0f, 20.0f, 20.0f, kSampleRate);
+        CHECK (bitEqualFloat (wild.b0, clamped.b0));
+        CHECK (bitEqualFloat (wild.b1, clamped.b1));
+        CHECK (bitEqualFloat (wild.b2, clamped.b2));
+        CHECK (bitEqualFloat (wild.a1, clamped.a1));
+        CHECK (bitEqualFloat (wild.a2, clamped.a2));
+    }
+}
+
+//==============================================================================
+// 5. biquadMagnitudeDb sanity. Loose tolerances on purpose — this is a net that
+// catches a curve drawn upside-down, off by an octave, or in the wrong units,
+// not a golden lock (testBiquadGoldenCoefficients is the lock).
+static void testBiquadMagnitudeResponse()
+{
+    using spatcore::dsp::BiquadCoefficients;
+    using spatcore::dsp::biquadMagnitudeDb;
+    using spatcore::dsp::OutputEQBiquadFilter;
+    using spatcore::dsp::ReverbBiquadFilter;
+
+    constexpr double sr = eqtests::kSampleRate;
+
+    // A default-constructed (== OFF) coefficient set reads exactly flat.
+    CHECK (bitEqualFloat (biquadMagnitudeDb (BiquadCoefficients {}, 1000.0f, sr), 0.0f));
+
+    const auto off = OutputEQBiquadFilter::calculateCoefficients (0, 1000.0f, 12.0f, 1.0f, 0.7f, sr);
+    CHECK (bitEqualFloat (biquadMagnitudeDb (off, 20.0f,    sr), 0.0f));
+    CHECK (bitEqualFloat (biquadMagnitudeDb (off, 1000.0f,  sr), 0.0f));
+    CHECK (bitEqualFloat (biquadMagnitudeDb (off, 20000.0f, sr), 0.0f));
+
+    // Peak: |H(f0)| == A^2 == the requested gain, flat far from the centre.
+    const auto peak = OutputEQBiquadFilter::calculateCoefficients (3, 1000.0f, 6.0f, 1.0f, 0.7f, sr);
+    CHECK (peak.active);
+    CHECK (std::abs (biquadMagnitudeDb (peak, 1000.0f, sr) - 6.0f) < 0.25f);
+    CHECK (std::abs (biquadMagnitudeDb (peak, 50.0f,   sr))        < 0.5f);
+    CHECK (std::abs (biquadMagnitudeDb (peak, 20000.0f, sr))       < 0.5f);
+
+    // ...and a cut is its mirror image.
+    const auto dip = OutputEQBiquadFilter::calculateCoefficients (3, 1000.0f, -6.0f, 1.0f, 0.7f, sr);
+    CHECK (std::abs (biquadMagnitudeDb (dip, 1000.0f, sr) + 6.0f) < 0.25f);
+
+    // Low cut: deep rejection a decade below the corner (2nd order -> ~-40 dB),
+    // transparent a decade above it, -3 dB at the corner for Q = 1/sqrt(2).
+    const auto lowCut = OutputEQBiquadFilter::calculateCoefficients (1, 1000.0f, 0.0f, 0.70710678f, 0.7f, sr);
+    CHECK (biquadMagnitudeDb (lowCut, 100.0f, sr) < -25.0f);
+    CHECK (std::abs (biquadMagnitudeDb (lowCut, 10000.0f, sr))          < 0.5f);
+    CHECK (std::abs (biquadMagnitudeDb (lowCut, 1000.0f,  sr) + 3.01f)  < 0.3f);
+
+    // High cut is the mirror (and lives at a different shape ID in each class).
+    const auto highCut    = OutputEQBiquadFilter::calculateCoefficients (6, 1000.0f, 0.0f, 0.70710678f, 0.7f, sr);
+    const auto revHighCut = ReverbBiquadFilter::calculateCoefficients   (5, 1000.0f, 0.0f, 0.70710678f, 0.7f, sr);
+    CHECK (biquadMagnitudeDb (highCut,    10000.0f, sr) < -25.0f);
+    CHECK (biquadMagnitudeDb (revHighCut, 10000.0f, sr) < -25.0f);
+    CHECK (std::abs (biquadMagnitudeDb (highCut,    100.0f, sr)) < 0.5f);
+    CHECK (std::abs (biquadMagnitudeDb (revHighCut, 100.0f, sr)) < 0.5f);
+
+    // Shelves approach their gain in the passband and unity in the stopband.
+    const auto lowShelf = OutputEQBiquadFilter::calculateCoefficients (2, 500.0f, 6.0f, 0.7f, 0.7f, sr);
+    CHECK (std::abs (biquadMagnitudeDb (lowShelf, 10.0f,   sr) - 6.0f) < 0.5f);
+    CHECK (std::abs (biquadMagnitudeDb (lowShelf, 10000.0f, sr))       < 0.5f);
+
+    const auto highShelf = OutputEQBiquadFilter::calculateCoefficients (5, 2000.0f, 6.0f, 0.7f, 0.7f, sr);
+    CHECK (std::abs (biquadMagnitudeDb (highShelf, 20000.0f, sr) - 6.0f) < 0.5f);
+    CHECK (std::abs (biquadMagnitudeDb (highShelf, 50.0f,    sr))        < 0.5f);
+
+    // Same two shelves through the reverb class, whose HighShelf is shape 4.
+    const auto revLowShelf  = ReverbBiquadFilter::calculateCoefficients (2, 500.0f,  -6.0f, 0.7f, 0.7f, sr);
+    const auto revHighShelf = ReverbBiquadFilter::calculateCoefficients (4, 2000.0f, -6.0f, 0.7f, 0.7f, sr);
+    CHECK (std::abs (biquadMagnitudeDb (revLowShelf,  10.0f,    sr) + 6.0f) < 0.5f);
+    CHECK (std::abs (biquadMagnitudeDb (revHighShelf, 20000.0f, sr) + 6.0f) < 0.5f);
+
+    // Band pass: 0 dB at the centre, rolling off both ways.
+    const auto bandPass = OutputEQBiquadFilter::calculateCoefficients (4, 1000.0f, 0.0f, 1.0f, 0.7f, sr);
+    CHECK (std::abs (biquadMagnitudeDb (bandPass, 1000.0f, sr)) < 0.2f);
+    CHECK (biquadMagnitudeDb (bandPass, 100.0f,   sr) < -12.0f);
+    CHECK (biquadMagnitudeDb (bandPass, 10000.0f, sr) < -12.0f);
+
+    // All pass: unity magnitude everywhere (phase only).
+    const auto allPass = OutputEQBiquadFilter::calculateCoefficients (7, 1000.0f, 0.0f, 0.5f, 0.7f, sr);
+    for (float f : { 20.0f, 500.0f, 1000.0f, 5000.0f, 20000.0f })
+        CHECK (std::abs (biquadMagnitudeDb (allPass, f, sr)) < 0.05f);
+
+    // Edge guards: a bad sample rate reads flat, and out-of-band frequencies are
+    // clamped into (0, Nyquist) rather than returning NaN.
+    CHECK (bitEqualFloat (biquadMagnitudeDb (peak, 1000.0f,  0.0), 0.0f));
+    CHECK (bitEqualFloat (biquadMagnitudeDb (peak, 1000.0f, -1.0), 0.0f));
+    for (float f : { -100.0f, 0.0f, 1.0e9f })
+        CHECK (std::isfinite (biquadMagnitudeDb (peak, f, sr)));
+}
+
+//==============================================================================
+// 6. Golden coefficient table — a regression lock for both filter classes.
+// Expected values were derived by evaluating the cookbook formulas in the
+// headers in float precision. The tolerance is ~80x the float epsilon at these
+// magnitudes: tight enough that any change to a formula, a clamp or the pi
+// constant shows up, loose enough to survive a different libm's last bit.
+static void testBiquadGoldenCoefficients()
+{
+    using namespace eqtests;
+
+    static const GoldenCase outputGolden[] =
+    {
+        { 1,  100.0f,  0.0f, 0.70710678f, 0.7f, 48000.0,
+          0.990786731f, -1.98157346f, 0.990786731f, -1.98148847f, 0.98165822f },
+        { 2,  250.0f,  6.0f, 0.7f,        0.7f, 48000.0,
+          1.00964761f, -1.95301175f, 0.9448421f, -1.95338047f, 0.954121232f },
+        { 3, 1000.0f, -6.0f, 2.0f,        0.7f, 48000.0,
+          0.978021026f, -1.8955189f, 0.933854163f, -1.8955189f, 0.911875308f },
+        { 4, 2000.0f,  0.0f, 1.0f,        0.7f, 96000.0,
+          0.0612647682f, 0.0f, -0.0612647682f, -1.86140835f, 0.877470434f },
+        { 5, 5000.0f, -3.0f, 0.7f,        0.5f, 48000.0,
+          0.772829175f, -0.709621847f, 0.162000552f, -1.04882085f, 0.274028808f },
+        { 6, 8000.0f,  0.0f, 0.70710678f, 0.7f, 44100.0,
+          0.177245006f, 0.354490012f, 0.177245006f, -0.508717537f, 0.217697605f },
+        { 7, 1000.0f,  0.0f, 0.5f,        0.7f, 48000.0,
+          0.769087732f, -1.75395298f, 0.99999994f, -1.75395298f, 0.769087732f },
+    };
+
+    static const GoldenCase reverbGolden[] =
+    {
+        { 1,   80.0f,  0.0f, 0.70710678f, 0.7f, 48000.0,
+          0.992622495f, -1.98524499f, 0.992622495f, -1.98519063f, 0.985299468f },
+        { 2,  200.0f,  4.0f, 0.7f,        0.8f, 48000.0,
+          1.0047797f, -1.96299291f, 0.959060431f, -1.96314931f, 0.963683903f },
+        { 3,  800.0f,  9.0f, 3.0f,        0.7f, 48000.0,
+          1.01867604f, -1.96861494f, 0.960782528f, -1.96861494f, 0.97945857f },
+        { 4, 4000.0f, -5.0f, 0.7f,        0.6f, 48000.0,
+          0.63234663f, -0.686702669f, 0.199771792f, -1.27773619f, 0.423152119f },
+        { 5, 6000.0f,  0.0f, 0.70710678f, 0.7f, 44100.0,
+          0.112055212f, 0.224110425f, 0.112055212f, -0.855989456f, 0.304210305f },
+        { 6, 1500.0f,  0.0f, 1.5f,        0.7f, 96000.0,
+          0.031638667f, 0.0f, -0.031638667f, -1.92739677f, 0.936722636f },
+    };
+
+    for (const auto& g : outputGolden)
+        checkGolden ("OutputEQ",
+                     g,
+                     spatcore::dsp::OutputEQBiquadFilter::calculateCoefficients (
+                         g.shape, g.freq, g.gainDb, g.q, g.slope, g.sampleRate));
+
+    for (const auto& g : reverbGolden)
+        checkGolden ("ReverbEQ",
+                     g,
+                     spatcore::dsp::ReverbBiquadFilter::calculateCoefficients (
+                         g.shape, g.freq, g.gainDb, g.q, g.slope, g.sampleRate));
+}
+
+//==============================================================================
+// 7. OutputEQProcessor neutrality at defaults. This is the class sitting in the
+// WFS-DIY output path, and the golden-render gate compares renders byte-for-byte
+// — so with every channel disabled (the default, and the state prepare() leaves
+// behind) processBlock() must leave the buffer BIT-identical, on a partial slice
+// as well as a whole block.
+static void testOutputEQProcessorNeutrality()
+{
+    using namespace eqtests;
+
+    constexpr int numChannels = 4;
+    constexpr int blockSize   = 256;
+
+    const auto reference = makeAwkwardSignal (blockSize);
+    CHECK (static_cast<int> (reference.size()) == blockSize);
+
+    auto fillBuffer = [&] (juce::AudioBuffer<float>& buf)
+    {
+        for (int c = 0; c < buf.getNumChannels(); ++c)
+        {
+            float* d = buf.getWritePointer (c);
+            for (int i = 0; i < blockSize; ++i)
+            {
+                // A per-channel rotation of the same awkward signal, so every
+                // channel carries the negative zero / denormals somewhere.
+                const size_t src = static_cast<size_t> ((i + 37 * c) % blockSize);
+                d[i] = reference[src];
+            }
+        }
+    };
+
+    auto buffersBitEqual = [] (const juce::AudioBuffer<float>& a,
+                               const juce::AudioBuffer<float>& b)
+    {
+        if (a.getNumChannels() != b.getNumChannels() || a.getNumSamples() != b.getNumSamples())
+            return false;
+
+        for (int c = 0; c < a.getNumChannels(); ++c)
+            if (std::memcmp (a.getReadPointer (c), b.getReadPointer (c),
+                             static_cast<size_t> (a.getNumSamples()) * sizeof (float)) != 0)
+                return false;
+
+        return true;
+    };
+
+    juce::AudioBuffer<float> buffer (numChannels, blockSize), expected (numChannels, blockSize);
+    fillBuffer (buffer);
+    fillBuffer (expected);
+    CHECK (buffersBitEqual (buffer, expected));
+
+    spatcore::dsp::OutputEQProcessor eq;
+    eq.prepare (kSampleRate, blockSize, numChannels);
+
+    // (a) Straight after prepare(), before any setParameters() call.
+    eq.processBlock (buffer, 0, blockSize);
+    CHECK (buffersBitEqual (buffer, expected));
+
+    // (b) After pushing default Params: every channel disabled, every band at
+    //     the default shape 0.
+    spatcore::dsp::OutputEQProcessor::Params params;
+    params.channels.resize (static_cast<size_t> (numChannels));
+    eq.setParameters (params);
+
+    eq.processBlock (buffer, 0, blockSize);
+    CHECK (buffersBitEqual (buffer, expected));
+
+    // (c) Bands loaded with real, active shapes while the channels stay
+    //     disabled — the enabled-flag-first ordering must keep them OFF.
+    for (auto& cp : params.channels)
+    {
+        cp.enabled = false;
+        for (int b = 0; b < spatcore::dsp::OutputEQProcessor::NUM_EQ_BANDS; ++b)
+        {
+            auto& bp = cp.bands[static_cast<size_t> (b)];
+            bp.shape = kTickA[b].shape;
+            bp.freq  = kTickA[b].freq;
+            bp.gain  = kTickA[b].gainDb;
+            bp.q     = kTickA[b].q;
+            bp.slope = kTickA[b].slope;
+        }
+    }
+
+    eq.setParameters (params);
+    eq.processBlock (buffer, 0, blockSize);
+    CHECK (buffersBitEqual (buffer, expected));
+
+    // (d) A partial slice (the WFS output path processes sub-block ranges).
+    eq.processBlock (buffer, 64, 128);
+    CHECK (buffersBitEqual (buffer, expected));
+
+    // (e) reset() on a neutral processor changes nothing.
+    eq.reset();
+    eq.processBlock (buffer, 0, blockSize);
+    CHECK (buffersBitEqual (buffer, expected));
+
+    // Sanity that the harness would have noticed a change: enabling the
+    // channels and re-pushing the SAME bands must make the EQ audible.
+    for (auto& cp : params.channels)
+        cp.enabled = true;
+
+    eq.setParameters (params);
+    eq.processBlock (buffer, 0, blockSize);
+    CHECK (! buffersBitEqual (buffer, expected));
+
+    for (int c = 0; c < numChannels; ++c)
+    {
+        const float* d = buffer.getReadPointer (c);
+        for (int i = 0; i < blockSize; ++i)
+            CHECK (std::isfinite (d[i]));
+    }
+}
+
+//==============================================================================
 int main()
 {
     try
@@ -471,6 +1265,13 @@ int main()
         testGpuHostWorkPoolDeterminism();
         testGpuHostWorkPoolCrossGenBarrier();
         testSdnLevelVsNodeCount();
+        testMultiChannelEQBankNeutrality();
+        testMultiChannelEQBankEnableSemantics();
+        testMultiChannelEQBankEquivalence();
+        testBiquadCoefficientsMatchAudioPath();
+        testBiquadMagnitudeResponse();
+        testBiquadGoldenCoefficients();
+        testOutputEQProcessorNeutrality();
     }
     catch (const std::exception& e)
     {

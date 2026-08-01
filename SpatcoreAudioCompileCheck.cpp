@@ -43,13 +43,16 @@
 #include "rt/SharedInputRingBuffer.h"
 
 // dsp/ - smoothers, filters, detectors
+#include "dsp/BiquadResponse.h"
 #include "dsp/DelayTargetSmoother.h"
 #include "dsp/FrDiffusionModel.h"
 #include "dsp/InputSpeedLimiter.h"
 #include "dsp/LFOWaveforms.h"
 #include "dsp/LiveSourceLevelDetector.h"
+#include "dsp/MultiChannelEQBank.h"
 #include "dsp/NumericGuards.h"
 #include "dsp/OutputEQBiquadFilter.h"
+#include "dsp/OutputEQProcessor.h"
 #include "dsp/OutputLevelDetector.h"
 #include "dsp/ReverbBiquadFilter.h"
 #include "dsp/TrackingPositionFilter.h"
@@ -88,6 +91,21 @@
 #include "gpu/IrGpuBackend.h"
 #include "gpu/FdnGpuBackend.h"
 #include "gpu/SdnGpuBackend.h"
+
+// dsp/MultiChannelEQBank.h is a class TEMPLATE, so the #include above buys
+// almost no checking: an uninstantiated template body is only parsed, and any
+// error that depends on the template arguments stays dormant until something
+// instantiates it. Including dsp/OutputEQProcessor.h is not enough either - its
+// `MultiChannelEQBank<NUM_EQ_BANDS> bank` member implicitly instantiates the
+// CLASS (member declarations), but member function BODIES are instantiated only
+// where they are odr-used, and nothing in this TU calls them.
+//
+// An explicit instantiation definition instantiates every member body at once,
+// which is exactly what this compile check is for. 6 bands is the arity both
+// current consumers use (OutputEQProcessor::NUM_EQ_BANDS; XOA's per-speaker
+// compensation bank matches). It also gives the archive real, non-inline
+// symbols on top of the anchor below.
+template class spatcore::dsp::MultiChannelEQBank<6>;
 
 namespace spatcore
 {
