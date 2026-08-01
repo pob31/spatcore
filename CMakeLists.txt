@@ -3,12 +3,17 @@
 # rules) + core-boundary-proposal-control.md.
 #
 # Targets
-#   spatcore-audio    STATIC  rt/ dsp/ wfs/ reverb/ gpu/   (header-only from
-#                             the consumer's point of view on Windows/Linux;
-#                             the gpu backend .cpps self-guard to empty TUs —
-#                             see SpatcoreAudioCompileCheck.cpp; Metal .mm
-#                             carries real code on Apple)
-#   spatcore-control  STATIC  control/{osc,state,mcp}
+#   spatcore-audio        STATIC  rt/ dsp/ wfs/ reverb/ gpu/   (header-only from
+#                                 the consumer's point of view on Windows/Linux;
+#                                 the gpu backend .cpps self-guard to empty TUs —
+#                                 see SpatcoreAudioCompileCheck.cpp; Metal .mm
+#                                 carries real code on Apple)
+#   spatcore-control      STATIC  control/{osc,state,mcp}
+#   spatcore-controllers  STATIC  controllers/ (SpaceMouse / Stream Deck+ /
+#                                 Lightpad / Linux evdev touch)
+#   spatcore-ui           STATIC  ui/ (shared GUI widgets; header-only, kept
+#                                 apart from spatcore-audio so the audio layer
+#                                 never links juce_gui_basics)
 #
 # Consumer-provides-JUCE contract: this file does NOT add_subdirectory(JUCE).
 # The consumer must make the juce::* module targets available BEFORE adding
@@ -24,7 +29,7 @@
 
 cmake_minimum_required(VERSION 3.22)
 
-project(spatcore VERSION 0.1.1 LANGUAGES C CXX)
+project(spatcore VERSION 0.2.0 LANGUAGES C CXX)
 
 # Metal backends (.mm) are Objective-C++ — and on Apple, JUCE's module sources
 # are .mm too, attached to whichever target links the module, INCLUDING the
@@ -66,6 +71,12 @@ option(SPATCORE_CONTROLLERS
 # juce_simpleweb dependency the MCP transport needs.
 option(SPATCORE_CONTROL
     "Build spatcore-control (needs the juce_simpleweb module)" ON)
+
+# Shared GUI widgets (EQ curve display + band toggle). OFF-able because a
+# headless consumer (offline renderer, CI smoke build, a plugin that ships its
+# own editor) has no use for the JUCE GUI modules this pulls in.
+option(SPATCORE_UI
+    "Build spatcore-ui (shared GUI widgets; needs juce_gui_basics)" ON)
 
 # ---------------------------------------------------------------------------
 # Consumer-provides-JUCE contract
@@ -344,6 +355,61 @@ if(SPATCORE_CONTROLLERS)
 
     spatcore_apply_compile_flags(spatcore-controllers)
 endif()
+
+# ---------------------------------------------------------------------------
+# spatcore-ui
+# ---------------------------------------------------------------------------
+# Shared GUI widgets (EQ curve display + band toggle). Header-only, so the
+# target's one source is the compile-check TU — see ui/SpatcoreUiCompileCheck.cpp
+# for the rationale (it is also the archive anchor, so no /IGNORE:4221 is needed
+# here as it is for the self-guarding TUs in the two targets above).
+#
+# It is a SEPARATE target on purpose: spatcore-audio deliberately does not link
+# juce_gui_basics — the audio layer must stay usable in headless renderers and
+# DAW-plugin DSP, and the core-boundary rules keep the GUI modules off the audio
+# path — so the widget headers can neither be compiled into spatcore-audio's
+# compile check nor inherit its module list. The dependency runs ui/ -> dsp/
+# only (EQDisplayComponent draws with the JUCE-free biquad headers), so this
+# target needs no link to spatcore-audio.
+#
+# No consumer-provides guard, unlike SPATCORE_CONTROL / SPATCORE_CONTROLLERS
+# above: every module below ships with JUCE itself, so the juce::juce_core check
+# already covers them. Only juce_simpleweb / roli_blocks_basics — which the
+# consumer must juce_add_module() by hand — can be missing while JUCE is present.
+if(SPATCORE_UI)
+    add_library(spatcore-ui STATIC
+        ui/SpatcoreUiCompileCheck.cpp
+    )
+
+    target_include_directories(spatcore-ui PUBLIC "${SPATCORE_INCLUDE_ROOT}")
+
+    # JUCE module deps as measured from spatcore/ui includes (2026-08):
+    #   juce_gui_basics       ui/EQDisplayComponent.h (Component + mouse/keyboard
+    #                         interaction, MouseCursor) and ui/EQBandToggle.h
+    #                         (juce::Button)
+    #   juce_graphics         both widgets' paint(): Graphics, Path, PathStrokeType,
+    #                         Colour(s), Font/FontOptions, Justification
+    #   juce_data_structures  ui/EQDisplayComponent.h reads/writes the band
+    #                         parameters as a juce::ValueTree (ValueTree::Listener,
+    #                         UndoManager-scoped edits)
+    #   juce_events           no direct use in the widgets, but juce_gui_basics is
+    #                         built on its message thread; named explicitly like
+    #                         every other spatcore target's transitive modules
+    #   juce_core             juce::String / var / Identifier / jlimit / jmax
+    #                         + transitive base
+    target_link_libraries(spatcore-ui PUBLIC
+        juce::juce_gui_basics
+        juce::juce_graphics
+        juce::juce_data_structures
+        juce::juce_events
+        juce::juce_core)
+
+    # Consumers may be shared objects (plugin formats); PIC is free on Win/mac
+    # and required on Linux (see Plugin/CMakeLists.txt for the ld error text).
+    set_target_properties(spatcore-ui PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+    spatcore_apply_compile_flags(spatcore-ui)
+endif()  # SPATCORE_UI
 
 # ---------------------------------------------------------------------------
 # Tests
