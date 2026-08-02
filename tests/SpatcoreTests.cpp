@@ -1538,6 +1538,62 @@ static void testTestSignalGeneratorDeterministicSeed()
         }
 }
 
+static void testTestSignalGeneratorSpeakerIdSequencing()
+{
+    using Gen = spatcore::io::TestSignalGenerator;
+
+    // SpeakerId steps a declicked pink burst across each buffer channel in
+    // turn (0.75 s on / 0.25 s gap): at any instant exactly one channel
+    // carries energy, matching getCurrentSpeakerIndex(); the gap is silent on
+    // every channel. Ported from the XOA fork this mode originated in.
+    constexpr double sr = 48000.0;
+    constexpr int numOut = 4;
+
+    Gen gen;
+    gen.setDeterministicSeed (42);
+    gen.prepare (sr, 8192);
+    gen.setLevel (0.0f);
+    gen.setSignalType (Gen::SignalType::SpeakerId);
+
+    CHECK (gen.isActive());                     // active with no target channel
+
+    auto advance = [&] (double seconds)
+    {
+        juce::AudioBuffer<float> scratch (numOut, static_cast<int> (seconds * sr));
+        scratch.clear();
+        gen.renderNextBlock (scratch, 0, scratch.getNumSamples());
+    };
+
+    // Probe a short window and assert exactly `expected` carries energy.
+    auto probeExclusive = [&] (int expected)
+    {
+        juce::AudioBuffer<float> probe (numOut, 2400);   // 50 ms, inside one burst
+        probe.clear();
+        gen.renderNextBlock (probe, 0, 2400);
+
+        CHECK (gen.getCurrentSpeakerIndex() == expected);
+        for (int c = 0; c < numOut; ++c)
+        {
+            const bool hot = probe.getMagnitude (c, 0, 2400) > 0.0f;
+            CHECK (hot == (c == expected));
+        }
+    };
+
+    advance (0.30);  probeExclusive (0);   // ~0.30 s: channel 0 burst
+    advance (0.95);  probeExclusive (1);   // ~1.30 s: channel 1 burst
+    advance (0.95);  probeExclusive (2);   // ~2.30 s: channel 2 burst
+
+    // Into channel 2's gap (withinSlot [0.75, 1.0)): silent everywhere, index
+    // cleared.
+    advance (0.45);                        // ~2.80 s
+    juce::AudioBuffer<float> gap (numOut, 1200);
+    gap.clear();
+    gen.renderNextBlock (gap, 0, 1200);
+    CHECK (gen.getCurrentSpeakerIndex() == -1);
+    for (int c = 0; c < numOut; ++c)
+        CHECK (gap.getMagnitude (c, 0, 1200) == 0.0f);
+}
+
 //==============================================================================
 int main()
 {
@@ -1565,6 +1621,7 @@ int main()
         testTestSignalGeneratorToneFollowsSampleRate();
         testTestSignalGeneratorProtectiveRamp();
         testTestSignalGeneratorDeterministicSeed();
+        testTestSignalGeneratorSpeakerIdSequencing();
     }
     catch (const std::exception& e)
     {

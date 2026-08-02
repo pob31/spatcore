@@ -20,6 +20,10 @@ namespace io
       - Tone         continuous sine, 20 Hz - 20 kHz
       - Sweep        log sweep 20 Hz -> 20 kHz over 1 s, then 3 s of silence
       - DiracPulse   5 ms burst repeating every second
+      - SpeakerId    declicked pink burst stepping across EVERY buffer channel
+                     in turn (0.75 s on / 0.25 s gap); the target channel is
+                     ignored and getCurrentSpeakerIndex() names the channel
+                     under test so a UI can announce it
 
     HEARING PROTECTION: the continuous signals (pink noise and tone) always
     ramp up over 500 ms, and the ramp restarts every time the signal starts or
@@ -45,7 +49,8 @@ public:
         PinkNoise,
         Tone,
         Sweep,
-        DiracPulse
+        DiracPulse,
+        SpeakerId    // keep last: consumers persist / combo-map the ordinals
     };
 
     TestSignalGenerator() = default;
@@ -79,7 +84,9 @@ public:
 
         sweepPosition = 0.0f;
         pulsePosition = 0.0f;
+        speakerIdPosition = 0.0;
         fadePosition.store (0.0f);
+        currentSpeakerIndex.store (-1);
     }
 
     void setSignalType (SignalType type)
@@ -93,9 +100,11 @@ public:
             phase = 0.0f;
             sweepPosition = 0.0f;
             pulsePosition = 0.0f;
+            speakerIdPosition = 0.0;
 
             // Restart the 500 ms protective ramp for the continuous signals;
-            // the transient ones envelope themselves.
+            // the transient ones envelope themselves (SpeakerId declicks its
+            // own burst edges).
             if (type == SignalType::PinkNoise || type == SignalType::Tone)
                 fadePosition.store (0.0f);
             else
@@ -153,7 +162,12 @@ public:
     //==========================================================================
     bool isActive() const
     {
-        return targetChannel.load() >= 0 && currentType.load() != SignalType::Off;
+        const SignalType type = currentType.load();
+
+        if (type == SignalType::SpeakerId)
+            return true;    // steps every output itself; needs no target channel
+
+        return targetChannel.load() >= 0 && type != SignalType::Off;
     }
 
     SignalType getSignalType() const   { return currentType.load(); }
@@ -162,6 +176,10 @@ public:
     bool isHoldEnabled() const         { return holdEnabled.load(); }
     int getOutputChannel() const       { return targetChannel.load(); }
 
+    /** SpeakerId mode: the buffer channel currently under test, or -1 in a
+        gap / when the mode is inactive. */
+    int getCurrentSpeakerIndex() const { return currentSpeakerIndex.load(); }
+
     /** Stops all signal generation (thread-safe). */
     void reset()
     {
@@ -169,6 +187,7 @@ public:
         currentType.store (SignalType::Off);
         fadePosition.store (0.0f);
         holdEnabled.store (false);
+        currentSpeakerIndex.store (-1);
     }
 
     //==========================================================================
@@ -182,8 +201,18 @@ public:
         const SignalType signalType = currentType.load();
         const float level = levelLinear.load();
 
-        if (channel < 0 || channel >= outputBuffer.getNumChannels()
-             || signalType == SignalType::Off)
+        if (signalType == SignalType::Off || numSamples <= 0)
+            return;
+
+        // SpeakerId addresses every buffer channel itself; the target-channel
+        // gate below must not apply to it.
+        if (signalType == SignalType::SpeakerId)
+        {
+            renderSpeakerId (outputBuffer, startSample, numSamples, level);
+            return;
+        }
+
+        if (channel < 0 || channel >= outputBuffer.getNumChannels())
             return;
 
         auto* channelData = outputBuffer.getWritePointer (channel, startSample);
@@ -219,6 +248,7 @@ public:
                     break;
 
                 case SignalType::Off:
+                case SignalType::SpeakerId:   // handled above; unreachable here
                 default:
                     sample = 0.0f;
                     break;
@@ -291,6 +321,50 @@ private:
         return 0.0f;    // silence during the gap
     }
 
+    void renderSpeakerId (juce::AudioBuffer<float>& outputBuffer,
+                          int startSample,
+                          int numSamples,
+                          float level)
+    {
+        const int numOut = outputBuffer.getNumChannels();
+
+        if (numOut <= 0)
+        {
+            currentSpeakerIndex.store (-1);
+            return;
+        }
+
+        const double dt = 1.0 / sampleRate;
+        const double cycle = static_cast<double> (numOut) * speakerIdSlot;   // one full sweep of the rig
+        int lastSpeaker = -1;
+
+        for (int i = 0; i < numSamples; ++i)
+        {
+            const int    speaker    = static_cast<int> (speakerIdPosition / speakerIdSlot);
+            const double withinSlot = speakerIdPosition - static_cast<double> (speaker) * speakerIdSlot;
+
+            if (withinSlot < speakerIdBurst && speaker >= 0 && speaker < numOut)
+            {
+                // Raised-edge envelope over the burst (declick both ends).
+                float env = 1.0f;
+                if (withinSlot < declickDuration)
+                    env = static_cast<float> (withinSlot / declickDuration);
+                else if (withinSlot > speakerIdBurst - declickDuration)
+                    env = static_cast<float> ((speakerIdBurst - withinSlot) / declickDuration);
+
+                outputBuffer.getWritePointer (speaker, startSample)[i] = generatePinkNoise() * level * env;
+                lastSpeaker = speaker;
+            }
+            // else: gap - leave the buffer untouched on every channel.
+
+            speakerIdPosition += dt;
+            if (speakerIdPosition >= cycle)
+                speakerIdPosition -= cycle;
+        }
+
+        currentSpeakerIndex.store (lastSpeaker);
+    }
+
     //==========================================================================
     // Control state (message thread <-> audio thread).
     std::atomic<int> targetChannel { -1 };
@@ -298,6 +372,7 @@ private:
     std::atomic<bool> holdEnabled { false };
     std::atomic<SignalType> currentType { SignalType::Off };
     std::atomic<float> levelLinear { 0.01f };   // -40 dB
+    std::atomic<int> currentSpeakerIndex { -1 };
 
     // Generator state (audio thread; frequency/sampleRate are also read there
     // after a message-thread write, as in the original app implementation).
@@ -321,6 +396,11 @@ private:
     static constexpr float pulseDuration = 0.005f;   // 5 ms burst
     static constexpr float pulseGap = 1.0f;          // 1 s between pulses
     static constexpr float pulseAmplitude = 2.0f;
+
+    double speakerIdPosition = 0.0;
+    static constexpr double speakerIdBurst = 0.75;     // seconds on
+    static constexpr double speakerIdSlot = 1.0;       // burst + 0.25 s gap
+    static constexpr double declickDuration = 0.010;   // 10 ms edge fade
 
     // 500 ms protective ramp — see the class comment before changing.
     static constexpr float fadeDuration = 0.5f;
