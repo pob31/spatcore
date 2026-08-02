@@ -15,7 +15,8 @@ target_sources(spatcore-tests PRIVATE
 # interface (their sources compile into this target, JUCE-module style).
 target_link_libraries(spatcore-tests PRIVATE
     spatcore-audio
-    spatcore-control)
+    spatcore-control
+    spatcore-io)
 
 # Same JUCE_WEB_BROWSER/JUCE_USE_CURL trims as the repo's other console
 # harness (tools/validation/offline-render).

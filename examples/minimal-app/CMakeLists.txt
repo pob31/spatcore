@@ -52,12 +52,18 @@ FetchContent_MakeAvailable(JUCE)
 # on Windows, macOS and Linux — the same reason spatcore-audio is here. It costs
 # the Linux job nothing: the workflow already installs the X11/freetype/
 # fontconfig dev packages, because JUCE's juceaide links juce_gui_basics.
+#
+# spatcore-io is ON for the same reason, and it is the one target whose JUCE
+# dependency is platform driver code (ASIO/WASAPI, CoreAudio, ALSA), so
+# compiling it on all three OSes here is the only guard against a backend-
+# specific break. The Linux job already installs libasound2-dev.
 set(SPATCORE_CONTROL     OFF)
 set(SPATCORE_CONTROLLERS OFF)
 set(SPATCORE_UI          ON)
+set(SPATCORE_IO          ON)
 add_subdirectory("${SPATCORE_ROOT}" "${CMAKE_CURRENT_BINARY_DIR}/spatcore")
 
 juce_add_console_app(spatcore-minimal-app)
 target_sources(spatcore-minimal-app PRIVATE main.cpp)
-target_link_libraries(spatcore-minimal-app PRIVATE spatcore-audio spatcore-ui)
+target_link_libraries(spatcore-minimal-app PRIVATE spatcore-audio spatcore-ui spatcore-io)
 spatcore_apply_compile_flags(spatcore-minimal-app)
