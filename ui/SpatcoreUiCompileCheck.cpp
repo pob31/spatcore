@@ -27,6 +27,13 @@
 #include "EQBandToggle.h"
 #include "EQDisplayComponent.h"
 
+// ui/patch/ - the audio-interface patch matrix. Unlike the EQ widgets this one
+// has a real .cpp in the target; the header surface is compile-checked here for
+// the same reason. It reaches io/ for the test-signal generator it points at,
+// but never opens a device.
+#include "patch/PatchMatrixConfig.h"
+#include "patch/PatchMatrixComponent.h"
+
 namespace spatcore
 {
     // Referenced by nothing at runtime; exists so the archive is never empty.
