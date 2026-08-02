@@ -67,6 +67,7 @@ public:
     juce::String openNamedDevice (const juce::String& deviceTypeName,
                                   const juce::String& deviceName)
     {
+        ensureDeviceTypesScanned();
         deviceManager.setCurrentAudioDeviceType (deviceTypeName, true);
 
         return setDeviceAllChannels (deviceName);
@@ -76,6 +77,8 @@ public:
         at the device's default sample rate and buffer size. */
     juce::String setDeviceAllChannels (const juce::String& deviceName)
     {
+        ensureDeviceTypesScanned();
+
         auto setup = deviceManager.getAudioDeviceSetup();
 
         setup.inputDeviceName  = deviceName;
@@ -200,6 +203,18 @@ public:
     }
 
 private:
+    /** AudioDeviceManager only scans for device types inside initialise() and
+        the getters that call scanDevicesIfNeeded(). On a manager that has not
+        been initialised, its type list is empty, and setAudioDeviceSetup() then
+        takes an early "no device type" exit that returns an EMPTY error string
+        while opening nothing — a device that silently fails to open with no
+        message to show the user. Touching the type list first is what makes the
+        real driver error surface instead. */
+    void ensureDeviceTypesScanned()
+    {
+        deviceManager.getAvailableDeviceTypes();
+    }
+
     juce::AudioDeviceManager& deviceManager;
     const int maxChannels;
 
