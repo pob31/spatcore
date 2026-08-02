@@ -387,6 +387,7 @@ endif()
 if(SPATCORE_UI)
     add_library(spatcore-ui STATIC
         ui/SpatcoreUiCompileCheck.cpp
+        ui/patch/PatchMatrixComponent.cpp
     )
 
     target_include_directories(spatcore-ui PUBLIC "${SPATCORE_INCLUDE_ROOT}")
@@ -405,11 +406,18 @@ if(SPATCORE_UI)
     #                         every other spatcore target's transitive modules
     #   juce_core             juce::String / var / Identifier / jlimit / jmax
     #                         + transitive base
+    #   juce_audio_basics     ui/patch/ hosts the output test tone, whose
+    #                         generator (io/TestSignalGenerator.h) is written
+    #                         into a juce::AudioBuffer. The patch UI only holds
+    #                         a pointer to it and never opens a device, so this
+    #                         does NOT pull in juce_audio_devices — that stays
+    #                         behind SPATCORE_IO.
     target_link_libraries(spatcore-ui PUBLIC
         juce::juce_gui_basics
         juce::juce_graphics
         juce::juce_data_structures
         juce::juce_events
+        juce::juce_audio_basics
         juce::juce_core)
 
     # Consumers may be shared objects (plugin formats); PIC is free on Win/mac
