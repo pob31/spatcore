@@ -1130,6 +1130,14 @@ void PatchMatrixComponent::drawCell(juce::Graphics& g, int row, int col,
                 g.fillRect(bounds);
                 break;
 
+            case TestSignalGenerator::SignalType::SpeakerId:
+                // SpeakerId steps across every output on its own; the cell the
+                // operator clicked is not the one sounding, so draw a dimmed
+                // pink to say "burst mode armed" without claiming this channel.
+                g.setColour(juce::Colour(0xFFFF69B4).withAlpha(0.5f));
+                g.fillRect(bounds);
+                break;
+
             default:
                 // Fallback green for unknown types
                 g.setColour(juce::Colours::green);
