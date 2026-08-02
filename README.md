@@ -17,6 +17,7 @@ submodule by multiple apps (WFS-DIY, and the planned XOA and Tight-WFS).
 | `control/` | `osc/` wire codec + transports + ingest queues, `state/` ValueTree parameter store + XML persistence, `mcp/` MCP server core (JSON-RPC transport, dispatcher, tool registry, tier enforcement) |
 | `controllers/` | Hardware controller device layer: SpaceMouse, Stream Deck+, ROLI Lightpad, evdev touch |
 | `ui/` | Shared GUI widgets: the interactive EQ curve display (ValueTree-backed, undoable) and the per-band toggle. Palette and localised strings are injected by the consuming app through provider callbacks, so spatcore stays app-agnostic |
+| `io/` | Audio device layer: open/restore policy that makes explicit channel masks stick, a device callback with no channel cap whose buffer is indexed by hardware channel, and the output test-signal generator (500 ms protective ramp) |
 | `tools/` | `gpu/` per-vendor plugin build scripts, `codegen/` CSV→MCP tool generator core |
 | `tests/` | Standalone unit tests + the wiring to build them |
 | `docs/` | The architecture analyses and boundary decisions this extraction was built from |
@@ -24,7 +25,7 @@ submodule by multiple apps (WFS-DIY, and the planned XOA and Tight-WFS).
 ## Consuming
 
 spatcore builds as CMake static libraries (`spatcore-audio`, `spatcore-control`,
-`spatcore-controllers`, `spatcore-ui`). The consumer provides the third-party
+`spatcore-controllers`, `spatcore-ui`, `spatcore-io`). The consumer provides the third-party
 dependencies — each contract fails loudly if unmet:
 
 - **JUCE**: `juce::*` module targets must exist before `add_subdirectory(spatcore)`
@@ -50,6 +51,11 @@ dependencies — each contract fails loudly if unmet:
 `spatcore-ui` needs no extra dependency (its JUCE modules ship with JUCE), but
 it does link `juce_gui_basics` — which `spatcore-audio` deliberately never does,
 so the audio layer stays usable headless. `SPATCORE_UI=OFF` drops it entirely.
+
+`spatcore-io` is separate for the same reason and links `juce_audio_devices`,
+which pulls in the platform driver backends (ASIO/WASAPI, CoreAudio, ALSA/JACK).
+An app that opens its own device wants it; a DAW plugin or an offline renderer,
+where the host owns the device, sets `SPATCORE_IO=OFF`.
 
 Compile flags: `cmake/SpatcoreCompileFlags.cmake` pins the optimization and
 floating-point flags the bit-exactness gates were baselined with.

@@ -78,6 +78,14 @@ option(SPATCORE_CONTROL
 option(SPATCORE_UI
     "Build spatcore-ui (shared GUI widgets; needs juce_gui_basics)" ON)
 
+# Audio device layer (device open/restore policy + the uncapped hardware-indexed
+# device callback + output test signals). OFF-able because a plugin or an
+# offline renderer never opens a device itself — the host does — and
+# juce_audio_devices drags in the platform driver backends (ASIO/WASAPI,
+# CoreAudio, ALSA/JACK) with it.
+option(SPATCORE_IO
+    "Build spatcore-io (audio device host + callback; needs juce_audio_devices)" ON)
+
 # ---------------------------------------------------------------------------
 # Consumer-provides-JUCE contract
 # ---------------------------------------------------------------------------
@@ -410,6 +418,55 @@ if(SPATCORE_UI)
 
     spatcore_apply_compile_flags(spatcore-ui)
 endif()  # SPATCORE_UI
+
+# ---------------------------------------------------------------------------
+# spatcore-io
+# ---------------------------------------------------------------------------
+# Audio device layer: DeviceHost (open/restore policy with explicit channel
+# masks), DeviceIoCallback (drives a juce::AudioSource from the raw device
+# callback with no channel cap and a hardware-indexed buffer) and
+# TestSignalGenerator. Header-only, so the target's one source is the
+# compile-check TU — see io/SpatcoreIoCompileCheck.cpp for the rationale.
+#
+# A SEPARATE target for the same reason spatcore-ui is one, with a different
+# unwanted dependency: juce_audio_devices pulls in the platform driver backends,
+# and spatcore-audio must stay linkable where the HOST owns the device (DAW
+# plugins, offline renderers). The dependency runs io/ -> juce only — nothing
+# here includes spatcore-audio, and nothing in spatcore-audio includes io/.
+#
+# No consumer-provides guard: every module below ships with JUCE, so the
+# juce::juce_core check above already covers them.
+if(SPATCORE_IO)
+    add_library(spatcore-io STATIC
+        io/SpatcoreIoCompileCheck.cpp
+    )
+
+    target_include_directories(spatcore-io PUBLIC "${SPATCORE_INCLUDE_ROOT}")
+
+    # JUCE module deps as measured from spatcore/io includes (2026-08):
+    #   juce_audio_devices  io/DeviceHost.h (AudioDeviceManager, AudioDeviceSetup)
+    #                       and io/DeviceIoCallback.h (AudioIODeviceCallback,
+    #                       AudioIODevice active-channel masks)
+    #   juce_audio_basics   AudioBuffer / AudioSource / AudioSourceChannelInfo /
+    #                       FloatVectorOperations / Decibels in the callback and
+    #                       io/TestSignalGenerator.h
+    #   juce_events         no direct use, but juce_audio_devices is built on the
+    #                       message thread (device change broadcasts); named
+    #                       explicitly like every other target's transitive modules
+    #   juce_core           BigInteger (io/HardwareIndexMap.h), String, Random,
+    #                       Time, jlimit/jmax + transitive base
+    target_link_libraries(spatcore-io PUBLIC
+        juce::juce_audio_devices
+        juce::juce_audio_basics
+        juce::juce_events
+        juce::juce_core)
+
+    # Consumers may be shared objects (plugin formats); PIC is free on Win/mac
+    # and required on Linux (see Plugin/CMakeLists.txt for the ld error text).
+    set_target_properties(spatcore-io PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+    spatcore_apply_compile_flags(spatcore-io)
+endif()  # SPATCORE_IO
 
 # ---------------------------------------------------------------------------
 # Tests

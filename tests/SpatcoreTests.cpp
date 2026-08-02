@@ -23,6 +23,15 @@
                                  biquadMagnitudeDb sanity + a golden coefficient
                                  table for both filter classes; OutputEQProcessor
                                  neutral at defaults
+      6. io/HardwareIndexMap     hardware -> compact callback index translation:
+                                 contiguous (identity), sparse (holes shift
+                                 every index), empty, and policy clamping
+      7. io/DeviceHost           the enable-all channel-mask policy, including
+                                 clearing useDefault*Channels - without which
+                                 JUCE silently replaces the mask
+      8. io/TestSignalGenerator  tone pitch survives prepare()/sample-rate
+                                 change; the 500 ms protective ramp; seeded
+                                 pink noise is reproducible
 */
 
 // OSCParser.h / OSCSerializer.h use juce::OSC* types but (verbatim-moved,
@@ -50,6 +59,9 @@
 #include "spatcore/control/osc/OSCParser.h"
 #include "spatcore/reverb/ReverbSDNAlgorithm.h"
 #include "spatcore/reverb/ReverbFDNAlgorithm.h"
+#include "spatcore/io/HardwareIndexMap.h"
+#include "spatcore/io/DeviceHost.h"
+#include "spatcore/io/TestSignalGenerator.h"
 
 #include <array>
 #include <cmath>
@@ -1253,6 +1265,280 @@ static void testOutputEQProcessorNeutrality()
 }
 
 //==============================================================================
+// io/ - device layer.
+//
+// DeviceIoCallback itself is not driven here: exercising it needs a live
+// juce::AudioIODevice, which cannot be faked headlessly without reimplementing
+// a backend. Everything about it that can be wrong independently of a driver
+// lives in HardwareIndexMap (the hardware -> compact index translation) and is
+// covered below; the buffer assembly is verified against real hardware by the
+// app's patch-window acceptance checks.
+//==============================================================================
+static juce::BigInteger maskFromBits (std::initializer_list<int> bits)
+{
+    juce::BigInteger mask;
+
+    for (int b : bits)
+        mask.setBit (b);
+
+    return mask;
+}
+
+static void testHardwareIndexMapContiguous()
+{
+    juce::BigInteger ins, outs;
+    ins.setRange (0, 8, true);
+    outs.setRange (0, 64, true);
+
+    const auto map = spatcore::io::HardwareIndexMap::fromMasks (ins, outs, 512);
+
+    // One past the highest active bit of EITHER mask.
+    CHECK (map.numChannels == 64);
+    CHECK ((int) map.inputIndexForHw.size() == 64);
+    CHECK ((int) map.outputIndexForHw.size() == 64);
+
+    // Contiguous from 0: hardware index == compact index, which is exactly the
+    // assumption the old AudioSourcePlayer path silently relied on.
+    CHECK (map.isIdentityMapping());
+
+    for (int hw = 0; hw < 8; ++hw)
+        CHECK (map.inputIndexForHw[(size_t) hw] == hw);
+
+    for (int hw = 8; hw < 64; ++hw)
+        CHECK (map.inputIndexForHw[(size_t) hw] == -1);
+
+    for (int hw = 0; hw < 64; ++hw)
+        CHECK (map.outputIndexForHw[(size_t) hw] == hw);
+}
+
+static void testHardwareIndexMapSparse()
+{
+    // Holes: hardware index and compact index diverge. Reading the callback
+    // arrays by hardware number here would silently address the wrong channel.
+    const auto ins  = maskFromBits ({ 1, 3 });
+    const auto outs = maskFromBits ({ 0, 2, 5 });
+
+    const auto map = spatcore::io::HardwareIndexMap::fromMasks (ins, outs, 512);
+
+    CHECK (map.numChannels == 6);
+    CHECK (! map.isIdentityMapping());
+
+    const int expectedIn[6]  = { -1, 0, -1, 1, -1, -1 };
+    const int expectedOut[6] = {  0, -1, 1, -1, -1,  2 };
+
+    for (int hw = 0; hw < 6; ++hw)
+    {
+        CHECK (map.inputIndexForHw[(size_t) hw]  == expectedIn[hw]);
+        CHECK (map.outputIndexForHw[(size_t) hw] == expectedOut[hw]);
+    }
+}
+
+static void testHardwareIndexMapEmptyAndClamp()
+{
+    const juce::BigInteger empty;
+
+    const auto none = spatcore::io::HardwareIndexMap::fromMasks (empty, empty, 512);
+    CHECK (none.numChannels == 0);
+    CHECK (none.inputIndexForHw.empty());
+    CHECK (none.outputIndexForHw.empty());
+    CHECK (none.isIdentityMapping());        // vacuously
+
+    // A device wider than the policy limit is addressed up to the limit only;
+    // nothing is a fixed-size array, so this is the ONLY cap in the path.
+    juce::BigInteger wide;
+    wide.setRange (0, 600, true);
+
+    const auto clamped = spatcore::io::HardwareIndexMap::fromMasks (wide, wide, 512);
+    CHECK (clamped.numChannels == 512);
+    CHECK (clamped.outputIndexForHw[511] == 511);
+
+    // 512 is a policy number, not a structural one: ask for more, get more.
+    const auto unclamped = spatcore::io::HardwareIndexMap::fromMasks (wide, wide, 1024);
+    CHECK (unclamped.numChannels == 600);
+}
+
+static void testDeviceHostEnableAllPolicy()
+{
+    juce::AudioDeviceManager::AudioDeviceSetup setup;
+
+    // The default state is the bug: while useDefault*Channels is true,
+    // AudioDeviceManager::setAudioDeviceSetup discards the caller's mask and
+    // substitutes range(0, numChansNeeded).
+    CHECK (setup.useDefaultInputChannels);
+    CHECK (setup.useDefaultOutputChannels);
+
+    spatcore::io::DeviceHost::applyEnableAllPolicy (setup, 32, 128, 512);
+
+    CHECK (! setup.useDefaultInputChannels);
+    CHECK (! setup.useDefaultOutputChannels);
+    CHECK (setup.inputChannels.countNumberOfSetBits() == 32);
+    CHECK (setup.outputChannels.countNumberOfSetBits() == 128);
+    CHECK (setup.inputChannels.getHighestBit() == 31);
+    CHECK (setup.outputChannels.getHighestBit() == 127);
+
+    // Re-applying with smaller counts must CLEAR the old bits, not union them
+    // (switching to a smaller interface).
+    spatcore::io::DeviceHost::applyEnableAllPolicy (setup, 2, 4, 512);
+    CHECK (setup.inputChannels.countNumberOfSetBits() == 2);
+    CHECK (setup.outputChannels.countNumberOfSetBits() == 4);
+
+    // Clamped to the policy limit.
+    spatcore::io::DeviceHost::applyEnableAllPolicy (setup, 600, 600, 512);
+    CHECK (setup.inputChannels.countNumberOfSetBits() == 512);
+    CHECK (setup.outputChannels.countNumberOfSetBits() == 512);
+
+    // An output-only device: no inputs is a valid mask, not a disabled flag.
+    spatcore::io::DeviceHost::applyEnableAllPolicy (setup, 0, 8, 512);
+    CHECK (setup.inputChannels.isZero());
+    CHECK (setup.outputChannels.countNumberOfSetBits() == 8);
+    CHECK (! setup.useDefaultInputChannels);
+}
+
+//==============================================================================
+// Counts sign changes, which measures the tone's pitch independently of its
+// amplitude (the protective ramp means early samples are tiny).
+static int countZeroCrossings (const float* data, int numSamples)
+{
+    int crossings = 0;
+
+    for (int i = 1; i < numSamples; ++i)
+        if ((data[i - 1] < 0.0f && data[i] >= 0.0f) || (data[i - 1] >= 0.0f && data[i] < 0.0f))
+            ++crossings;
+
+    return crossings;
+}
+
+static void renderTone (spatcore::io::TestSignalGenerator& gen,
+                        juce::AudioBuffer<float>& buffer,
+                        int blockSize)
+{
+    for (int start = 0; start + blockSize <= buffer.getNumSamples(); start += blockSize)
+        gen.renderNextBlock (buffer, start, blockSize);
+}
+
+static void testTestSignalGeneratorToneFollowsSampleRate()
+{
+    using Gen = spatcore::io::TestSignalGenerator;
+
+    // No setFrequency() call anywhere: prepare() alone must leave the tone
+    // playable. This is the regression the app shipped with - the phase
+    // increment defaulted to zero and was only ever written by setFrequency(),
+    // so a Tone selected on any path that skipped it was pure silence.
+    Gen gen;
+    gen.prepare (48000.0, 480);
+    gen.setSignalType (Gen::SignalType::Tone);
+    gen.setOutputChannel (0);
+
+    // 480 divides 48000, so every sample of the buffer is rendered - a partial
+    // trailing block would read as a pitch error.
+    const int blockSize = 480;
+    juce::AudioBuffer<float> buffer (2, 48000);
+    buffer.clear();
+    renderTone (gen, buffer, blockSize);
+
+    CHECK (buffer.getMagnitude (0, 0, 48000) > 0.0f);
+    CHECK (buffer.getMagnitude (1, 0, 48000) == 0.0f);   // other channels untouched
+
+    // 1000 Hz default over the second half second (past the ramp): 2 crossings
+    // per cycle.
+    const int crossings48k = countZeroCrossings (buffer.getReadPointer (0) + 24000, 24000);
+    CHECK (crossings48k >= 995 && crossings48k <= 1005);
+
+    // Same generator re-prepared at double the rate: the pitch must hold, so
+    // the crossings over the same SAMPLE count must halve. Without the
+    // recompute in prepare() the tone would come back an octave up.
+    gen.prepare (96000.0, blockSize);
+    gen.setSignalType (Gen::SignalType::Off);
+    gen.setSignalType (Gen::SignalType::Tone);
+    gen.setOutputChannel (-1);
+    gen.setOutputChannel (0);
+
+    buffer.clear();
+    renderTone (gen, buffer, blockSize);
+
+    const int crossings96k = countZeroCrossings (buffer.getReadPointer (0) + 24000, 24000);
+    CHECK (crossings96k >= 495 && crossings96k <= 505);
+}
+
+static void testTestSignalGeneratorProtectiveRamp()
+{
+    using Gen = spatcore::io::TestSignalGenerator;
+
+    // HEARING PROTECTION: the continuous signals must ramp up over 500 ms from
+    // silence, every time they start. A rig under test can be pointed at
+    // someone's head at full system gain.
+    Gen gen;
+    gen.prepare (48000.0, 512);
+    gen.setLevel (0.0f);                       // unity, so the envelope is readable
+    gen.setSignalType (Gen::SignalType::Tone);
+    gen.setOutputChannel (0);
+
+    const int blockSize = 480;                 // 10 ms
+    const int numBlocks = 100;                 // 1 s: 500 ms of ramp + 500 ms at level
+    juce::AudioBuffer<float> buffer (1, blockSize * numBlocks);
+    buffer.clear();
+    renderTone (gen, buffer, blockSize);
+
+    CHECK (buffer.getReadPointer (0)[0] == 0.0f);   // starts from silence
+
+    float previousPeak = -1.0f;
+    for (int b = 0; b < 50; ++b)                    // across the ramp
+    {
+        const float peak = buffer.getMagnitude (0, b * blockSize, blockSize);
+        CHECK (peak >= previousPeak);               // never steps back up
+        previousPeak = peak;
+    }
+
+    // First 10 ms is a small fraction of level; the ramp is complete by 500 ms.
+    CHECK (buffer.getMagnitude (0, 0, blockSize) < 0.05f);
+    CHECK (buffer.getMagnitude (0, 50 * blockSize, blockSize) > 0.98f);
+
+    // Restarting on another channel restarts the ramp - not a step to full.
+    gen.setOutputChannel (-1);
+    gen.setOutputChannel (0);
+    buffer.clear();
+    gen.renderNextBlock (buffer, 0, blockSize);
+    CHECK (buffer.getMagnitude (0, 0, blockSize) < 0.05f);
+
+    // The transient types carry their own envelopes and start at unity.
+    gen.setSignalType (Gen::SignalType::DiracPulse);
+    buffer.clear();
+    gen.renderNextBlock (buffer, 0, blockSize);
+    CHECK (buffer.getMagnitude (0, 0, blockSize) > 1.0f);   // pulse amplitude is 2.0
+}
+
+static void testTestSignalGeneratorDeterministicSeed()
+{
+    using Gen = spatcore::io::TestSignalGenerator;
+
+    const int blockSize = 256;
+    const int numBlocks = 8;
+
+    juce::AudioBuffer<float> a (1, blockSize * numBlocks), b (1, blockSize * numBlocks);
+    a.clear();
+    b.clear();
+
+    for (auto* pair : { &a, &b })
+    {
+        Gen gen;
+        gen.setDeterministicSeed (42);
+        gen.prepare (48000.0, blockSize);
+        gen.setSignalType (Gen::SignalType::PinkNoise);
+        gen.setOutputChannel (0);
+        renderTone (gen, *pair, blockSize);
+    }
+
+    CHECK (a.getMagnitude (0, 0, a.getNumSamples()) > 0.0f);
+
+    for (int i = 0; i < a.getNumSamples(); ++i)
+        if (! bitEqualFloat (a.getReadPointer (0)[i], b.getReadPointer (0)[i]))
+        {
+            CHECK (false);
+            break;
+        }
+}
+
+//==============================================================================
 int main()
 {
     try
@@ -1272,6 +1558,13 @@ int main()
         testBiquadMagnitudeResponse();
         testBiquadGoldenCoefficients();
         testOutputEQProcessorNeutrality();
+        testHardwareIndexMapContiguous();
+        testHardwareIndexMapSparse();
+        testHardwareIndexMapEmptyAndClamp();
+        testDeviceHostEnableAllPolicy();
+        testTestSignalGeneratorToneFollowsSampleRate();
+        testTestSignalGeneratorProtectiveRamp();
+        testTestSignalGeneratorDeterministicSeed();
     }
     catch (const std::exception& e)
     {
