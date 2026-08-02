@@ -25,12 +25,14 @@ namespace io
                      ignored and getCurrentSpeakerIndex() names the channel
                      under test so a UI can announce it
 
-    HEARING PROTECTION: the continuous signals (pink noise and tone) always
-    ramp up over 500 ms, and the ramp restarts every time the signal starts or
-    the signal type changes. A rig under test can be pointed at someone's head
-    at full system gain, so this is a safety property, not a nicety — do not
-    shorten it, and give any new continuous signal type the same ramp. The
-    transient types (sweep, pulse) carry their own envelopes and start at unity.
+    HEARING PROTECTION: EVERY signal type ramps up over 500 ms, and the ramp
+    restarts each time the signal starts or the signal type changes. A rig
+    under test can be pointed at someone's head at full system gain, and the
+    ramp is what gives the operator time to stop a too-loud signal before it
+    hurts — so it is a safety property, not a nicety: do not shorten it, do
+    not exempt a signal type from it (the transient types' own envelopes and
+    SpeakerId's burst declick sit ON TOP of it, they do not replace it), and
+    give any new signal type the same ramp.
 
     Injected AFTER the spatial processing, straight into the hardware output
     buffer, and it REPLACES the samples on its target channel rather than mixing
@@ -102,13 +104,10 @@ public:
             pulsePosition = 0.0f;
             speakerIdPosition = 0.0;
 
-            // Restart the 500 ms protective ramp for the continuous signals;
-            // the transient ones envelope themselves (SpeakerId declicks its
-            // own burst edges).
-            if (type == SignalType::PinkNoise || type == SignalType::Tone)
-                fadePosition.store (0.0f);
-            else
-                fadePosition.store (1.0f);
+            // Restart the 500 ms protective ramp — for EVERY type. The
+            // transient envelopes and SpeakerId's declick ride on top of it;
+            // none of them may bypass it (see the class comment).
+            fadePosition.store (0.0f);
         }
     }
 
@@ -133,11 +132,10 @@ public:
 
         const SignalType type = currentType.load();
 
-        // Restart the ramp on every start, so the operator never gets a step
-        // into full level.
+        // Restart the ramp on every start, whatever the type, so the operator
+        // never gets a step into full level.
         if (channel >= 0 && oldChannel < 0)
-            if (type == SignalType::PinkNoise || type == SignalType::Tone)
-                fadePosition.store (0.0f);
+            fadePosition.store (0.0f);
 
         // Moving to another channel restarts the transient signals, so the
         // operator hears them from the beginning on the new speaker.
@@ -338,6 +336,11 @@ private:
         const double cycle = static_cast<double> (numOut) * speakerIdSlot;   // one full sweep of the rig
         int lastSpeaker = -1;
 
+        // The 500 ms protective ramp applies here too (see the class
+        // comment); the per-burst declick envelope rides on top of it.
+        float currentFade = fadePosition.load();
+        const float fadeStep = 1.0f / (fadeDuration * static_cast<float> (sampleRate));
+
         for (int i = 0; i < numSamples; ++i)
         {
             const int    speaker    = static_cast<int> (speakerIdPosition / speakerIdSlot);
@@ -352,16 +355,20 @@ private:
                 else if (withinSlot > speakerIdBurst - declickDuration)
                     env = static_cast<float> ((speakerIdBurst - withinSlot) / declickDuration);
 
-                outputBuffer.getWritePointer (speaker, startSample)[i] = generatePinkNoise() * level * env;
+                outputBuffer.getWritePointer (speaker, startSample)[i] = generatePinkNoise() * level * env * currentFade;
                 lastSpeaker = speaker;
             }
             // else: gap - leave the buffer untouched on every channel.
+
+            if (currentFade < 1.0f)
+                currentFade = juce::jmin (1.0f, currentFade + fadeStep);
 
             speakerIdPosition += dt;
             if (speakerIdPosition >= cycle)
                 speakerIdPosition -= cycle;
         }
 
+        fadePosition.store (currentFade);
         currentSpeakerIndex.store (lastSpeaker);
     }
 
