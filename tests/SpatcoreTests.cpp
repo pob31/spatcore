@@ -1500,11 +1500,27 @@ static void testTestSignalGeneratorProtectiveRamp()
     gen.renderNextBlock (buffer, 0, blockSize);
     CHECK (buffer.getMagnitude (0, 0, blockSize) < 0.05f);
 
-    // The transient types carry their own envelopes and start at unity.
+    // EVERY type ramps — the transient envelopes and SpeakerId's declick ride
+    // on top of the 500 ms protective ramp rather than replacing it. A Dirac
+    // at unity into a rig at full gain is exactly the step this guards
+    // against: the operator must get time to stop it before it hurts.
     gen.setSignalType (Gen::SignalType::DiracPulse);
+    juce::AudioBuffer<float> longBuf (1, 96000);   // 2 s: pulses at ~0 s and ~1 s
+    longBuf.clear();
+    renderTone (gen, longBuf, blockSize);
+    CHECK (longBuf.getMagnitude (0, 0, blockSize) < 0.05f);      // first pulse ramped down
+    CHECK (longBuf.getMagnitude (0, 48000, 48000) > 1.9f);       // post-ramp pulse at full 2.0
+
+    gen.setSignalType (Gen::SignalType::Sweep);
     buffer.clear();
     gen.renderNextBlock (buffer, 0, blockSize);
-    CHECK (buffer.getMagnitude (0, 0, blockSize) > 1.0f);   // pulse amplitude is 2.0
+    CHECK (buffer.getMagnitude (0, 0, blockSize) < 0.05f);       // sweep start ramped
+
+    gen.setSignalType (Gen::SignalType::SpeakerId);
+    juce::AudioBuffer<float> idBuf (2, blockSize);
+    idBuf.clear();
+    gen.renderNextBlock (idBuf, 0, blockSize);
+    CHECK (idBuf.getMagnitude (0, 0, blockSize) < 0.05f);        // first burst ramped
 }
 
 static void testTestSignalGeneratorDeterministicSeed()
