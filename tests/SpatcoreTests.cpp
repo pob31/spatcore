@@ -64,6 +64,7 @@
 #include "spatcore/io/TestSignalGenerator.h"
 #include "spatcore/binaural/HeadFrame.h"
 #include "spatcore/binaural/StructuralHrtfRenderer.h"
+#include "spatcore/dsp/OneEuroFilter.h"
 #ifdef SPATCORE_TEST_SOFA_FIXTURE
 #include "spatcore/binaural/SofaLoader.h"
 #include "spatcore/binaural/SofaHrtfRenderer.h"
@@ -1843,6 +1844,156 @@ static void testStructuralHrtfRotationContinuity()
 }
 
 //==============================================================================
+// binaural/HeadFrame — matrixToYawPitchRoll is the inverse used by head
+// trackers to recover angles after zero-calibration composition.
+static void testHeadFrameMatrixToYawPitchRoll()
+{
+    namespace hf = spatcore::binaural::headframe;
+    constexpr float pi = 3.14159265358979f;
+    const float tol = 1e-4f;
+
+    // Roundtrip over a grid, away from gimbal lock.
+    for (float yaw = -3.0f; yaw <= 3.0f; yaw += 0.75f)
+        for (float pitch = -1.4f; pitch <= 1.4f; pitch += 0.35f)
+            for (float roll = -1.4f; roll <= 1.4f; roll += 0.35f)
+            {
+                float R[9];
+                hf::yawPitchRollToMatrix (yaw, pitch, roll, R);
+
+                float y2, p2, r2;
+                hf::matrixToYawPitchRoll (R, y2, p2, r2);
+
+                // Compare through the matrix: distinct angle triples can name
+                // the same rotation, the rotation itself must match.
+                float R2[9];
+                hf::yawPitchRollToMatrix (y2, p2, r2, R2);
+                for (int i = 0; i < 9; ++i)
+                    CHECK (std::fabs (R[i] - R2[i]) < 1e-3f);
+            }
+
+    // Gimbal lock: looking straight up stays finite and reproduces the rotation.
+    {
+        float R[9];
+        hf::yawPitchRollToMatrix (0.6f, pi / 2.0f, 0.0f, R);
+        float y, p, r;
+        hf::matrixToYawPitchRoll (R, y, p, r);
+        CHECK (std::isfinite (y) && std::isfinite (p) && std::isfinite (r));
+        CHECK (r == 0.0f);                                  // roll folded into yaw
+        CHECK (std::fabs (p - pi / 2.0f) < 1e-3f);
+    }
+
+    // transpose() inverts an orthonormal rotation: Rᵀ·R = I.
+    {
+        float R[9], Rt[9], I[9];
+        hf::yawPitchRollToMatrix (0.7f, -0.4f, 0.3f, R);
+        hf::transpose (R, Rt);
+        hf::multiply (Rt, R, I);
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+                CHECK (std::fabs (I[i * 3 + j] - (i == j ? 1.0f : 0.0f)) < tol);
+    }
+}
+
+//==============================================================================
+// The zero-calibration property head trackers rely on: capturing R_zero and
+// pre-multiplying by its inverse maps that attitude to identity, and any
+// later attitude to its offset FROM the calibration pose.
+static void testHeadTrackerZeroComposition()
+{
+    namespace hf = spatcore::binaural::headframe;
+    const float tol = 1e-3f;
+
+    float rZero[9], rZeroInv[9];
+    hf::yawPitchRollToMatrix (0.9f, -0.3f, 0.15f, rZero);   // user looking off-axis
+    hf::transpose (rZero, rZeroInv);
+
+    // Calibration pose itself → zero angles.
+    {
+        float corrected[9];
+        hf::multiply (rZeroInv, rZero, corrected);
+        float y, p, r;
+        hf::matrixToYawPitchRoll (corrected, y, p, r);
+        CHECK (std::fabs (y) < tol);
+        CHECK (std::fabs (p) < tol);
+        CHECK (std::fabs (r) < tol);
+    }
+
+    // A later attitude → the rotation from calibration to now, and NOT the
+    // per-angle difference (the trap this composition exists to avoid).
+    {
+        float rNow[9], corrected[9];
+        hf::yawPitchRollToMatrix (1.3f, 0.2f, -0.1f, rNow);
+        hf::multiply (rZeroInv, rNow, corrected);
+
+        float y, p, r;
+        hf::matrixToYawPitchRoll (corrected, y, p, r);
+
+        // Recomposing must reproduce the corrected rotation exactly.
+        float check[9];
+        hf::yawPitchRollToMatrix (y, p, r, check);
+        for (int i = 0; i < 9; ++i)
+            CHECK (std::fabs (corrected[i] - check[i]) < tol);
+
+        // Naive subtraction would give yaw 0.4/pitch 0.5/roll −0.25; with a
+        // non-zero calibration pitch/roll the true composition differs.
+        const bool differsFromNaive = std::fabs (y - 0.4f) > 1e-2f
+                                   || std::fabs (p - 0.5f) > 1e-2f
+                                   || std::fabs (r + 0.25f) > 1e-2f;
+        CHECK (differsFromNaive);
+    }
+}
+
+//==============================================================================
+// dsp/OneEuroFilter — promoted out of TrackingPositionFilter for head tracking.
+static void testOneEuroFilter()
+{
+    spatcore::dsp::OneEuroFilter f;
+
+    // First sample passes through untouched, and seeds the state.
+    CHECK (f.filter (0.5f, 0.0, 1.5f, 3.0f, 1.0f) == 0.5f);
+
+    // A constant signal stays put (no drift, no overshoot).
+    double t = 0.0;
+    for (int i = 0; i < 50; ++i)
+    {
+        t += 1.0 / 60.0;
+        f.filter (0.5f, t, 1.5f, 3.0f, 1.0f);
+    }
+    CHECK (std::fabs (f.prevFiltered - 0.5f) < 1e-4f);
+
+    // Steady jitter around a mean is attenuated (that is the whole point).
+    spatcore::dsp::OneEuroFilter jf;
+    double tj = 0.0;
+    float maxDeviation = 0.0f;
+    jf.filter (0.0f, tj, 1.5f, 3.0f, 1.0f);
+    for (int i = 0; i < 200; ++i)
+    {
+        tj += 1.0 / 60.0;
+        const float noise = (i % 2 == 0 ? 0.02f : -0.02f);   // ±0.02 alternating
+        const float out = jf.filter (noise, tj, 1.5f, 3.0f, 1.0f);
+        if (i > 20)
+            maxDeviation = std::max (maxDeviation, std::fabs (out));
+    }
+    CHECK (maxDeviation < 0.01f);        // less than half the input excursion
+
+    // A fast ramp is tracked closely (adaptive cutoff opens with speed).
+    spatcore::dsp::OneEuroFilter rf;
+    double tr = 0.0;
+    float value = 0.0f, out = 0.0f;
+    rf.filter (0.0f, tr, 1.5f, 3.0f, 1.0f);
+    for (int i = 0; i < 60; ++i)         // 1 s at 60 Hz, 2 rad/s
+    {
+        tr += 1.0 / 60.0;
+        value += 2.0f / 60.0f;
+        out = rf.filter (value, tr, 1.5f, 3.0f, 1.0f);
+    }
+    CHECK (std::fabs (out - value) < 0.15f);   // lag well under 0.1 s of travel
+
+    f.reset();
+    CHECK (! f.initialized);
+}
+
+//==============================================================================
 #ifdef SPATCORE_TEST_SOFA_FIXTURE
 // binaural/SofaLoader + SofaHrtfRenderer — real-file coverage against the
 // bundled SADIE II KU100 set: grid bake sanity, ITD extraction, FFT cook,
@@ -1994,6 +2145,9 @@ int main()
         testTestSignalGeneratorDeterministicSeed();
         testTestSignalGeneratorSpeakerIdSequencing();
         testBinauralHeadFrame();
+        testHeadFrameMatrixToYawPitchRoll();
+        testHeadTrackerZeroComposition();
+        testOneEuroFilter();
         testStructuralHrtfItdAndDc();
         testStructuralHrtfRotationContinuity();
 #ifdef SPATCORE_TEST_SOFA_FIXTURE

@@ -68,6 +68,42 @@ inline void yawPitchRollToMatrix (float yaw, float pitch, float roll, float R[9]
     multiply (rz, tmp, R);
 }
 
+/** Inverse of yawPitchRollToMatrix: recover the angles from the offset matrix.
+
+    With R = Rz(−yaw)·Rx(pitch)·Ry(roll) the entries are
+        R[7] = sin(pitch)
+        R[1] =  sin(yaw)·cos(pitch)   R[4] = cos(yaw)·cos(pitch)
+        R[6] = −cos(pitch)·sin(roll)  R[8] = cos(pitch)·cos(roll)
+    At |pitch| → 90° yaw and roll degenerate (gimbal lock); we then attribute
+    the whole rotation to yaw and report roll = 0, which is the stable choice
+    for head tracking (looking straight up/down is already an edge case).
+*/
+inline void matrixToYawPitchRoll (const float R[9], float& yaw, float& pitch, float& roll) noexcept
+{
+    const float sinPitch = R[7] < -1.0f ? -1.0f : (R[7] > 1.0f ? 1.0f : R[7]);
+    pitch = std::asin (sinPitch);
+
+    if (std::abs (sinPitch) > 0.9999f)
+    {
+        yaw = std::atan2 (-R[3], R[0]);
+        roll = 0.0f;
+        return;
+    }
+
+    yaw  = std::atan2 (R[1], R[4]);
+    roll = std::atan2 (-R[6], R[8]);
+}
+
+/** Transpose of an orthonormal rotation = its inverse. Aliasing-safe. */
+inline void transpose (const float R[9], float out[9]) noexcept
+{
+    const float t[9] = { R[0], R[3], R[6],
+                         R[1], R[4], R[7],
+                         R[2], R[5], R[8] };
+    for (int i = 0; i < 9; ++i)
+        out[i] = t[i];
+}
+
 /** Baseline rotation for a listener placed at world angle alphaRad, facing the origin. */
 inline void baselineMatrix (float alphaRad, float R[9]) noexcept
 {

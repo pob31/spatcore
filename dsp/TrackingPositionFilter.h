@@ -1,6 +1,7 @@
 #pragma once
 
 #include <juce_audio_basics/juce_audio_basics.h>
+#include "OneEuroFilter.h"
 #include <cmath>
 #include <vector>
 
@@ -167,73 +168,11 @@ public:
 
 private:
     //==========================================================================
-    // 1-Euro Filter (single axis)
+    // 1-Euro Filter (single axis) — shared implementation, see
+    // spatcore/dsp/OneEuroFilter.h (head tracking uses the same struct).
     //==========================================================================
 
-    struct OneEuroFilter
-    {
-        float prevFiltered = 0.0f;
-        float prevDerivative = 0.0f;
-        double prevTimestamp = 0.0;
-        bool initialized = false;
-
-        void reset()
-        {
-            prevFiltered = 0.0f;
-            prevDerivative = 0.0f;
-            prevTimestamp = 0.0;
-            initialized = false;
-        }
-
-        float filter (float rawValue, double timestamp,
-                      float minCutoff, float beta, float derivativeCutoff)
-        {
-            if (! initialized)
-            {
-                prevFiltered = rawValue;
-                prevDerivative = 0.0f;
-                prevTimestamp = timestamp;
-                initialized = true;
-                return rawValue;
-            }
-
-            double dt = timestamp - prevTimestamp;
-            if (dt < 0.001) dt = 0.001;
-            if (dt > 1.0) dt = 1.0;
-            prevTimestamp = timestamp;
-
-            // Estimate derivative (speed)
-            float rawDerivative = (rawValue - prevFiltered) / static_cast<float> (dt);
-
-            // Smooth the derivative with fixed cutoff
-            float dAlpha = computeAlpha (derivativeCutoff, dt);
-            float filteredDerivative = lowPass (rawDerivative, prevDerivative, dAlpha);
-            prevDerivative = filteredDerivative;
-
-            // Adaptive cutoff based on speed
-            float speed = std::abs (filteredDerivative);
-            float cutoff = minCutoff + beta * speed;
-
-            // Filter the value
-            float alpha = computeAlpha (cutoff, dt);
-            float filteredValue = lowPass (rawValue, prevFiltered, alpha);
-            prevFiltered = filteredValue;
-
-            return filteredValue;
-        }
-
-    private:
-        static float computeAlpha (float cutoff, double dt)
-        {
-            float tau = 1.0f / (2.0f * juce::MathConstants<float>::pi * cutoff);
-            return 1.0f / (1.0f + tau / static_cast<float> (dt));
-        }
-
-        static float lowPass (float raw, float prev, float alpha)
-        {
-            return prev + alpha * (raw - prev);
-        }
-    };
+    using OneEuroFilter = spatcore::dsp::OneEuroFilter;
 
     //==========================================================================
     // Per-input filter state

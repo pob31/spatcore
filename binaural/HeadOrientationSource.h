@@ -40,6 +40,14 @@ public:
 
     /** RT-safe. Called by the render worker once per block. */
     virtual HeadOrientation getOrientation() const noexcept = 0;
+
+    /** Calibrate "this attitude is zero" — the user faces the stage and asks
+        for the current pose to become the facing-origin reference. Sources
+        store the inverse of the current attitude and pre-multiply every
+        subsequent report (matrix composition, NOT per-angle subtraction:
+        rotations don't commute). Called from the message thread; sources that
+        need no calibration ignore it. */
+    virtual void setZero() {}
 };
 
 /** Publish/acquire base most sources will want: poll thread publishes,
