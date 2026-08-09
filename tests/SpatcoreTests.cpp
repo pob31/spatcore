@@ -62,6 +62,12 @@
 #include "spatcore/io/HardwareIndexMap.h"
 #include "spatcore/io/DeviceHost.h"
 #include "spatcore/io/TestSignalGenerator.h"
+#include "spatcore/binaural/HeadFrame.h"
+#include "spatcore/binaural/StructuralHrtfRenderer.h"
+#ifdef SPATCORE_TEST_SOFA_FIXTURE
+#include "spatcore/binaural/SofaLoader.h"
+#include "spatcore/binaural/SofaHrtfRenderer.h"
+#endif
 
 #include <array>
 #include <cmath>
@@ -1611,6 +1617,355 @@ static void testTestSignalGeneratorSpeakerIdSequencing()
 }
 
 //==============================================================================
+//==============================================================================
+// binaural/HeadFrame — rotation conventions are load-bearing for every HRTF
+// mode: pin them against hand-computed cases.
+static void testBinauralHeadFrame()
+{
+    using namespace spatcore::binaural;
+    namespace hf = spatcore::binaural::headframe;
+    constexpr float pi = 3.14159265358979f;
+    const float tol = 1e-4f;
+
+    // Baseline α = 0 → identity: head faces +y (the legacy listener at (0,−d)
+    // facing the origin).
+    ListenerPose pose;   // origin, identity R
+    {
+        auto front = hf::directionInHeadFrame (pose, 0.0f, 5.0f, 0.0f);
+        CHECK (std::fabs (front.azRad) < tol);
+        CHECK (std::fabs (front.elRad) < tol);
+        CHECK (std::fabs (front.distance - 5.0f) < tol);
+
+        auto right = hf::directionInHeadFrame (pose, 3.0f, 0.0f, 0.0f);
+        CHECK (std::fabs (right.azRad - pi / 2.0f) < tol);   // +az = listener's right
+
+        auto above = hf::directionInHeadFrame (pose, 0.0f, 0.0f, 2.0f);
+        CHECK (std::fabs (above.elRad - pi / 2.0f) < tol);
+    }
+
+    // Positive yaw turns the head right: a source on +x lands dead ahead.
+    {
+        float offset[9];
+        hf::yawPitchRollToMatrix (pi / 2.0f, 0.0f, 0.0f, offset);
+        hf::composeWithBaseline (0.0f, offset, pose.R);
+        auto d = hf::directionInHeadFrame (pose, 4.0f, 0.0f, 0.0f);
+        CHECK (std::fabs (d.azRad) < tol);
+        CHECK (std::fabs (d.elRad) < tol);
+    }
+
+    // Positive pitch looks up: a source straight ahead drops below the gaze.
+    {
+        float offset[9];
+        hf::yawPitchRollToMatrix (0.0f, pi / 6.0f, 0.0f, offset);   // +30°
+        hf::composeWithBaseline (0.0f, offset, pose.R);
+        auto d = hf::directionInHeadFrame (pose, 0.0f, 5.0f, 0.0f);
+        CHECK (std::fabs (d.elRad + pi / 6.0f) < tol);              // el = −30°
+        CHECK (std::fabs (d.azRad) < tol);
+    }
+
+    // Baseline α = 90°: listener placed at (d, 0), facing the origin (−x).
+    {
+        float offset[9];
+        hf::yawPitchRollToMatrix (0.0f, 0.0f, 0.0f, offset);
+        pose.x = 5.0f; pose.y = 0.0f; pose.z = 0.0f;
+        hf::composeWithBaseline (pi / 2.0f, offset, pose.R);
+        auto d = hf::directionInHeadFrame (pose, 0.0f, 0.0f, 0.0f);
+        CHECK (std::fabs (d.azRad) < tol);                          // origin dead ahead
+        CHECK (std::fabs (d.distance - 5.0f) < tol);
+    }
+
+    // Composed rotation stays orthonormal (RᵀR = I).
+    {
+        float offset[9], R[9];
+        hf::yawPitchRollToMatrix (0.7f, -0.4f, 0.3f, offset);
+        hf::composeWithBaseline (1.1f, offset, R);
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+            {
+                float dot = 0.0f;
+                for (int k = 0; k < 3; ++k)
+                    dot += R[k * 3 + i] * R[k * 3 + j];
+                CHECK (std::fabs (dot - (i == j ? 1.0f : 0.0f)) < 1e-4f);
+            }
+    }
+}
+
+//==============================================================================
+// binaural/StructuralHrtfRenderer — ITD sign/magnitude per direction, and
+// DC transparency of the filter chain (shadow is unity at DC by construction).
+static void testStructuralHrtfItdAndDc()
+{
+    using namespace spatcore::binaural;
+    constexpr float pi = 3.14159265358979f;
+    const double fs = 48000.0;
+    const int block = 512;
+    const float headRadius = 0.0875f;
+
+    auto renderImpulse = [&] (float azRad, std::vector<float>& L, std::vector<float>& R)
+    {
+        StructuralHrtfRenderer r;
+        r.prepare (fs, block, 1);
+
+        SourceDirection dir;
+        dir.azRad = azRad;
+        dir.elRad = 0.0f;
+        dir.distance = 2.0f;
+
+        const int numBlocks = 2;
+        L.assign ((size_t) (numBlocks * block), 0.0f);
+        R.assign ((size_t) (numBlocks * block), 0.0f);
+        std::vector<float> input ((size_t) block, 0.0f);
+
+        std::int64_t pos = 0;
+        for (int b = 0; b < numBlocks; ++b)
+        {
+            std::fill (input.begin(), input.end(), 0.0f);
+            if (b == 0)
+                input[0] = 1.0f;
+            r.processSource (0, dir, headRadius, 0.0f, 1.0f, input.data(),
+                             L.data() + pos, R.data() + pos, block, pos);
+            pos += block;
+        }
+    };
+
+    auto peakIndex = [] (const std::vector<float>& v)
+    {
+        size_t best = 0;
+        for (size_t i = 1; i < v.size(); ++i)
+            if (std::fabs (v[i]) > std::fabs (v[best]))
+                best = i;
+        return (int) best;
+    };
+
+    // Source hard right: right ear leads by (a/c)·(1 + π/2) seconds.
+    {
+        std::vector<float> L, R;
+        renderImpulse (pi / 2.0f, L, R);
+        const int itdSamples = peakIndex (L) - peakIndex (R);
+        const int expected = (int) std::lround ((headRadius / 343.0f) * (1.0f + pi / 2.0f) * fs);
+        CHECK (itdSamples > 0);                            // right leads
+        CHECK (std::abs (itdSamples - expected) <= 3);
+        // Shadowed (left) ear is noticeably quieter at the peak.
+        CHECK (std::fabs (R[(size_t) peakIndex (R)]) > std::fabs (L[(size_t) peakIndex (L)]));
+    }
+
+    // Source dead ahead: no ITD, symmetric level.
+    {
+        std::vector<float> L, R;
+        renderImpulse (0.0f, L, R);
+        CHECK (std::abs (peakIndex (L) - peakIndex (R)) <= 1);
+        const float pl = std::fabs (L[(size_t) peakIndex (L)]);
+        const float pr = std::fabs (R[(size_t) peakIndex (R)]);
+        CHECK (std::fabs (pl - pr) < 0.05f * (pl + pr));
+    }
+
+    // DC transparency: constant input, front source at 1 m (unity distance
+    // gain) settles to ~1 on both ears — the whole chain is unity at DC.
+    {
+        StructuralHrtfRenderer r;
+        r.prepare (fs, block, 1);
+        SourceDirection dir;                // front, 1 m
+        dir.distance = 1.0f;
+
+        std::vector<float> L ((size_t) block), R ((size_t) block), input ((size_t) block, 1.0f);
+        std::int64_t pos = 0;
+        float lastL = 0.0f, lastR = 0.0f;
+        for (int b = 0; b < 6; ++b)         // 64 ms — past the 1 m delay + filters
+        {
+            std::fill (L.begin(), L.end(), 0.0f);
+            std::fill (R.begin(), R.end(), 0.0f);
+            r.processSource (0, dir, headRadius, 0.0f, 1.0f, input.data(),
+                             L.data(), R.data(), block, pos);
+            pos += block;
+            lastL = L.back();
+            lastR = R.back();
+        }
+        CHECK (std::fabs (lastL - 1.0f) < 0.05f);
+        CHECK (std::fabs (lastR - 1.0f) < 0.05f);
+    }
+}
+
+//==============================================================================
+// binaural/StructuralHrtfRenderer — continuity under head rotation: sweeping
+// the azimuth across blocks must never produce sample-to-sample jumps beyond
+// what a slow Doppler on a low-frequency sine can explain (no zipper).
+static void testStructuralHrtfRotationContinuity()
+{
+    using namespace spatcore::binaural;
+    constexpr float pi = 3.14159265358979f;
+    const double fs = 48000.0;
+    const int block = 512;
+    const int numBlocks = 40;   // ~0.43 s
+
+    StructuralHrtfRenderer r;
+    r.prepare (fs, block, 1);
+
+    SourceDirection dir;
+    dir.distance = 3.0f;
+
+    std::vector<float> L ((size_t) block), R ((size_t) block), input ((size_t) block);
+    std::int64_t pos = 0;
+    double phase = 0.0;
+    const double phaseInc = 2.0 * pi * 200.0 / fs;
+
+    float prevL = 0.0f, prevR = 0.0f, maxDelta = 0.0f;
+    for (int b = 0; b < numBlocks; ++b)
+    {
+        // 0 → 90° sweep across the run — a fast but plausible head turn.
+        dir.azRad = (pi / 2.0f) * (float) b / (float) numBlocks;
+
+        for (int i = 0; i < block; ++i)
+        {
+            input[(size_t) i] = (float) std::sin (phase);
+            phase += phaseInc;
+        }
+        std::fill (L.begin(), L.end(), 0.0f);
+        std::fill (R.begin(), R.end(), 0.0f);
+        r.processSource (0, dir, 0.0875f, 0.0f, 1.0f, input.data(),
+                         L.data(), R.data(), block, pos);
+        pos += block;
+
+        for (int i = 0; i < block; ++i)
+        {
+            if (b > 1 || i > 0)   // skip the initial fill-in transient
+            {
+                maxDelta = std::max (maxDelta, std::fabs (L[(size_t) i] - prevL));
+                maxDelta = std::max (maxDelta, std::fabs (R[(size_t) i] - prevR));
+            }
+            prevL = L[(size_t) i];
+            prevR = R[(size_t) i];
+        }
+    }
+
+    // A clean 200 Hz sine at this level moves ≲0.01/sample; rotation-induced
+    // modulation stays the same order. A zipper/click would blow well past 0.1.
+    CHECK (maxDelta < 0.1f);
+}
+
+//==============================================================================
+#ifdef SPATCORE_TEST_SOFA_FIXTURE
+// binaural/SofaLoader + SofaHrtfRenderer — real-file coverage against the
+// bundled SADIE II KU100 set: grid bake sanity, ITD extraction, FFT cook,
+// and an end-to-end impulse render through the partitioned convolver.
+static void testSofaLoaderAndRenderer()
+{
+    using namespace spatcore::binaural;
+    constexpr float pi = 3.14159265358979f;
+    const double fs = 48000.0;
+    const int block = 512;
+
+    const juce::File fixture (SPATCORE_TEST_SOFA_FIXTURE);
+    const auto load = sofa::loadSofaFile (fixture, fs);
+    if (load.database == nullptr)
+    {
+        std::fprintf (stderr, "FAIL: SOFA fixture load: %s\n", load.status.toRawUTF8());
+        ++failures;
+        return;
+    }
+    const auto& db = *load.database;
+    CHECK (db.hrirLength >= 64 && db.hrirLength <= 1024);
+    CHECK (db.sampleRate == fs);
+
+    // ITD extraction at ear level, el = 0 (grid el index 9):
+    //   az 90° (source right) → LEFT ear is far: relL in ~[0.4, 1.0] ms, relR = 0.
+    //   az 270° mirrors. az 0° is symmetric within ~0.15 ms.
+    const int elMid = 9;
+    {
+        const float relL = db.relDelaySec[(size_t) db.delayIndex (18, elMid, 0)];   // az 90°
+        const float relR = db.relDelaySec[(size_t) db.delayIndex (18, elMid, 1)];
+        CHECK (relR == 0.0f);
+        CHECK (relL > 0.0004f && relL < 0.0010f);
+
+        const float relL2 = db.relDelaySec[(size_t) db.delayIndex (54, elMid, 0)];  // az 270°
+        const float relR2 = db.relDelaySec[(size_t) db.delayIndex (54, elMid, 1)];
+        CHECK (relL2 == 0.0f);
+        CHECK (relR2 > 0.0004f && relR2 < 0.0010f);
+
+        const float fl = db.relDelaySec[(size_t) db.delayIndex (0, elMid, 0)];      // az 0°
+        const float fr = db.relDelaySec[(size_t) db.delayIndex (0, elMid, 1)];
+        CHECK (std::fabs (fl - fr) < 0.00015f);
+    }
+
+    // HRIRs are aligned: every grid point's max |tap| lands in the first
+    // quarter of the IR (the onset strip worked).
+    {
+        int lateOnsets = 0;
+        for (int az = 0; az < HrirDatabase::kNumAz; az += 6)
+            for (int el = 0; el < HrirDatabase::kNumEl; el += 3)
+                for (int ear = 0; ear < 2; ++ear)
+                {
+                    const float* h = db.hrirs.data() + db.hrirIndex (az, el, ear);
+                    int peak = 0;
+                    for (int i = 1; i < db.hrirLength; ++i)
+                        if (std::fabs (h[i]) > std::fabs (h[peak]))
+                            peak = i;
+                    if (peak > db.hrirLength / 4)
+                        ++lateOnsets;
+                }
+        CHECK (lateOnsets == 0);
+    }
+
+    // FFT cook shape.
+    const auto cooked = cookHrirSet (load.database, block);
+    CHECK (cooked != nullptr);
+    CHECK (cooked->blockSize == block);
+    CHECK (cooked->fftSize == 2 * block);
+    CHECK (cooked->numPartitions == (db.hrirLength + block - 1) / block);
+
+    // End-to-end: impulse from hard right through the renderer — right ear
+    // leads by the measured ITD and carries more energy.
+    {
+        SofaHrtfRenderer r;
+        r.prepare (fs, block, 1);
+        r.publishSet (cooked);
+        r.processBlockBegin();
+        CHECK (r.hasActiveSet());
+
+        SourceDirection dir;
+        dir.azRad = pi / 2.0f;
+        dir.distance = 2.0f;
+
+        const int numBlocks = 3;
+        std::vector<float> L ((size_t) (numBlocks * block), 0.0f), R (L), input ((size_t) block, 0.0f);
+        std::int64_t pos = 0;
+        for (int b = 0; b < numBlocks; ++b)
+        {
+            std::fill (input.begin(), input.end(), 0.0f);
+            if (b == 0)
+                input[0] = 1.0f;
+            r.processSource (0, dir, 0.0f, 1.0f, input.data(),
+                             L.data() + pos, R.data() + pos, block, pos);
+            pos += block;
+        }
+
+        float energyL = 0.0f, energyR = 0.0f;
+        for (size_t i = 0; i < L.size(); ++i) { energyL += L[i] * L[i]; energyR += R[i] * R[i]; }
+        CHECK (energyR > 0.0f);
+        CHECK (energyR > energyL);                       // right ear louder
+
+        // Rendered ITD via interaural cross-correlation (same estimator the
+        // loader used), lag of L relative to R, positive = left later.
+        int bestLag = 0;
+        double bestVal = -1.0;
+        for (int lag = -100; lag <= 100; ++lag)
+        {
+            double acc = 0.0;
+            for (int i = 0; i < (int) L.size(); ++i)
+            {
+                const int j = i - lag;
+                if (j >= 0 && j < (int) R.size())
+                    acc += (double) L[(size_t) i] * (double) R[(size_t) j];
+            }
+            if (acc > bestVal) { bestVal = acc; bestLag = lag; }
+        }
+
+        const float relL = db.relDelaySec[(size_t) db.delayIndex (18, elMid, 0)];
+        CHECK (bestLag > 0);                             // right leads
+        CHECK (std::abs (bestLag - (int) std::lround (relL * fs)) <= 3);
+    }
+}
+#endif // SPATCORE_TEST_SOFA_FIXTURE
+
 int main()
 {
     try
@@ -1638,6 +1993,12 @@ int main()
         testTestSignalGeneratorProtectiveRamp();
         testTestSignalGeneratorDeterministicSeed();
         testTestSignalGeneratorSpeakerIdSequencing();
+        testBinauralHeadFrame();
+        testStructuralHrtfItdAndDc();
+        testStructuralHrtfRotationContinuity();
+#ifdef SPATCORE_TEST_SOFA_FIXTURE
+        testSofaLoaderAndRenderer();
+#endif
     }
     catch (const std::exception& e)
     {

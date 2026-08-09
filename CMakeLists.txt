@@ -208,6 +208,55 @@ endif()
 spatcore_apply_compile_flags(spatcore-audio)
 
 # ---------------------------------------------------------------------------
+# spatcore-mysofa (optional) — vendored libmysofa + zlib inflate subset for
+# the binaural SOFA (HRTF) loader. Consumer-provides contract like hidapi:
+# the consumer points SPATCORE_LIBMYSOFA_DIR / SPATCORE_ZLIB_DIR at its
+# vendored checkouts (WFS-DIY: ThirdParty/libmysofa, ThirdParty/zlib).
+# Plain C, no JUCE dependency.
+# ---------------------------------------------------------------------------
+if(SPATCORE_LIBMYSOFA_DIR AND SPATCORE_ZLIB_DIR)
+    add_library(spatcore-mysofa STATIC
+        "${SPATCORE_LIBMYSOFA_DIR}/src/hrtf/reader.c"
+        "${SPATCORE_LIBMYSOFA_DIR}/src/hrtf/check.c"
+        "${SPATCORE_LIBMYSOFA_DIR}/src/hrtf/spherical.c"
+        "${SPATCORE_LIBMYSOFA_DIR}/src/hrtf/lookup.c"
+        "${SPATCORE_LIBMYSOFA_DIR}/src/hrtf/tools.c"
+        "${SPATCORE_LIBMYSOFA_DIR}/src/hrtf/kdtree.c"
+        "${SPATCORE_LIBMYSOFA_DIR}/src/hrtf/neighbors.c"
+        "${SPATCORE_LIBMYSOFA_DIR}/src/hrtf/interpolate.c"
+        "${SPATCORE_LIBMYSOFA_DIR}/src/hrtf/resample.c"
+        "${SPATCORE_LIBMYSOFA_DIR}/src/hrtf/loudness.c"
+        "${SPATCORE_LIBMYSOFA_DIR}/src/hrtf/minphase.c"
+        "${SPATCORE_LIBMYSOFA_DIR}/src/hrtf/easy.c"
+        "${SPATCORE_LIBMYSOFA_DIR}/src/hrtf/cache.c"
+        "${SPATCORE_LIBMYSOFA_DIR}/src/hdf/superblock.c"
+        "${SPATCORE_LIBMYSOFA_DIR}/src/hdf/dataobject.c"
+        "${SPATCORE_LIBMYSOFA_DIR}/src/hdf/btree.c"
+        "${SPATCORE_LIBMYSOFA_DIR}/src/hdf/fractalhead.c"
+        "${SPATCORE_LIBMYSOFA_DIR}/src/hdf/gunzip.c"
+        "${SPATCORE_LIBMYSOFA_DIR}/src/hdf/gcol.c"
+        "${SPATCORE_LIBMYSOFA_DIR}/src/resampler/speex_resampler.c"
+        "${SPATCORE_ZLIB_DIR}/adler32.c"
+        "${SPATCORE_ZLIB_DIR}/crc32.c"
+        "${SPATCORE_ZLIB_DIR}/inflate.c"
+        "${SPATCORE_ZLIB_DIR}/inftrees.c"
+        "${SPATCORE_ZLIB_DIR}/inffast.c"
+        "${SPATCORE_ZLIB_DIR}/zutil.c"
+        "${SPATCORE_ZLIB_DIR}/uncompr.c"
+    )
+    target_include_directories(spatcore-mysofa PUBLIC
+        "${SPATCORE_LIBMYSOFA_DIR}/src/hrtf"
+        "${SPATCORE_ZLIB_DIR}")
+    set_target_properties(spatcore-mysofa PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    if(MSVC)
+        target_compile_definitions(spatcore-mysofa PRIVATE _CRT_SECURE_NO_WARNINGS)
+    endif()
+    if(UNIX)
+        target_link_libraries(spatcore-mysofa PUBLIC m)
+    endif()
+endif()
+
+# ---------------------------------------------------------------------------
 # spatcore-control
 # ---------------------------------------------------------------------------
 if(SPATCORE_CONTROL)

@@ -24,5 +24,15 @@ target_compile_definitions(spatcore-tests PRIVATE
     JUCE_WEB_BROWSER=0
     JUCE_USE_CURL=0)
 
+# SOFA loader coverage runs only when the consumer wired libmysofa and points
+# us at a fixture file (WFS-DIY: the bundled SADIE II KU100 set).
+if(TARGET spatcore-mysofa)
+    target_link_libraries(spatcore-tests PRIVATE spatcore-mysofa)
+    if(SPATCORE_TEST_SOFA_FIXTURE)
+        target_compile_definitions(spatcore-tests PRIVATE
+            SPATCORE_TEST_SOFA_FIXTURE="${SPATCORE_TEST_SOFA_FIXTURE}")
+    endif()
+endif()
+
 # Test TUs compile under the same transcribed app flags as the libs.
 spatcore_apply_compile_flags(spatcore-tests)

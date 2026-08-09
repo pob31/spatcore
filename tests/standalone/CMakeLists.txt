@@ -42,5 +42,11 @@ spatcore_add_juce_simpleweb("${REPO_ROOT}/ThirdParty/juce_simpleweb")
 juce_add_module("${REPO_ROOT}/ThirdParty/roli_blocks_basics")
 set(SPATCORE_HIDAPI_INCLUDE_DIR "${REPO_ROOT}/ThirdParty/hidapi")
 
+# Binaural SOFA loader: vendored libmysofa + zlib subset, and the SADIE II
+# KU100 fixture the SOFA tests load.
+set(SPATCORE_LIBMYSOFA_DIR "${REPO_ROOT}/ThirdParty/libmysofa")
+set(SPATCORE_ZLIB_DIR "${REPO_ROOT}/ThirdParty/zlib")
+set(SPATCORE_TEST_SOFA_FIXTURE "${REPO_ROOT}/assets/SOFA/D1_48K_24bit_256tap_FIR_SOFA.sofa")
+
 set(SPATCORE_STANDALONE_TESTS ON)
 add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../.." "${CMAKE_CURRENT_BINARY_DIR}/spatcore")
