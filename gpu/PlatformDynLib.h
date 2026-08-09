@@ -1,16 +1,19 @@
 #pragma once
-#if WFS_GPU_NATIVE && ! defined(__APPLE__)
 
 /*
-    PlatformDynLib — tiny cross-platform shim over the OS dynamic-loader, so the
-    GPU device enumeration (GpuDeviceManager) and the vendor-plugin factory
-    (GpuBackendFactory) share one code path on Linux and Windows.
+    PlatformDynLib — tiny cross-platform shim over the OS dynamic-loader, shared
+    by the GPU device enumeration (GpuDeviceManager), the vendor-plugin factory
+    (GpuBackendFactory) and the head-tracker plugin loader (app side).
 
-        Linux:   dlopen / dlsym / readlink("/proc/self/exe")   (libfoo.so)
-        Windows: LoadLibraryA / GetProcAddress / GetModuleFileNameA   (foo.dll)
+        Linux:   dlopen / dlsym / readlink("/proc/self/exe")        (libfoo.so)
+        macOS:   dlopen / dlsym / _NSGetExecutablePath              (libfoo.dylib)
+        Windows: LoadLibraryA / GetProcAddress / GetModuleFileNameA (foo.dll)
 
-    macOS does not use this (its GPU path is the in-process Metal backend), hence
-    the !__APPLE__ guard. No CUDA/HIP SDK headers are pulled in here.
+    The GPU consumers never call this on macOS (its GPU path is the in-process
+    Metal backend), but the header must compile there for the head tracker —
+    it used to be guarded `WFS_GPU_NATIVE && !__APPLE__`, which broke the first
+    non-GPU consumer. Dependency-free (no CUDA/HIP SDK headers), so it is now
+    unconditional.
 */
 
 #include <string>
@@ -23,6 +26,11 @@
   #define NOMINMAX
  #endif
  #include <windows.h>
+#elif defined(__APPLE__)
+ #include <dlfcn.h>
+ #include <climits>
+ #include <mach-o/dyld.h>
+ #include <cstdlib>
 #else
  #include <dlfcn.h>
  #include <climits>
@@ -90,6 +98,29 @@ namespace wfsdyn
     inline const char* libPrefix() noexcept { return ""; }      // foo.dll
     inline const char* libExt()    noexcept { return ".dll"; }
 
+#elif defined(__APPLE__)
+
+    using LibHandle = void*;
+
+    inline LibHandle openLib (const char* name) noexcept { return ::dlopen (name, RTLD_NOW | RTLD_LOCAL); }
+    inline void*     sym (LibHandle h, const char* s) noexcept { return ::dlsym (h, s); }
+
+    inline std::string exeDir()
+    {
+        // _NSGetExecutablePath may return a symlinked/relative path; resolve it.
+        char buf[PATH_MAX];
+        uint32_t size = sizeof (buf);
+        if (::_NSGetExecutablePath (buf, &size) != 0) return {};
+        char resolved[PATH_MAX];
+        const char* path = ::realpath (buf, resolved) != nullptr ? resolved : buf;
+        std::string p (path);
+        const auto slash = p.find_last_of ('/');
+        return slash == std::string::npos ? std::string {} : p.substr (0, slash);
+    }
+
+    inline const char* libPrefix() noexcept { return "lib"; }   // libfoo.dylib
+    inline const char* libExt()    noexcept { return ".dylib"; }
+
 #else  // POSIX (Linux)
 
     using LibHandle = void*;
@@ -121,5 +152,3 @@ namespace wfsdyn
 }
 
 } // namespace spatcore::gpu
-
-#endif // WFS_GPU_NATIVE && !__APPLE__
