@@ -47,9 +47,11 @@ jobs:
           # Audio-only example, but JUCE's juceaide build tool links
           # juce_gui_basics, which needs the X11 dev headers (Xrandr / Xinerama
           # / Xcursor). The app CIs get these transitively via libgtk-3-dev.
+          # libxi-dev: XInput2 headers, required since JUCE 9 (native multitouch).
           sudo apt-get install -y build-essential cmake pkg-config libasound2-dev \
               libfreetype6-dev libfontconfig1-dev libgl1-mesa-dev libcurl4-openssl-dev \
-              libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxext-dev
+              libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxext-dev \
+              libxi-dev
 
       # The five gpu/Metal*Backend.mm are compiled in TWO ObjC memory modes and
       # must build in both:
