@@ -40,7 +40,7 @@ include(FetchContent)
 # use. Override with -DFETCHCONTENT_SOURCE_DIR_JUCE to reuse a local checkout.
 FetchContent_Declare(JUCE
     GIT_REPOSITORY https://github.com/juce-framework/JUCE.git
-    GIT_TAG        2cdfca8feb300fb424002ba2c2751569e5bacb64   # JUCE 8.0.14
+    GIT_TAG        e18f7f506c0b96f2c738a0bcd7fe6467a5005ad8   # JUCE 9.0.1
     GIT_SHALLOW    TRUE)
 FetchContent_MakeAvailable(JUCE)
 
