@@ -63,6 +63,8 @@
 #include "spatcore/io/DeviceHost.h"
 #include "spatcore/io/TestSignalGenerator.h"
 #include "spatcore/binaural/HeadFrame.h"
+#include "spatcore/binaural/BinauralEngine.h"
+#include "spatcore/binaural/HeadOrientationSource.h"
 #include "spatcore/binaural/StructuralHrtfRenderer.h"
 #include "spatcore/dsp/OneEuroFilter.h"
 #ifdef SPATCORE_TEST_SOFA_FIXTURE
@@ -1692,6 +1694,148 @@ static void testBinauralHeadFrame()
 }
 
 //==============================================================================
+// Non-finite head attitude must never reach the audio. Regression for the
+// class of bug XOA hit first (its 1560330): the tracker ABI hands over RAW
+// angles, a degenerate face box makes the estimator emit NaN, and NaN in a
+// rotation matrix becomes NaN in the delay lines / filter state / convolution
+// history — where it stays long after the frame that caused it.
+static void testNonFiniteAttitudeIsRefused()
+{
+    using namespace spatcore::binaural;
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float inf = std::numeric_limits<float>::infinity();
+
+    // isFiniteAttitude is the shared predicate both guards are built on.
+    {
+        HeadOrientation o;
+        o.yawRad = 0.1f; o.pitchRad = -0.2f; o.rollRad = 0.05f; o.valid = true;
+        CHECK (isFiniteAttitude (o));
+        o.pitchRad = nan;  CHECK (! isFiniteAttitude (o));
+        o.pitchRad = -0.2f; o.rollRad = inf;
+        CHECK (! isFiniteAttitude (o));
+    }
+
+    // The publish choke point every source goes through refuses to put a
+    // non-finite attitude on the render thread, reporting "nothing
+    // trustworthy" so the consumer's existing fallback takes over.
+    {
+        struct TestSource : SnapshotHeadOrientationSource
+        {
+            juce::String getSourceId() const override    { return "test"; }
+            juce::String getDisplayName() const override { return "Test"; }
+            bool isConnected() const override            { return true; }
+            using SnapshotHeadOrientationSource::publishOrientation;
+        };
+
+        TestSource src;
+        HeadOrientation good;
+        good.yawRad = 0.3f; good.valid = true;
+        src.publishOrientation (good);
+        CHECK (src.getOrientation().valid);
+        CHECK (std::fabs (src.getOrientation().yawRad - 0.3f) < 1e-6f);
+
+        HeadOrientation bad;
+        bad.yawRad = nan; bad.pitchRad = 0.0f; bad.rollRad = 0.0f; bad.valid = true;
+        src.publishOrientation (bad);
+        CHECK (! src.getOrientation().valid);
+        CHECK (isFiniteAttitude (src.getOrientation()));   // and not merely flagged
+    }
+
+    // isFinitePose catches the same poison one hop later, as a matrix.
+    {
+        ListenerPose p;                       // default = identity, origin
+        CHECK (isFinitePose (p));
+        p.R[4] = nan;  CHECK (! isFinitePose (p));
+        p.R[4] = 1.0f; p.z = inf;
+        CHECK (! isFinitePose (p));
+    }
+}
+
+// ...and if one slips through anyway, the render core must not emit NaN.
+static void testEngineSurvivesNonFinitePose()
+{
+    using namespace spatcore::binaural;
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const double fs = 48000.0;
+    const int block = 256;
+    const int numBlocks = 6;
+
+    auto allFinite = [] (const std::vector<float>& v)
+    {
+        for (float s : v)
+            if (! std::isfinite (s))
+                return false;
+        return true;
+    };
+
+    BinauralEngine engine;
+    engine.prepare (fs, block, 2);
+    engine.setMode (RenderMode::Structural);
+
+    float positions[2][3] = { { 1.0f, 3.0f, 1.6f }, { -2.0f, 4.0f, 1.6f } };
+    std::vector<float> tone ((size_t) block, 0.0f);
+    for (int i = 0; i < block; ++i)
+        tone[(size_t) i] = 0.25f * std::sin (2.0f * 3.14159265f * 440.0f * (float) i / (float) fs);
+    const float* inputs[2] = { tone.data(), tone.data() };
+
+    std::vector<float> L ((size_t) block), R ((size_t) block);
+
+    // A pose whose rotation is entirely NaN — what a NaN attitude produces.
+    ListenerPose poisoned;
+    for (int i = 0; i < 9; ++i)
+        poisoned.R[i] = nan;
+    poisoned.y = -5.0f;
+
+    for (int b = 0; b < numBlocks; ++b)
+    {
+        std::fill (L.begin(), L.end(), 0.0f);
+        std::fill (R.begin(), R.end(), 0.0f);
+        engine.processBlock (poisoned, positions, inputs, nullptr, 0.0f,
+                             L.data(), R.data(), 2, block);
+        CHECK (allFinite (L));
+        CHECK (allFinite (R));
+    }
+
+    // A single bad source position must not take the other source with it.
+    {
+        ListenerPose pose;
+        pose.y = -5.0f;
+        float mixed[2][3] = { { nan, nan, nan }, { -2.0f, 4.0f, 1.6f } };
+        for (int b = 0; b < numBlocks; ++b)
+        {
+            std::fill (L.begin(), L.end(), 0.0f);
+            std::fill (R.begin(), R.end(), 0.0f);
+            engine.processBlock (pose, mixed, inputs, nullptr, 0.0f,
+                                 L.data(), R.data(), 2, block);
+            CHECK (allFinite (L));
+            CHECK (allFinite (R));
+        }
+        float peak = 0.0f;
+        for (float s : L) peak = std::max (peak, std::fabs (s));
+        CHECK (peak > 0.0f);        // the healthy source still renders
+    }
+
+    // Recovery: once the pose is good again the output must be audible, i.e.
+    // no filter/delay state was permanently poisoned by the bad blocks.
+    {
+        ListenerPose pose;
+        pose.y = -5.0f;
+        float peak = 0.0f;
+        for (int b = 0; b < numBlocks; ++b)
+        {
+            std::fill (L.begin(), L.end(), 0.0f);
+            std::fill (R.begin(), R.end(), 0.0f);
+            engine.processBlock (pose, positions, inputs, nullptr, 0.0f,
+                                 L.data(), R.data(), 2, block);
+            CHECK (allFinite (L));
+            CHECK (allFinite (R));
+            for (float s : L) peak = std::max (peak, std::fabs (s));
+        }
+        CHECK (peak > 0.0f);
+    }
+}
+
+//==============================================================================
 // binaural/StructuralHrtfRenderer — ITD sign/magnitude per direction, and
 // DC transparency of the filter chain (shadow is unity at DC by construction).
 static void testStructuralHrtfItdAndDc()
@@ -2148,6 +2292,8 @@ int main()
         testHeadFrameMatrixToYawPitchRoll();
         testHeadTrackerZeroComposition();
         testOneEuroFilter();
+        testNonFiniteAttitudeIsRefused();
+        testEngineSurvivesNonFinitePose();
         testStructuralHrtfItdAndDc();
         testStructuralHrtfRotationContinuity();
 #ifdef SPATCORE_TEST_SOFA_FIXTURE

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cmath>
 #include <cstdint>
 
 namespace spatcore::binaural
@@ -61,6 +62,26 @@ struct HeadOrientation
 };
 
 /**
+    Is this attitude usable as a rotation?
+
+    Head attitude arrives from untrusted producers — the tracker plugin ABI
+    hands over RAW angles, and the manual parameters come from a project file
+    — so it can be NaN or infinite (a degenerate face box divides by a
+    vanishing eye distance). Non-finite angles build a non-orthonormal
+    rotation matrix, and from there NaN spreads into delay lines, IIR state
+    and convolution history, where it stays: the damage outlives the bad
+    frame that caused it.
+
+    Note the positive-logic form. `a < limit` style tests are useless against
+    NaN (every comparison with NaN is false), which is exactly how this class
+    of bug slips through.
+*/
+inline bool isFiniteAttitude (const HeadOrientation& o) noexcept
+{
+    return std::isfinite (o.yawRad) && std::isfinite (o.pitchRad) && std::isfinite (o.rollRad);
+}
+
+/**
     Listener pose in the world frame, built per block by the render worker:
     damped position from the slow (50 Hz) parameter path, rotation from the
     fast orientation path.
@@ -74,6 +95,19 @@ struct ListenerPose
                    0.0f, 1.0f, 0.0f,
                    0.0f, 0.0f, 1.0f };
 };
+
+/** Is this pose usable? Same reasoning as isFiniteAttitude, one hop later:
+    by here the angles have become a rotation matrix, and a single non-finite
+    entry makes every direction derived from it non-finite. */
+inline bool isFinitePose (const ListenerPose& p) noexcept
+{
+    if (! (std::isfinite (p.x) && std::isfinite (p.y) && std::isfinite (p.z)))
+        return false;
+    for (int i = 0; i < 9; ++i)
+        if (! std::isfinite (p.R[i]))
+            return false;
+    return true;
+}
 
 /** A source direction expressed in the head frame (vertical-polar). */
 struct SourceDirection

@@ -21,6 +21,9 @@ namespace spatcore::binaural
       - valid == false in the returned HeadOrientation means the source has
         nothing trustworthy (device unplugged, no data yet) — the consumer
         falls back to the manual orientation parameters, slewed.
+      - Angles are always FINITE. A source that computes a NaN/infinite
+        attitude reports valid == false instead; publishOrientation() below
+        enforces this for every source that uses it.
       - getSourceId() is a stable identifier for persistence ("manual" is
         reserved; hardware sources use e.g. "usb:<serial>"). Display names
         are free-form.
@@ -61,9 +64,24 @@ public:
     }
 
 protected:
-    /** Call from the ONE producing thread only. */
+    /** Call from the ONE producing thread only.
+
+        Non-finite attitudes are refused here — the single choke point every
+        source publishes through, so no driver can put NaN on the render
+        thread by forgetting to check (see isFiniteAttitude). The refusal is
+        published as "nothing trustworthy" rather than dropped, so the
+        consumer's existing invalid-source fallback handles it.
+
+        This is a backstop, not a licence to skip validating upstream: by the
+        time a bad value reaches here, a source's own smoothing/calibration
+        state may already be poisoned, which only that source can repair. */
     void publishOrientation (const HeadOrientation& o) noexcept
     {
+        if (o.valid && ! isFiniteAttitude (o))
+        {
+            snapshot.publish ({});
+            return;
+        }
         snapshot.publish (o);
     }
 

@@ -6,6 +6,7 @@
 #include "SofaHrtfRenderer.h"
 #include <juce_audio_basics/juce_audio_basics.h>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 
 namespace spatcore::binaural
@@ -112,6 +113,19 @@ public:
         const float radius = headRadius.load (std::memory_order_acquire);
         numSources = juce::jmin (numSources, maxSources);
 
+        // A library does not get to assume its caller validated. A non-finite
+        // pose (tracker glitch, corrupt project file) would put NaN into the
+        // ITD delay lines — where the read index is derived from the delay,
+        // so a float→int conversion of NaN is undefined — and into filter and
+        // convolution state, which never recovers on its own. Substituting the
+        // identity pose keeps the block rendering instead of clicking to
+        // silence; hosts layer their own, better-informed fallback on top.
+        const ListenerPose* posePtr = &pose;
+        ListenerPose fallback;
+        if (! isFinitePose (pose))
+            posePtr = &fallback;
+        const ListenerPose& safePose = *posePtr;
+
         // Sofa mode renders measured HRIRs once a cooked set has been adopted;
         // it falls back to the structural model while none is loaded, so the
         // mode never produces dead air.
@@ -127,7 +141,13 @@ public:
             if (inputs[i] == nullptr)
                 continue;
 
-            const auto dir = headframe::directionInHeadFrame (pose,
+            // Same for a single bad source position: mute that source rather
+            // than let it poison the shared output and its own filter state.
+            if (! (std::isfinite (srcPositions[i][0]) && std::isfinite (srcPositions[i][1])
+                   && std::isfinite (srcPositions[i][2])))
+                continue;
+
+            const auto dir = headframe::directionInHeadFrame (safePose,
                                                               srcPositions[i][0],
                                                               srcPositions[i][1],
                                                               srcPositions[i][2]);
