@@ -46,11 +46,29 @@ public:
 
     /** Calibrate "this attitude is zero" — the user faces the stage and asks
         for the current pose to become the facing-origin reference. Sources
-        store the inverse of the current attitude and pre-multiply every
-        subsequent report (matrix composition, NOT per-angle subtraction:
-        rotations don't commute). Called from the message thread; sources that
-        need no calibration ignore it. */
+        store the inverse of the current attitude and compose it with every
+        subsequent report (rotation composition, NOT per-angle subtraction:
+        rotations don't commute). Which SIDE it composes on is the source's
+        own business — a camera cancels a world-side offset, a head-mounted
+        sensor cancels a body-side one. Called from the message thread; sources
+        that need no calibration ignore it. */
     virtual void setZero() {}
+
+    /** Message thread. Called when this source becomes, or stops being, the
+        selected one.
+
+        Sources owning an EXCLUSIVE device open it in activate() and release it
+        in deactivate(), so an unselected tracker never holds a webcam the user
+        wants elsewhere. Returning false refuses activation (the source logs
+        the reason) and the caller falls back to manual orientation.
+
+        Sources fed by a SHARED device that must already be running BEFORE any
+        selection — a USB dongle whose stream is what populates the tracker
+        list in the first place — leave both as no-ops; that device's lifetime
+        is owned elsewhere and is not tied to selection. Both must be
+        idempotent. */
+    virtual bool activate() { return true; }
+    virtual void deactivate() {}
 };
 
 /** Publish/acquire base most sources will want: poll thread publishes,

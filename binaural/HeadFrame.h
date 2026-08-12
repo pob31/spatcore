@@ -104,6 +104,78 @@ inline void transpose (const float R[9], float out[9]) noexcept
         out[i] = t[i];
 }
 
+/** Head attitude from a hardware tracker's body->world quaternion.
+
+    Source convention (headtracker PROTOCOL.md 1.3): Hamilton quaternion in
+    w,x,y,z order, unit norm, rotating body -> world, in a body frame with
+    X forward (nose), Y left, Z up.
+
+    Target convention (BinauralTypes.h): x = out of the right ear, y = facing,
+    z = up, with R_offset = Rz(-yaw)*Rx(pitch)*Ry(roll).
+
+    The two frames are the same physical triad with relabelled axes, so they
+    differ by one fixed change of basis. Writing the head basis in body
+    coordinates -- right ear = (0,-1,0), facing = (1,0,0), up = (0,0,1) -- gives
+    the columns of C, where v_body = C * v_head:
+
+            [  0  1  0 ]
+        C = [ -1  0  0 ]  = Rz(-90 deg)
+            [  0  0  1 ]
+
+    and therefore R_offset = C^T * R(q) * C. Carried out on a row-major R(q)
+    with entries r0..r8 that whole product is a signed index shuffle:
+
+                    [  r4  -r3  -r5 ]
+        R_offset =  [ -r1   r0   r2 ]
+                    [ -r7   r6   r8 ]
+
+    Equivalently -- and this is what testTrackerQuatToHeadAngles pins -- the
+    result is the source's intrinsic Z-Y-X Euler angles with yaw and pitch
+    negated and roll kept: the source's +yaw is a turn to the LEFT and its
+    +pitch is nose DOWN, while both conventions agree that +roll is right ear
+    down. The matrix route is used here rather than those three sign flips
+    because it is mechanically checkable against the derivation above and
+    avoids a second trigonometric round trip.
+
+    Non-finite or degenerate input yields (0,0,0) rather than NaN: a tracker
+    frame can pass its CRC and still carry a NaN or infinity, and every
+    consumer latches filter and calibration state from this output.
+*/
+inline void trackerQuatToYawPitchRoll (float qw, float qx, float qy, float qz,
+                                       float& yaw, float& pitch, float& roll) noexcept
+{
+    const float n2 = qw * qw + qx * qx + qy * qy + qz * qz;
+
+    // Both halves matter: positive logic because `n2 < eps` is false for NaN,
+    // and isfinite because an infinite component makes n2 infinite, which
+    // passes a lower-bound test and then gives inf * (1/sqrt(inf)) = NaN.
+    if (! (std::isfinite (n2) && n2 > 1.0e-12f))
+    {
+        yaw = pitch = roll = 0.0f;
+        return;
+    }
+
+    const float inv = 1.0f / std::sqrt (n2);
+    const float w = qw * inv, x = qx * inv, y = qy * inv, z = qz * inv;
+
+    // Hamilton body->world rotation matrix, row-major r0..r8.
+    const float r0 = 1.0f - 2.0f * (y * y + z * z);
+    const float r1 = 2.0f * (x * y - w * z);
+    const float r2 = 2.0f * (x * z + w * y);
+    const float r3 = 2.0f * (x * y + w * z);
+    const float r4 = 1.0f - 2.0f * (x * x + z * z);
+    const float r5 = 2.0f * (y * z - w * x);
+    const float r6 = 2.0f * (x * z - w * y);
+    const float r7 = 2.0f * (y * z + w * x);
+    const float r8 = 1.0f - 2.0f * (x * x + y * y);
+
+    const float offset[9] = {  r4, -r3, -r5,
+                              -r1,  r0,  r2,
+                              -r7,  r6,  r8 };
+
+    matrixToYawPitchRoll (offset, yaw, pitch, roll);
+}
+
 /** Baseline rotation for a listener placed at world angle alphaRad, facing the origin. */
 inline void baselineMatrix (float alphaRad, float R[9]) noexcept
 {

@@ -63,6 +63,7 @@
 #include "spatcore/io/DeviceHost.h"
 #include "spatcore/io/TestSignalGenerator.h"
 #include "spatcore/binaural/HeadFrame.h"
+#include "spatcore/binaural/HeadAttitudePipeline.h"
 #include "spatcore/binaural/BinauralEngine.h"
 #include "spatcore/binaural/HeadOrientationSource.h"
 #include "spatcore/binaural/StructuralHrtfRenderer.h"
@@ -2039,6 +2040,245 @@ static void testHeadFrameMatrixToYawPitchRoll()
 }
 
 //==============================================================================
+// binaural/HeadFrame — trackerQuatToYawPitchRoll converts a hardware tracker's
+// body->world quaternion (X forward / Y left / Z up, per the headtracker
+// PROTOCOL.md) into the head-frame angles the binaural renderer consumes.
+//
+// The three directional cases below ARE the sign contract: get one of them
+// backwards and the binaural image rotates the wrong way, which is trivially
+// audible but not something any other test would catch.
+static void testTrackerQuatToHeadAngles()
+{
+    namespace hf = spatcore::binaural::headframe;
+    constexpr float pi = 3.14159265358979f;
+    const float tol = 1e-3f;
+
+    // Quaternion for a rotation of `angle` about a body axis, Hamilton w,x,y,z.
+    auto axisAngle = [] (float ax, float ay, float az, float angle,
+                         float& w, float& x, float& y, float& z)
+    {
+        const float s = std::sin (angle * 0.5f);
+        w = std::cos (angle * 0.5f);
+        x = ax * s; y = ay * s; z = az * s;
+    };
+
+    float w, x, y, z, yaw, pitch, roll;
+
+    // Identity → level and facing front.
+    hf::trackerQuatToYawPitchRoll (1.0f, 0.0f, 0.0f, 0.0f, yaw, pitch, roll);
+    CHECK (std::fabs (yaw) < tol && std::fabs (pitch) < tol && std::fabs (roll) < tol);
+
+    for (const float a : { 15.0f, 45.0f, 90.0f, -30.0f })
+    {
+        const float rad = a * pi / 180.0f;
+
+        // Turn RIGHT: in a forward/left/up body frame that is a NEGATIVE
+        // rotation about Z (the nose swings from +X toward -Y).
+        axisAngle (0.0f, 0.0f, 1.0f, -rad, w, x, y, z);
+        hf::trackerQuatToYawPitchRoll (w, x, y, z, yaw, pitch, roll);
+        CHECK (std::fabs (yaw - rad) < tol);        // +yaw = turn right
+        CHECK (std::fabs (pitch) < tol);
+        CHECK (std::fabs (roll) < tol);
+
+        // Look UP: negative rotation about body Y (Ry(+t) tips the nose down).
+        axisAngle (0.0f, 1.0f, 0.0f, -rad, w, x, y, z);
+        hf::trackerQuatToYawPitchRoll (w, x, y, z, yaw, pitch, roll);
+        CHECK (std::fabs (pitch - rad) < tol);      // +pitch = look up
+        CHECK (std::fabs (yaw) < tol);
+        CHECK (std::fabs (roll) < tol);
+
+        // RIGHT EAR DOWN: positive rotation about body X lifts the left ear.
+        axisAngle (1.0f, 0.0f, 0.0f, rad, w, x, y, z);
+        hf::trackerQuatToYawPitchRoll (w, x, y, z, yaw, pitch, roll);
+        CHECK (std::fabs (roll - rad) < tol);       // +roll = right ear down
+        CHECK (std::fabs (yaw) < tol);
+        CHECK (std::fabs (pitch) < tol);
+    }
+
+    // Round-trip through the rotation, not through the angle triple: distinct
+    // triples can name the same rotation. This also pins the change of basis
+    // as a whole rather than three independent signs.
+    {
+        // A tumbling sequence of arbitrary unit quaternions (deterministic).
+        uint32_t s = 0x9E3779B9u;
+        auto nextf = [&s] { s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+                            return (float) (s & 0xFFFFFFu) / 8388608.0f - 1.0f; };
+
+        for (int i = 0; i < 400; ++i)
+        {
+            float q[4] = { nextf(), nextf(), nextf(), nextf() };
+            const float n = std::sqrt (q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]);
+            if (n < 0.1f)
+                continue;
+            for (auto& c : q) c /= n;
+
+            hf::trackerQuatToYawPitchRoll (q[0], q[1], q[2], q[3], yaw, pitch, roll);
+            CHECK (std::isfinite (yaw) && std::isfinite (pitch) && std::isfinite (roll));
+
+            // Rebuild R_offset from the angles and from the quaternion via the
+            // documented permutation; the two must agree.
+            float fromAngles[9];
+            hf::yawPitchRollToMatrix (yaw, pitch, roll, fromAngles);
+
+            const float w2 = q[0], x2 = q[1], y2 = q[2], z2 = q[3];
+            const float r0 = 1.0f - 2.0f * (y2*y2 + z2*z2);
+            const float r1 = 2.0f * (x2*y2 - w2*z2);
+            const float r2 = 2.0f * (x2*z2 + w2*y2);
+            const float r3 = 2.0f * (x2*y2 + w2*z2);
+            const float r4 = 1.0f - 2.0f * (x2*x2 + z2*z2);
+            const float r5 = 2.0f * (y2*z2 - w2*x2);
+            const float r6 = 2.0f * (x2*z2 - w2*y2);
+            const float r7 = 2.0f * (y2*z2 + w2*x2);
+            const float r8 = 1.0f - 2.0f * (x2*x2 + y2*y2);
+            const float expected[9] = { r4, -r3, -r5, -r1, r0, r2, -r7, r6, r8 };
+
+            for (int k = 0; k < 9; ++k)
+                CHECK (std::fabs (fromAngles[k] - expected[k]) < 2e-3f);
+        }
+    }
+
+    // Degenerate and poisoned wire values must not reach the renderer as NaN:
+    // a tracker frame can pass its CRC and still carry a NaN or an infinity.
+    {
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+        const float inf = std::numeric_limits<float>::infinity();
+        const float bad[][4] = { { 0, 0, 0, 0 }, { nan, 0, 0, 0 }, { 1, nan, 0, 0 },
+                                 { inf, 0, 0, 0 }, { 1, 0, inf, 0 },
+                                 { nan, nan, nan, nan } };
+        for (const auto& q : bad)
+        {
+            hf::trackerQuatToYawPitchRoll (q[0], q[1], q[2], q[3], yaw, pitch, roll);
+            CHECK (std::isfinite (yaw) && std::isfinite (pitch) && std::isfinite (roll));
+        }
+    }
+
+    // Gimbal pose (nose straight up) stays finite; roll folds into yaw exactly
+    // as matrixToYawPitchRoll documents.
+    {
+        axisAngle (0.0f, 1.0f, 0.0f, -pi / 2.0f, w, x, y, z);
+        hf::trackerQuatToYawPitchRoll (w, x, y, z, yaw, pitch, roll);
+        CHECK (std::isfinite (yaw) && std::isfinite (pitch) && std::isfinite (roll));
+        CHECK (std::fabs (pitch - pi / 2.0f) < 1e-3f);
+        CHECK (roll == 0.0f);
+    }
+}
+
+//==============================================================================
+// binaural/HeadAttitudePipeline — the publish-side half every head-orientation
+// source shares: yaw unwrap, 1-Euro smoothing, and the guards that stop a
+// single poisoned sample from latching forever.
+static void testHeadAttitudePipeline()
+{
+    using spatcore::binaural::HeadAttitudePipeline;
+    using spatcore::binaural::HeadAttitudeTuning;
+    constexpr float pi = 3.14159265358979f;
+
+    // Bypass tuning: unwrap and guards only, so the arithmetic is checkable.
+    const HeadAttitudeTuning bypass { 0.0f, 0.0f, 1.0f };
+
+    // Crossing the +/-pi seam must not be seen as a full-circle jump. Walk yaw
+    // past pi in small steps; every output step must stay small.
+    {
+        HeadAttitudePipeline p (bypass);
+        float prev = 0.0f;
+        double t = 0.0;
+        for (int i = 0; i <= 40; ++i)
+        {
+            const float trueYaw = spatcore::binaural::wrapPi (3.0f + (float) i * 0.05f);
+            const auto o = p.process (trueYaw, 0.0f, 0.0f, t);
+            t += 0.02;
+            CHECK (o.valid);
+            if (i > 0)
+            {
+                const float step = std::fabs (spatcore::binaural::wrapPi (o.yawRad - prev));
+                CHECK (step < 0.2f);        // ~0.05 rad expected, never ~2*pi
+            }
+            prev = o.yawRad;
+        }
+    }
+
+    // Output yaw is always wrapped, however far the unwrapped value has run.
+    {
+        HeadAttitudePipeline p (bypass);
+        double t = 0.0;
+        for (int i = 0; i < 500; ++i)
+        {
+            const auto o = p.process (spatcore::binaural::wrapPi ((float) i * 0.3f),
+                                      0.2f, -0.1f, t);
+            t += 0.01;
+            CHECK (o.yawRad > -pi - 1e-4f && o.yawRad <= pi + 1e-4f);
+        }
+    }
+
+    // Non-finite input is refused WITHOUT poisoning state: the very next good
+    // sample must track normally. This is the property that keeps a single bad
+    // frame from killing tracking for the rest of the session.
+    {
+        HeadAttitudePipeline p (bypass);
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+        const float inf = std::numeric_limits<float>::infinity();
+
+        CHECK (p.process (0.4f, 0.1f, 0.0f, 0.0).valid);
+        CHECK (! p.process (nan, 0.1f, 0.0f, 0.01).valid);
+        CHECK (! p.process (0.4f, inf, 0.0f, 0.02).valid);
+
+        const auto good = p.process (0.5f, 0.1f, 0.0f, 0.03);
+        CHECK (good.valid);
+        CHECK (std::fabs (good.yawRad - 0.5f) < 1e-4f);
+        CHECK (std::fabs (good.pitchRad - 0.1f) < 1e-4f);
+    }
+
+    // Filtering enabled: a constant input settles ON that input (no bias), and
+    // the first sample is passed through so tracking starts instantly.
+    {
+        HeadAttitudePipeline p (HeadAttitudeTuning { 1.5f, 3.0f, 1.0f });
+        const auto first = p.process (0.7f, -0.2f, 0.05f, 0.0);
+        CHECK (first.valid);
+        CHECK (std::fabs (first.yawRad - 0.7f) < 1e-4f);
+
+        double t = 0.0;
+        spatcore::binaural::HeadOrientation o {};
+        for (int i = 0; i < 400; ++i)
+        {
+            t += 1.0 / 60.0;
+            o = p.process (0.7f, -0.2f, 0.05f, t);
+        }
+        CHECK (std::fabs (o.yawRad - 0.7f) < 1e-3f);
+        CHECK (std::fabs (o.pitchRad + 0.2f) < 1e-3f);
+        CHECK (std::fabs (o.rollRad - 0.05f) < 1e-3f);
+    }
+
+    // reset() drops the unwrap anchor and the filter history: after it, the
+    // next sample is again passed through untouched (the behaviour a zero
+    // calibration relies on so it doesn't slew from the pre-tare pose).
+    {
+        HeadAttitudePipeline p (HeadAttitudeTuning { 1.5f, 3.0f, 1.0f });
+        double t = 0.0;
+        for (int i = 0; i < 50; ++i)
+            p.process (0.0f, 0.0f, 0.0f, t += 1.0 / 60.0);
+
+        p.reset();
+        const auto o = p.process (1.1f, 0.3f, -0.2f, t + 1.0 / 60.0);
+        CHECK (std::fabs (o.yawRad - 1.1f) < 1e-4f);
+        CHECK (std::fabs (o.pitchRad - 0.3f) < 1e-4f);
+        CHECK (std::fabs (o.rollRad + 0.2f) < 1e-4f);
+    }
+
+    // A pathological timestamp sequence must not produce non-finite output.
+    {
+        HeadAttitudePipeline p (HeadAttitudeTuning { 1.5f, 3.0f, 1.0f });
+        const double times[] = { 0.0, 1e9, -1e9, 0.0, 1e-9 };
+        for (const double t : times)
+        {
+            const auto o = p.process (0.3f, 0.1f, 0.0f, t);
+            CHECK (std::isfinite (o.yawRad));
+            CHECK (std::isfinite (o.pitchRad));
+            CHECK (std::isfinite (o.rollRad));
+        }
+    }
+}
+
+//==============================================================================
 // The zero-calibration property head trackers rely on: capturing R_zero and
 // pre-multiplying by its inverse maps that attitude to identity, and any
 // later attitude to its offset FROM the calibration pose.
@@ -2290,6 +2530,8 @@ int main()
         testTestSignalGeneratorSpeakerIdSequencing();
         testBinauralHeadFrame();
         testHeadFrameMatrixToYawPitchRoll();
+        testTrackerQuatToHeadAngles();
+        testHeadAttitudePipeline();
         testHeadTrackerZeroComposition();
         testOneEuroFilter();
         testNonFiniteAttitudeIsRefused();
