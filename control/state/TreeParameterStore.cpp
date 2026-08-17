@@ -105,7 +105,10 @@ juce::UndoManager* TreeParameterStore::getActiveUndoManager()
     // have a dedicated undo channel (the core MCP undo engine + the app's
     // AI-undo surface). Without this, all AI writes pile into one open JUCE
     // transaction and a single Ctrl+Z reverts every AI change at once.
-    if (osc::getCurrentOriginTag() == osc::OriginTag::MCP)
+    // Externally triggered recalls (MIDI note, OSC) suppress undo the same way,
+    // via ScopedUndoSuppression — a cue-driven show would otherwise push one
+    // undo entry per cue and bury the operator's own edits.
+    if (undoSuppressionCount > 0 || osc::getCurrentOriginTag() == osc::OriginTag::MCP)
         return nullptr;
 
     return getUndoManagerForDomain (activeDomain);
@@ -113,12 +116,21 @@ juce::UndoManager* TreeParameterStore::getActiveUndoManager()
 
 bool TreeParameterStore::undo()
 {
-    return getActiveUndoManager()->undo();
+    // Null only while undo is suppressed. That never overlaps a user-initiated
+    // undo (suppression is scoped tightly around a single write batch), but
+    // guard rather than crash if a future caller widens the scope.
+    if (auto* mgr = getActiveUndoManager())
+        return mgr->undo();
+
+    return false;
 }
 
 bool TreeParameterStore::redo()
 {
-    return getActiveUndoManager()->redo();
+    if (auto* mgr = getActiveUndoManager())
+        return mgr->redo();
+
+    return false;
 }
 
 bool TreeParameterStore::canUndo() const
@@ -144,7 +156,8 @@ void TreeParameterStore::beginUndoTransaction (const juce::String& transactionNa
 
 void TreeParameterStore::clearUndoHistory()
 {
-    getActiveUndoManager()->clearUndoHistory();
+    if (auto* mgr = getActiveUndoManager())
+        mgr->clearUndoHistory();
 }
 
 void TreeParameterStore::clearAllUndoHistories()

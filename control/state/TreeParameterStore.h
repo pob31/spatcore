@@ -172,6 +172,25 @@ public:
         int previous;
     };
 
+    /** RAII helper: writes made while this is alive bypass the JUCE UndoManager
+     *  entirely, exactly as MCP-origin writes do.
+     *
+     *  Used for externally triggered snapshot recalls (a MIDI note, an OSC
+     *  message) so a cue-driven show does not bury the operator's own edits
+     *  under one undo entry per cue. An origin tag cannot express this: a
+     *  snapshot load opens its own OriginTagScope internally, which replaces
+     *  whatever the caller set, so the distinction has to be an explicit flag.
+     *
+     *  Counted, so nesting is safe. Keep the scope TIGHT (around the load call
+     *  only, never spanning a message-loop turn): undo()/redo()/
+     *  clearUndoHistory() must not run while it is alive. */
+    struct ScopedUndoSuppression
+    {
+        explicit ScopedUndoSuppression (TreeParameterStore& s) : store (s) { ++store.undoSuppressionCount; }
+        ~ScopedUndoSuppression() { --store.undoSuppressionCount; }
+        TreeParameterStore& store;
+    };
+
     //==========================================================================
     // Listener Management
     //==========================================================================
@@ -249,6 +268,7 @@ private:
     std::vector<std::unique_ptr<juce::UndoManager>> undoManagers;
     juce::StringArray undoDomainNames;
     int activeDomain = 0;
+    int undoSuppressionCount = 0;   // > 0 while a ScopedUndoSuppression is alive
     WriteInterceptor writeInterceptor;
 
     // Listener management
