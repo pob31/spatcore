@@ -228,7 +228,7 @@ public:
                                    const juce::Identifier& property) override;
     void valueTreeChildAdded(juce::ValueTree& parent, juce::ValueTree& child) override;
     void valueTreeChildRemoved(juce::ValueTree& parent, juce::ValueTree& child, int index) override;
-    void valueTreeChildOrderChanged(juce::ValueTree&, int, int) override {}
+    void valueTreeChildOrderChanged(juce::ValueTree& parent, int, int) override;
     void valueTreeParentChanged(juce::ValueTree&) override {}
 
 private:
@@ -349,6 +349,7 @@ private:
     // Active test channel (for highlighting)
     int activeTestHardwareChannel = -1;
     bool spacebarTestActive = false;  // True when spacebar started test without hold
+    bool writingPatchData = false;    // Re-entrancy guard: our own patchData save must not trigger a reload
 
     // Channel dimensions
     int numWFSChannels = 0;

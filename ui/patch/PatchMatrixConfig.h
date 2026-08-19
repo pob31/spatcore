@@ -100,6 +100,14 @@ struct PatchMatrixConfig
     /// fallback column count when the patch tree carries no `cols`.
     int maxHardwareChannels = 512;
 
+    /// The host performs the structural patchData row edits itself (insert /
+    /// remove / move a row atomically with its channel-list edit). The matrix
+    /// then only MIRRORS external patchData writes — it must not auto-patch
+    /// on child add, prune-and-save on child remove or row-count change: its
+    /// in-memory copy can be stale mid-edit, and saving it back clobbers the
+    /// host's rows. False keeps the historical count-driven behaviour.
+    bool hostManagesRows = false;
+
     //==========================================================================
     // Host queries.
 

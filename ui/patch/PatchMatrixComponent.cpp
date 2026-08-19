@@ -198,7 +198,10 @@ void PatchMatrixComponent::savePatchesToValueTree()
     }
 
     juce::String patchDataStr = rowStrings.joinIntoString(";");
-    patchTree.setProperty(config.ids.patchData, patchDataStr, nullptr);
+    {
+        const juce::ScopedValueSetter<bool> guard(writingPatchData, true);
+        patchTree.setProperty(config.ids.patchData, patchDataStr, nullptr);
+    }
 
     // Keep cols tracking the real device (or 64 default) plus the highest
     // patched channel, so unpatching an overflow route shrinks the matrix
@@ -625,25 +628,47 @@ void PatchMatrixComponent::valueTreePropertyChanged(juce::ValueTree& tree,
                                                     const juce::Identifier& property)
 {
     juce::ignoreUnused(tree);
-    if (property == config.ids.rows)
+    if (property == config.ids.patchData)
+    {
+        // An EXTERNAL patchData rewrite (host row insert/remove/move, config
+        // load). Mirror it — the in-memory copy is stale, and any later save
+        // from here would clobber the host's rows. Our own saves are guarded.
+        if (!writingPatchData)
+        {
+            updateChannelCounts();
+            loadPatchesFromValueTree();
+            updateScrollBars();
+            repaint();
+        }
+    }
+    else if (property == config.ids.rows)
     {
         updateChannelCounts();
 
-        // Row (WFS) shrink is user-driven (they removed a WFS channel).
-        // Drop patches that reference the now-missing row. Cols cannot
-        // shrink past the highest patched hardware channel under the current
-        // policy, so we never drop by column here.
-        auto before = patches.size();
-        patches.erase(
-            std::remove_if(patches.begin(), patches.end(),
-                [this](const PatchPoint& p) {
-                    return p.wfsChannel >= numWFSChannels;
-                }),
-            patches.end()
-        );
+        if (config.hostManagesRows)
+        {
+            // The host rewrote patchData in the same operation — just track
+            // the new dimensions; never prune-and-save a stale copy back.
+            loadPatchesFromValueTree();
+        }
+        else
+        {
+            // Row (WFS) shrink is user-driven (they removed a WFS channel).
+            // Drop patches that reference the now-missing row. Cols cannot
+            // shrink past the highest patched hardware channel under the current
+            // policy, so we never drop by column here.
+            auto before = patches.size();
+            patches.erase(
+                std::remove_if(patches.begin(), patches.end(),
+                    [this](const PatchPoint& p) {
+                        return p.wfsChannel >= numWFSChannels;
+                    }),
+                patches.end()
+            );
 
-        if (patches.size() != before)
-            savePatchesToValueTree();
+            if (patches.size() != before)
+                savePatchesToValueTree();
+        }
         updateScrollBars();
         repaint();
     }
@@ -674,6 +699,17 @@ void PatchMatrixComponent::valueTreeChildAdded(juce::ValueTree& parent, juce::Va
     // Check if this is an input/output channel being added
     if (parent == channelsTree)
     {
+        if (config.hostManagesRows)
+        {
+            // The host inserts the new channel's patch row itself (its
+            // patchData write follows and is mirrored there) — auto-patching
+            // here would fight it with a stale in-memory copy.
+            updateChannelCounts();
+            updateScrollBars();
+            repaint();
+            return;
+        }
+
         int oldWFSCount = numWFSChannels;
         updateChannelCounts();
 
@@ -762,6 +798,16 @@ void PatchMatrixComponent::valueTreeChildRemoved(juce::ValueTree& parent, juce::
     {
         updateChannelCounts();
 
+        if (config.hostManagesRows)
+        {
+            // The host removes exactly the deleted channel's row itself (a
+            // MIDDLE row when numbers have gaps); pruning by count here would
+            // drop the LAST row instead and save the corruption back.
+            updateScrollBars();
+            repaint();
+            return;
+        }
+
         // Remove invalid patches (beyond new bounds)
         patches.erase(
             std::remove_if(patches.begin(), patches.end(),
@@ -775,6 +821,15 @@ void PatchMatrixComponent::valueTreeChildRemoved(juce::ValueTree& parent, juce::
         savePatchesToValueTree();
         repaint();
     }
+}
+
+void PatchMatrixComponent::valueTreeChildOrderChanged(juce::ValueTree& parent, int, int)
+{
+    // Drag-to-reorder in the host: row labels/colours change with the order;
+    // the row DATA follows via the host's patchData rewrite (mirrored in
+    // valueTreePropertyChanged).
+    if (parent == channelsTree)
+        repaint();
 }
 
 //==============================================================================
