@@ -2667,7 +2667,7 @@ static void testStereoPassThroughIdentity()
     StereoDecomposerConfig cfg;
     CHECK (d.prepare (48000.0, 512, cfg));
     CHECK (d.getLatencyMs() == 0.0f);
-    CHECK (d.getNumActiveSlices() == 2);
+    CHECK (d.getNumActiveSlices() == 3);   // centre + L + R
 
     // Bit-exact copy, several block sizes including partial blocks.
     for (int numSamples : { 512, 64, 480, 1 })
@@ -2689,17 +2689,20 @@ static void testStereoPassThroughIdentity()
 
         for (int n = 0; n < numSamples; ++n)
         {
-            CHECK (slices[0][(size_t) n] == left[(size_t) n]);    // bit-equal
-            CHECK (slices[1][(size_t) n] == right[(size_t) n]);
+            CHECK (slices[0][(size_t) n] == 0.0f);                // centre: silent
+            CHECK (slices[1][(size_t) n] == left[(size_t) n]);    // bit-equal
+            CHECK (slices[2][(size_t) n] == right[(size_t) n]);
         }
     }
 
-    // Slice state: pass-through slices at the width extremes, full confidence.
+    // Slice state: centre anchored at azimuth 0, pass-through slices at the
+    // width extremes, full confidence.
     StereoSliceState state[StereoDecomposer::kMaxSlices];
     d.getSliceState (state);
-    CHECK (state[0].active && state[0].azimuth == -1.0f && state[0].confidence == 1.0f);
-    CHECK (state[1].active && state[1].azimuth ==  1.0f);
-    for (int k = 2; k < StereoDecomposer::kMaxSlices; ++k)
+    CHECK (state[0].active && state[0].azimuth ==  0.0f && state[0].confidence == 1.0f);
+    CHECK (state[1].active && state[1].azimuth == -1.0f && state[1].confidence == 1.0f);
+    CHECK (state[2].active && state[2].azimuth ==  1.0f);
+    for (int k = 3; k < StereoDecomposer::kMaxSlices; ++k)
         CHECK (! state[k].active);
 }
 

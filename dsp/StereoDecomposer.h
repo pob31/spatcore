@@ -47,10 +47,14 @@ struct StereoDecomposerConfig
     A stereo decomposition backend: two channels in, up to kMaxSlices slice
     feeds out.
 
-    Phase 0 ships PassThroughStereoDecomposer (slice 0 = L, slice 1 = R, zero
-    latency). Phase 1 adds the STFT / coherence / panning-index backend behind
-    this same interface — the channel type, snapshots and render mapping must
-    not change when it does.
+    Slot convention (all backends): slice 0 is the CENTRE/anchor feed — it
+    renders at the channel's own position, so its matrix row doubles as the
+    channel's reference row (visualisation, per-channel term derivation). The
+    image slices follow from index 1. Phase 0 ships
+    PassThroughStereoDecomposer (slice 0 silent, slice 1 = L, slice 2 = R,
+    zero latency); Phase 1 puts the crossover bass + centre content on
+    slice 0, exactly as this layout anticipates — the channel type, snapshots
+    and render mapping must not change when it does.
 
     HARD CONTRACT on process() (handoff doc §3.5 and §8 — the reconstruction
     invariant is what makes this feature safe in front of an audience):
@@ -106,10 +110,12 @@ public:
 
 //==============================================================================
 /**
-    Phase 0 backend: slice 0 = left, slice 1 = right, slices 2..5 cleared.
-    Zero latency; reconstruction is bit-exact by construction (L + R in,
-    L + R out). This is the permanent A/B control condition the Phase 1
-    decomposition must beat audibly on real program material (doc §8).
+    Phase 0 backend: slice 0 = centre (active but silent — it anchors the
+    channel's reference row at the anchor position), slice 1 = left,
+    slice 2 = right, slices 3..5 cleared. Zero latency; reconstruction is
+    bit-exact by construction (0 + L + R in, L + R out). This is the permanent
+    A/B control condition the Phase 1 decomposition must beat audibly on real
+    program material (doc §8).
 */
 class PassThroughStereoDecomposer final : public StereoDecomposer
 {
@@ -139,26 +145,32 @@ public:
         if (numSamples <= 0)
             return;
 
-        juce::FloatVectorOperations::copy (sliceOut[0], left,  numSamples);
-        juce::FloatVectorOperations::copy (sliceOut[1], right, numSamples);
+        // Slice 0 (centre) carries no audio in pass-through, but stays an
+        // ACTIVE slot: its row renders at the anchor and is the channel's
+        // reference row.
+        juce::FloatVectorOperations::clear (sliceOut[0], numSamples);
+        juce::FloatVectorOperations::copy (sliceOut[1], left,  numSamples);
+        juce::FloatVectorOperations::copy (sliceOut[2], right, numSamples);
 
         // Inactive slots are cleared, never stale (hard contract).
-        for (int k = 2; k < kMaxSlices; ++k)
+        for (int k = 3; k < kMaxSlices; ++k)
             juce::FloatVectorOperations::clear (sliceOut[k], numSamples);
     }
 
     float getLatencyMs() const noexcept override { return 0.0f; }
-    int getNumActiveSlices() const noexcept override { return 2; }
+    int getNumActiveSlices() const noexcept override { return 3; }
 
     void getSliceState (StereoSliceState* dest) const noexcept override
     {
         for (int k = 0; k < kMaxSlices; ++k)
             dest[k] = {};
 
-        // The two pass-through slices sit at the width extremes with full
+        // Centre at the anchor (silent here, but active so its row renders),
+        // then the two pass-through slices at the width extremes with full
         // confidence: the application maps ±1 to the channel's stereo width.
-        dest[0] = { -1.0f, 1.0f, 1.0f, true };
-        dest[1] = {  1.0f, 1.0f, 1.0f, true };
+        dest[0] = {  0.0f, 1.0f, 1.0f, true };
+        dest[1] = { -1.0f, 1.0f, 1.0f, true };
+        dest[2] = {  1.0f, 1.0f, 1.0f, true };
     }
 
 private:
