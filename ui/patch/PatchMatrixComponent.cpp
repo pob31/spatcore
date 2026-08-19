@@ -1362,6 +1362,13 @@ void PatchMatrixComponent::updatePatchDrag(juce::Point<int> currentCell)
         int row = patchDragState.startCell.y + (i * rowIncrement);
         int col = patchDragState.startCell.x + (i * colIncrement);
 
+        // The 1:1 diagonal sweep stops at the first multi-column row it would
+        // enter: sweeping a single column into a stereo-pair row would leave
+        // it half-patched and shift every row below off its pair. The start
+        // cell itself stays patchable (it behaves like a click).
+        if (i > 0 && row >= 0 && rowCapacity(row) != 1)
+            break;
+
         if (row >= 0 && row < numWFSChannels &&
             col >= 0 && col < numHardwareChannels &&
             isHardwareChannelActive(col) &&
