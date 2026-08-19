@@ -69,6 +69,7 @@
 #include "spatcore/binaural/StructuralHrtfRenderer.h"
 #include "spatcore/dsp/OneEuroFilter.h"
 #include "spatcore/wfs/RenderSourceMap.h"
+#include "spatcore/dsp/StereoDecomposer.h"
 #ifdef SPATCORE_TEST_SOFA_FIXTURE
 #include "spatcore/binaural/SofaLoader.h"
 #include "spatcore/binaural/SofaHrtfRenderer.h"
@@ -2608,11 +2609,158 @@ static void testRenderSourceMapBuild()
     }
 }
 
+
+//==============================================================================
+// StereoDecomposer — the Phase 0 pass-through backend, tested through the BASE
+// CLASS wherever possible so the Phase 1 STFT backend inherits the contract
+// tests (in particular the reconstruction invariant, doc §8) for free.
+
+// Deterministic squirrel-hash test signal, bipolar, distinct per (channel, n).
+static float stereoTestSample (int channel, int n)
+{
+    uint32_t h = (uint32_t) (n * 2654435761u) ^ (uint32_t) (channel * 0x9E3779B9u);
+    h ^= h >> 15; h *= 0x2C1B3C6Du; h ^= h >> 12; h *= 0x297A2D39u; h ^= h >> 15;
+    return ((float) (h & 0xFFFFFF) / (float) 0x7FFFFF) - 1.0f;
+}
+
+// Base-class contract: sum of slices reconstructs L+R within -120 dBFS, and
+// inactive slots are cleared. Phase 1 backends must pass unchanged (with their
+// latency accounted for — latency 0 is asserted separately per backend).
+static void checkStereoReconstruction (spatcore::dsp::StereoDecomposer& d,
+                                       int numSamples, int seedOffset)
+{
+    constexpr int kMax = spatcore::dsp::StereoDecomposer::kMaxSlices;
+    std::vector<float> left ((size_t) numSamples), right ((size_t) numSamples);
+    std::vector<std::vector<float>> slices ((size_t) kMax,
+                                            std::vector<float> ((size_t) numSamples, -12345.0f));
+    float* slicePtrs[kMax];
+    for (int k = 0; k < kMax; ++k)
+        slicePtrs[k] = slices[(size_t) k].data();
+
+    for (int n = 0; n < numSamples; ++n)
+    {
+        left[(size_t) n]  = stereoTestSample (0, n + seedOffset);
+        right[(size_t) n] = stereoTestSample (1, n + seedOffset);
+    }
+
+    d.process (left.data(), right.data(), slicePtrs, numSamples);
+
+    constexpr float tol = 1.0e-6f;   // -120 dBFS
+    for (int n = 0; n < numSamples; ++n)
+    {
+        float sum = 0.0f;
+        for (int k = 0; k < kMax; ++k)
+            sum += slices[(size_t) k][(size_t) n];
+        CHECK (std::abs (sum - (left[(size_t) n] + right[(size_t) n])) <= tol);
+    }
+
+    // Inactive slots: exactly zero, never the sentinel they were prefilled with.
+    for (int k = d.getNumActiveSlices(); k < kMax; ++k)
+        for (int n = 0; n < numSamples; ++n)
+            CHECK (slices[(size_t) k][(size_t) n] == 0.0f);
+}
+
+static void testStereoPassThroughIdentity()
+{
+    using namespace spatcore::dsp;
+    PassThroughStereoDecomposer d;
+    StereoDecomposerConfig cfg;
+    CHECK (d.prepare (48000.0, 512, cfg));
+    CHECK (d.getLatencyMs() == 0.0f);
+    CHECK (d.getNumActiveSlices() == 2);
+
+    // Bit-exact copy, several block sizes including partial blocks.
+    for (int numSamples : { 512, 64, 480, 1 })
+    {
+        std::vector<float> left ((size_t) numSamples), right ((size_t) numSamples);
+        std::vector<std::vector<float>> slices ((size_t) StereoDecomposer::kMaxSlices,
+                                                std::vector<float> ((size_t) numSamples, -1.0f));
+        float* slicePtrs[StereoDecomposer::kMaxSlices];
+        for (int k = 0; k < StereoDecomposer::kMaxSlices; ++k)
+            slicePtrs[k] = slices[(size_t) k].data();
+
+        for (int n = 0; n < numSamples; ++n)
+        {
+            left[(size_t) n]  = stereoTestSample (0, n);
+            right[(size_t) n] = stereoTestSample (1, n);
+        }
+
+        d.process (left.data(), right.data(), slicePtrs, numSamples);
+
+        for (int n = 0; n < numSamples; ++n)
+        {
+            CHECK (slices[0][(size_t) n] == left[(size_t) n]);    // bit-equal
+            CHECK (slices[1][(size_t) n] == right[(size_t) n]);
+        }
+    }
+
+    // Slice state: pass-through slices at the width extremes, full confidence.
+    StereoSliceState state[StereoDecomposer::kMaxSlices];
+    d.getSliceState (state);
+    CHECK (state[0].active && state[0].azimuth == -1.0f && state[0].confidence == 1.0f);
+    CHECK (state[1].active && state[1].azimuth ==  1.0f);
+    for (int k = 2; k < StereoDecomposer::kMaxSlices; ++k)
+        CHECK (! state[k].active);
+}
+
+static void testStereoReconstructionInvariant()
+{
+    using namespace spatcore::dsp;
+    PassThroughStereoDecomposer d;
+    CHECK (d.prepare (96000.0, 256, {}));
+
+    for (int block = 0; block < 16; ++block)
+        checkStereoReconstruction (d, 256, block * 256);
+}
+
+static void testStereoInactiveSlotsCleared()
+{
+    // Covered inside checkStereoReconstruction via the -12345 sentinel prefill;
+    // this test pins the property on its own so a regression names it.
+    using namespace spatcore::dsp;
+    PassThroughStereoDecomposer d;
+    CHECK (d.prepare (48000.0, 128, {}));
+    checkStereoReconstruction (d, 128, 0);
+}
+
+static void testStereoConfigChangeStability()
+{
+    using namespace spatcore::dsp;
+    PassThroughStereoDecomposer d;
+    StereoDecomposerConfig cfg;
+    CHECK (d.prepare (48000.0, 256, cfg));
+
+    for (int slices : { 2, 5, 2, 6, 3 })
+    {
+        cfg.activeSlices = slices;
+        d.setConfig (cfg);
+        checkStereoReconstruction (d, 256, slices * 1000);
+    }
+
+    // Out-of-envelope values clamp rather than break the contract.
+    cfg.activeSlices = 99;
+    d.setConfig (cfg);
+    CHECK (d.getNumActiveSlices() <= StereoDecomposer::kMaxSlices);
+    cfg.activeSlices = -3;
+    d.setConfig (cfg);
+    CHECK (d.getNumActiveSlices() >= 2);
+    checkStereoReconstruction (d, 256, 777);
+
+    // reset() returns to silence without reallocating (stateless here, but the
+    // call must exist and be harmless for every backend).
+    d.reset();
+    checkStereoReconstruction (d, 256, 888);
+}
+
 int main()
 {
     try
     {
         testRenderSourceMapBuild();
+        testStereoPassThroughIdentity();
+        testStereoReconstructionInvariant();
+        testStereoInactiveSlotsCleared();
+        testStereoConfigChangeStability();
         testLockFreeRingBuffer();
         testDelayTargetSmootherDeterminism();
         testRtSnapshot();

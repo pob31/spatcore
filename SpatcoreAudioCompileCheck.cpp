@@ -55,6 +55,7 @@
 #include "dsp/OutputEQProcessor.h"
 #include "dsp/OutputLevelDetector.h"
 #include "dsp/ReverbBiquadFilter.h"
+#include "dsp/StereoDecomposer.h"
 #include "dsp/TrackingPositionFilter.h"
 #include "dsp/WFSBiquadFilter.h"
 #include "dsp/WFSHighShelfFilter.h"
