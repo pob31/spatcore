@@ -124,6 +124,10 @@ public:
         rowCapacityProvider; 1 when the provider is absent. */
     int rowCapacity(int wfsChannel) const;
 
+    /** Display id for a row (header label, announcements). Reads the host's
+        rowIdProvider; row + 1 when absent (dense channel lists). */
+    int rowIdFor(int row) const;
+
     /**
      * Callback when processing state changes (stops test signals)
      */

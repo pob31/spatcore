@@ -253,6 +253,11 @@ int PatchMatrixComponent::rowCapacity(int wfsChannel) const
     return 1;
 }
 
+int PatchMatrixComponent::rowIdFor(int row) const
+{
+    return config.rowIdProvider ? config.rowIdProvider(row) : row + 1;
+}
+
 void PatchMatrixComponent::evictRowToCapacity(int wfsChannel)
 {
     // Drop the row's earliest-added patches until one slot is free. Insertion
@@ -515,7 +520,7 @@ void PatchMatrixComponent::mouseMove(const juce::MouseEvent& e)
                 // Testing mode: announce what would be tested
                 if (isPatchActive(wfsChannel, hwChannel))
                 {
-                    announcement = "Test " + channelType + " " + juce::String(wfsChannel + 1);
+                    announcement = "Test " + channelType + " " + juce::String(rowIdFor(wfsChannel));
                     if (channelName.isNotEmpty())
                         announcement += ", " + channelName;
                     announcement += " on audio interface channel " + juce::String(hwChannel + 1);
@@ -523,7 +528,7 @@ void PatchMatrixComponent::mouseMove(const juce::MouseEvent& e)
                 else
                 {
                     // Not patched - can't test
-                    announcement = channelType + " " + juce::String(wfsChannel + 1) +
+                    announcement = channelType + " " + juce::String(rowIdFor(wfsChannel)) +
                                    " not patched to channel " + juce::String(hwChannel + 1);
                 }
             }
@@ -535,7 +540,7 @@ void PatchMatrixComponent::mouseMove(const juce::MouseEvent& e)
                 if (existingHwChannel == hwChannel)
                 {
                     // Already patched here
-                    announcement = channelType + " " + juce::String(wfsChannel + 1);
+                    announcement = channelType + " " + juce::String(rowIdFor(wfsChannel));
                     if (channelName.isNotEmpty())
                         announcement += ", " + channelName;
                     announcement += " patched to audio interface channel " + juce::String(hwChannel + 1);
@@ -543,7 +548,7 @@ void PatchMatrixComponent::mouseMove(const juce::MouseEvent& e)
                 else if (existingHwChannel >= 0)
                 {
                     // Patched elsewhere
-                    announcement = channelType + " " + juce::String(wfsChannel + 1);
+                    announcement = channelType + " " + juce::String(rowIdFor(wfsChannel));
                     if (channelName.isNotEmpty())
                         announcement += ", " + channelName;
                     announcement += " currently patched to channel " + juce::String(existingHwChannel + 1);
@@ -551,7 +556,7 @@ void PatchMatrixComponent::mouseMove(const juce::MouseEvent& e)
                 else
                 {
                     // Not patched - prompt to patch
-                    announcement = "Patch " + channelType + " " + juce::String(wfsChannel + 1);
+                    announcement = "Patch " + channelType + " " + juce::String(rowIdFor(wfsChannel));
                     if (channelName.isNotEmpty())
                         announcement += ", " + channelName;
                     announcement += " to audio interface channel " + juce::String(hwChannel + 1);
@@ -992,7 +997,8 @@ void PatchMatrixComponent::drawRowHeaders(juce::Graphics& g)
         juce::String channelName;
         channelName = channelNameFor (row);
 
-        juce::String label = juce::String(row + 1) + " " + channelName;
+        const int rowId = rowIdFor(row);
+        juce::String label = juce::String(rowId) + " " + channelName;
 
         // Patch state, capacity-aware: a stereo-pair row is only "patched"
         // once BOTH its columns are filled; one column is the half-patched
@@ -1746,7 +1752,7 @@ void PatchMatrixComponent::announceSelectedCell()
     channelName = channelNameFor (wfsChannel);
 
     // Build announcement
-    juce::String announcement = channelType + " " + juce::String(wfsChannel + 1);
+    juce::String announcement = channelType + " " + juce::String(rowIdFor(wfsChannel));
     if (channelName.isNotEmpty())
         announcement += ", " + channelName;
     announcement += ", interface channel " + juce::String(hwChannel + 1);
@@ -1800,7 +1806,7 @@ void PatchMatrixComponent::handleCellActivation(juce::Point<int> cell)
             repaint();
 
             juce::String channelType = isInputPatch ? "Input" : "Output";
-            announceNow(channelType + " " + juce::String(wfsChannel + 1) + " unpatched");
+            announceNow(channelType + " " + juce::String(rowIdFor(wfsChannel)) + " unpatched");
         }
         else
         {
@@ -1824,7 +1830,7 @@ void PatchMatrixComponent::handleCellActivation(juce::Point<int> cell)
             repaint();
 
             juce::String channelType = isInputPatch ? "Input" : "Output";
-            announceNow(channelType + " " + juce::String(wfsChannel + 1) + " patched to interface channel " + juce::String(hwChannel + 1));
+            announceNow(channelType + " " + juce::String(rowIdFor(wfsChannel)) + " patched to interface channel " + juce::String(hwChannel + 1));
         }
     }
 }

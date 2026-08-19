@@ -123,6 +123,11 @@ struct PatchMatrixConfig
     /// Display name for a row, or an empty string. Row index is 0-based.
     std::function<juce::String(int)> channelNameProvider;
 
+    /// Display id for a row (the number shown in the row header). Null means
+    /// row + 1 — correct for dense channel lists. Hosts with stable channel
+    /// numbering (deletions leave gaps) return the row's permanent number.
+    std::function<int(int)> rowIdProvider;
+
     /// Colour for a row (the patched-cell fill). Row index is 0-based.
     std::function<juce::Colour(int)> rowColourProvider;
 
