@@ -115,6 +115,15 @@ public:
      */
     int getHardwareChannelForWFS(int wfsChannel) const;
 
+    /** All hardware channels patched to a row, ascending. For a stereo-pair
+        input row the first entry is the left channel by convention (lower
+        hardware column = L). Most rows hold at most one entry. */
+    std::vector<int> getHardwareChannelsForWFS(int wfsChannel) const;
+
+    /** How many hardware columns this row may hold (>= 1). Reads the host's
+        rowCapacityProvider; 1 when the provider is absent. */
+    int rowCapacity(int wfsChannel) const;
+
     /**
      * Callback when processing state changes (stops test signals)
      */
@@ -377,6 +386,10 @@ private:
 
     bool isPatchActive(int wfsChannel, int hwChannel) const;
     bool isValidPatch(int wfsChannel, int hwChannel) const;
+
+    /** Remove the row's earliest-added patches until one slot is free
+        (insertion order = eviction order). No-op when below capacity. */
+    void evictRowToCapacity(int wfsChannel);
     juce::Colour getCellColor(int wfsChannel) const;
 
     // Testing mode (output patch only)

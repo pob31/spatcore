@@ -236,6 +236,46 @@ int PatchMatrixComponent::getHardwareChannelForWFS(int wfsChannel) const
     return -1;
 }
 
+std::vector<int> PatchMatrixComponent::getHardwareChannelsForWFS(int wfsChannel) const
+{
+    std::vector<int> channels;
+    for (const auto& patch : patches)
+        if (patch.wfsChannel == wfsChannel)
+            channels.push_back(patch.hardwareChannel);
+    std::sort(channels.begin(), channels.end());
+    return channels;
+}
+
+int PatchMatrixComponent::rowCapacity(int wfsChannel) const
+{
+    if (config.rowCapacityProvider)
+        return juce::jmax(1, config.rowCapacityProvider(wfsChannel));
+    return 1;
+}
+
+void PatchMatrixComponent::evictRowToCapacity(int wfsChannel)
+{
+    // Drop the row's earliest-added patches until one slot is free. Insertion
+    // order is the eviction order, matching the historical replace behaviour
+    // for mono rows (capacity 1: any existing patch goes).
+    const int capacity = rowCapacity(wfsChannel);
+    int count = 0;
+    for (const auto& patch : patches)
+        if (patch.wfsChannel == wfsChannel)
+            ++count;
+
+    for (auto it = patches.begin(); it != patches.end() && count >= capacity;)
+    {
+        if (it->wfsChannel == wfsChannel)
+        {
+            it = patches.erase(it);
+            --count;
+        }
+        else
+            ++it;
+    }
+}
+
 void PatchMatrixComponent::setProcessingStateChanged(bool isProcessing)
 {
     // Stop test signals when WFS processing starts
@@ -954,9 +994,22 @@ void PatchMatrixComponent::drawRowHeaders(juce::Graphics& g)
 
         juce::String label = juce::String(row + 1) + " " + channelName;
 
-        // Check if this channel is patched
-        bool isPatched = isWFSChannelPatched(row);
-        int hwChannel = isPatched ? getHardwareChannelForWFS(row) : -1;
+        // Patch state, capacity-aware: a stereo-pair row is only "patched"
+        // once BOTH its columns are filled; one column is the half-patched
+        // state, drawn in yellow so the missing leg is visible at a glance.
+        const auto rowChannels = getHardwareChannelsForWFS(row);
+        const int capacity = rowCapacity(row);
+        const bool isPatched = !rowChannels.empty();
+        const bool isComplete = (int) rowChannels.size() >= capacity;
+        int hwChannel = isPatched ? rowChannels.front() : -1;
+
+        if (capacity > 1 && isPatched)
+        {
+            // Name the legs: lower column is L by convention.
+            label += rowChannels.size() >= 2
+                ? "  [L" + juce::String(rowChannels[0] + 1) + " R" + juce::String(rowChannels[1] + 1) + "]"
+                : "  [L" + juce::String(rowChannels[0] + 1) + " R?]";
+        }
 
         // Highlight background if active test channel (output patch only)
         if (!isInputPatch && currentMode == Mode::Testing &&
@@ -966,15 +1019,14 @@ void PatchMatrixComponent::drawRowHeaders(juce::Graphics& g)
             g.fillRect(0, y, rowHeaderWidth, cellHeight);
         }
 
-        // Set text color - orange for unpatched, white for patched
+        // Text colour: orange = unpatched, yellow = half-patched (stereo row
+        // with one leg), normal = complete.
         if (!isPatched)
-        {
             g.setColour(juce::Colours::orange);
-        }
+        else if (!isComplete)
+            g.setColour(juce::Colours::yellow);
         else
-        {
             g.setColour(palette().textPrimary);
-        }
 
         g.drawText(label, 5, y, rowHeaderWidth - 10, cellHeight,
                    juce::Justification::centredLeft);
@@ -1330,15 +1382,19 @@ void PatchMatrixComponent::commitPatchOperation()
     // Remove conflicts and add new patches
     for (const auto& newPatch : patchDragState.previewPatches)
     {
-        // Remove any existing patches that conflict
+        // Column conflicts always go (strict 1:1 on the hardware side).
         patches.erase(
             std::remove_if(patches.begin(), patches.end(),
                 [newPatch](const PatchPoint& p) {
-                    return p.wfsChannel == newPatch.wfsChannel ||
-                           p.hardwareChannel == newPatch.hardwareChannel;
+                    return p.hardwareChannel == newPatch.hardwareChannel;
                 }),
             patches.end()
         );
+
+        // Row side: evict the oldest column only while the row is at capacity,
+        // so a stereo-pair row accumulates its second column instead of losing
+        // its first.
+        evictRowToCapacity(newPatch.wfsChannel);
 
         // Add new patch
         patches.push_back(newPatch);
@@ -1369,14 +1425,14 @@ bool PatchMatrixComponent::isPatchActive(int wfsChannel, int hwChannel) const
 
 bool PatchMatrixComponent::isValidPatch(int wfsChannel, int hwChannel) const
 {
-    // Check 1:1 constraint
+    // Column side is strict 1:1 always: a hardware channel feeds one row.
     for (const auto& patch : patches)
-    {
-        if (patch.wfsChannel == wfsChannel && patch.hardwareChannel != hwChannel)
-            return false;  // WFS channel already mapped elsewhere
         if (patch.hardwareChannel == hwChannel && patch.wfsChannel != wfsChannel)
             return false;  // Hardware channel already mapped elsewhere
-    }
+
+    // Row side is capacity-aware: a mono row holds one column, a stereo-pair
+    // row holds two. A row at capacity is still "valid" to patch — commit
+    // replaces the oldest column, mirroring the historical replace behaviour.
     return true;
 }
 
@@ -1741,18 +1797,12 @@ void PatchMatrixComponent::handleCellActivation(juce::Point<int> cell)
         }
         else
         {
-            // Check if this WFS channel is already patched elsewhere
-            int existingHw = getHardwareChannelForWFS(wfsChannel);
-            if (existingHw >= 0)
-            {
-                // Remove existing patch first
-                patches.erase(std::remove_if(patches.begin(), patches.end(),
-                    [wfsChannel](const PatchPoint& p) {
-                        return p.wfsChannel == wfsChannel;
-                    }), patches.end());
-            }
+            // Row side: free a slot only if the row is at capacity (a
+            // stereo-pair row keeps its first column and gains a second).
+            evictRowToCapacity(wfsChannel);
 
-            // Check if another WFS channel is patched to this hardware channel
+            // Column side: strict 1:1 — another row on this hardware channel
+            // always loses it.
             for (auto it = patches.begin(); it != patches.end();)
             {
                 if (it->hardwareChannel == hwChannel)

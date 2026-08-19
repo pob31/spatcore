@@ -106,6 +106,15 @@ struct PatchMatrixConfig
     /// Number of application channels — matrix rows.
     std::function<int()> numChannelsProvider;
 
+    /// How many hardware columns row `wfsChannel` (0-based) may hold.
+    /// Null or a value < 1 means 1 — the historical strict 1:1 behaviour.
+    /// A stereo-pair input row returns 2; within such a row the LOWER
+    /// hardware column is the left channel by convention. The COLUMN side
+    /// of the invariant is unaffected: a hardware channel still maps to at
+    /// most one row, which is what protects the audio path and the
+    /// unpatched-row diagnostic.
+    std::function<int(int wfsChannel)> rowCapacityProvider;
+
     /// Called after the matrix writes patchData, so the host can re-run its
     /// own column-count policy (a patch beyond the current width must widen
     /// the matrix; removing one may narrow it).
