@@ -64,6 +64,7 @@
 #include "wfs/InputBufferProcessor.h"
 #include "wfs/OutputBufferAlgorithm.h"
 #include "wfs/OutputBufferProcessor.h"
+#include "wfs/RenderSourceMap.h"
 #include "wfs/NativeGpuOutputBufferAlgorithm.h"
 #include "wfs/NativeGpuWfsAlgorithm.h"
 

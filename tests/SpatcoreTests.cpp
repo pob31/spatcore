@@ -68,6 +68,7 @@
 #include "spatcore/binaural/HeadOrientationSource.h"
 #include "spatcore/binaural/StructuralHrtfRenderer.h"
 #include "spatcore/dsp/OneEuroFilter.h"
+#include "spatcore/wfs/RenderSourceMap.h"
 #ifdef SPATCORE_TEST_SOFA_FIXTURE
 #include "spatcore/binaural/SofaLoader.h"
 #include "spatcore/binaural/SofaHrtfRenderer.h"
@@ -2501,10 +2502,117 @@ static void testSofaLoaderAndRenderer()
 }
 #endif // SPATCORE_TEST_SOFA_FIXTURE
 
+
+//==============================================================================
+// RenderSourceMap — the slot allocator behind the stereo channel type.
+// Slot stability is the load-bearing property: OSC ids, matrix rows and GPU
+// buffers all key off these slots, so nothing but the channel-type vector may
+// move them.
+static void testRenderSourceMapBuild()
+{
+    using Map = spatcore::wfs::RenderSourceMap;
+
+    // Identity: all-mono, channel i <-> source i, nothing derived.
+    {
+        Map m;
+        CHECK (Map::buildIdentity (8, m));
+        CHECK (m.count == 8);
+        CHECK (m.numInputChannels == 8);
+        for (int i = 0; i < 8; ++i)
+        {
+            CHECK (m.desc[(size_t) i].owningInputChannel == i);
+            CHECK (m.desc[(size_t) i].sliceIndex == 0);
+            CHECK (! m.desc[(size_t) i].isStereoSlice);
+            CHECK (m.firstDerivedSlot[(size_t) i] == -1);
+        }
+    }
+
+    // Mixed: channels 1 and 3 stereo out of 6.
+    {
+        uint8_t types[6] = { 0, 1, 0, 1, 0, 0 };
+        Map m;
+        CHECK (Map::build (types, 6, m));
+        CHECK (m.count == 6 + 2 * Map::kDerivedPerStereo);
+
+        // Primary slots keep the channel <-> row identity for every channel.
+        for (int i = 0; i < 6; ++i)
+        {
+            CHECK (m.desc[(size_t) i].owningInputChannel == i);
+            CHECK (m.desc[(size_t) i].sliceIndex == 0);
+        }
+        CHECK (m.desc[1].isStereoSlice);
+        CHECK (! m.desc[2].isStereoSlice);
+
+        // Derived slots: contiguous, ordinal-ordered, slices 1..5.
+        CHECK (m.firstDerivedSlot[1] == 6);
+        CHECK (m.firstDerivedSlot[3] == 6 + Map::kDerivedPerStereo);
+        for (int s = 1; s <= Map::kDerivedPerStereo; ++s)
+        {
+            const auto& d1 = m.desc[(size_t) (6 + s - 1)];
+            CHECK (d1.owningInputChannel == 1);
+            CHECK (d1.sliceIndex == s);
+            CHECK (d1.isStereoSlice);
+
+            const auto& d3 = m.desc[(size_t) (6 + Map::kDerivedPerStereo + s - 1)];
+            CHECK (d3.owningInputChannel == 3);
+            CHECK (d3.sliceIndex == s);
+        }
+
+        // No two sources share (owner, slice).
+        for (int a = 0; a < m.count; ++a)
+            for (int b = a + 1; b < m.count; ++b)
+                CHECK (! (m.desc[(size_t) a].owningInputChannel == m.desc[(size_t) b].owningInputChannel
+                       && m.desc[(size_t) a].sliceIndex == m.desc[(size_t) b].sliceIndex));
+    }
+
+    // Slot stability: the map is a pure function of the type vector alone.
+    // Two builds from equal vectors must agree slot for slot, and a build
+    // differing only in a LATER channel's type must not move earlier slots.
+    {
+        uint8_t typesA[6] = { 0, 1, 0, 0, 0, 0 };
+        uint8_t typesB[6] = { 0, 1, 0, 0, 0, 1 };   // channel 5 became stereo
+        Map a, b;
+        CHECK (Map::build (typesA, 6, a));
+        CHECK (Map::build (typesB, 6, b));
+        CHECK (a.firstDerivedSlot[1] == b.firstDerivedSlot[1]);
+        for (int s = 0; s < a.count; ++s)
+        {
+            CHECK (a.desc[(size_t) s].owningInputChannel == b.desc[(size_t) s].owningInputChannel);
+            CHECK (a.desc[(size_t) s].sliceIndex == b.desc[(size_t) s].sliceIndex);
+        }
+    }
+
+    // Budget enforcement: 9 stereo channels is one past the cap, and must fail
+    // cleanly (empty map, not an overflow).
+    {
+        uint8_t types[Map::kMaxInputChannels] = {};
+        for (int i = 0; i < Map::kMaxStereoChannels + 1; ++i)
+            types[i] = Map::Stereo;
+        Map m;
+        CHECK (! Map::build (types, Map::kMaxInputChannels, m));
+        CHECK (m.count == 0);
+
+        // Exactly at the cap is fine, and fills the whole budget.
+        for (int i = 0; i < Map::kMaxInputChannels; ++i)
+            types[i] = (i < Map::kMaxStereoChannels) ? Map::Stereo : Map::Mono;
+        CHECK (Map::build (types, Map::kMaxInputChannels, m));
+        CHECK (m.count == Map::kMaxRenderSources);
+    }
+
+    // Invalid input: over-count and null both refuse.
+    {
+        Map m;
+        uint8_t t = 0;
+        CHECK (! Map::build (nullptr, 1, m));
+        CHECK (! Map::build (&t, Map::kMaxInputChannels + 1, m));
+    }
+}
+
 int main()
 {
     try
     {
+        testRenderSourceMapBuild();
         testLockFreeRingBuffer();
         testDelayTargetSmootherDeterminism();
         testRtSnapshot();
