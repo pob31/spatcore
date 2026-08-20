@@ -295,7 +295,18 @@ private:
     void updateScaledSizes() {
         cellWidth = sc(40); cellHeight = sc(30);
         titleHeight = sc(22); headerHeight = sc(50); contentTop = titleHeight + headerHeight;
-        rowHeaderWidth = sc(120); scrollBarThickness = sc(16);
+        // rowBadgeWidth() reads cellHeight, hence the ordering; and the gutter
+        // is ADDED to the strip rather than carved out of it, so the label
+        // keeps the same width it has with the badge off.
+        rowHeaderWidth = sc(120) + rowBadgeWidth(); scrollBarThickness = sc(16);
+    }
+
+    // Left gutter in every row header carrying the capacity badge. Reserved on
+    // all rows although only capacity > 1 rows draw a glyph: a gutter present
+    // on some rows only would make the row-id column's left edge ragged.
+    int rowBadgeWidth() const
+    {
+        return config.showRowCapacityBadge ? static_cast<int>(cellHeight * 0.6f) : 0;
     }
 
     // Data
@@ -380,6 +391,10 @@ private:
     // Drawing methods
     void drawHeader(juce::Graphics& g);
     void drawRowHeaders(juce::Graphics& g);
+
+    /** The classical stereo mark — two overlapping outlined circles — fitted
+        inside `area` at its own aspect and stroked, never filled. */
+    void drawStereoPairGlyph(juce::Graphics& g, juce::Rectangle<float> area, juce::Colour colour);
     void drawCells(juce::Graphics& g);
     void drawCell(juce::Graphics& g, int row, int col, juce::Rectangle<int> bounds);
 

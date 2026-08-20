@@ -567,7 +567,14 @@ void PatchMatrixComponent::mouseMove(const juce::MouseEvent& e)
             }
 
             if (announcement.isNotEmpty())
+            {
+                // Row capacity is otherwise visual only — the row-header glyph
+                // is the sole place a pair announces itself.
+                if (rowCapacity(wfsChannel) > 1)
+                    announcement += ", stereo pair";
+
                 announceHover(announcement);
+            }
         }
     }
 }
@@ -1040,6 +1047,8 @@ void PatchMatrixComponent::drawRowHeaders(juce::Graphics& g)
 
     g.setFont(juce::jmax(8.0f, 12.0f * uiScale()));
 
+    const int badgeWidth = rowBadgeWidth();
+
     for (int r = 0; r < visibleRows; ++r)
     {
         int row = firstRow + r;
@@ -1064,9 +1073,14 @@ void PatchMatrixComponent::drawRowHeaders(juce::Graphics& g)
         const bool isComplete = (int) rowChannels.size() >= capacity;
         int hwChannel = isPatched ? rowChannels.front() : -1;
 
-        if (capacity > 1 && isPatched)
+        // Name the legs textually only where no badge replaces them: the
+        // suffix costs about 40% of the label strip — enough to clip a name
+        // as ordinary as "Grand Piano" — while the glyph carries the same
+        // "this row is a pair" signal inside a gutter the strip is widened to
+        // absorb. Lower column is L by convention; which two columns they are
+        // stays readable in the grid itself.
+        if (capacity > 1 && isPatched && badgeWidth == 0)
         {
-            // Name the legs: lower column is L by convention.
             label += rowChannels.size() >= 2
                 ? "  [L" + juce::String(rowChannels[0] + 1) + " R" + juce::String(rowChannels[1] + 1) + "]"
                 : "  [L" + juce::String(rowChannels[0] + 1) + " R?]";
@@ -1081,15 +1095,24 @@ void PatchMatrixComponent::drawRowHeaders(juce::Graphics& g)
         }
 
         // Text colour: orange = unpatched, yellow = half-patched (stereo row
-        // with one leg), normal = complete.
+        // with one leg), normal = complete. The badge takes the same colour so
+        // the glyph carries the row's patch state, not just its capacity.
+        juce::Colour labelColour;
         if (!isPatched)
-            g.setColour(juce::Colours::orange);
+            labelColour = juce::Colours::orange;
         else if (!isComplete)
-            g.setColour(juce::Colours::yellow);
+            labelColour = juce::Colours::yellow;
         else
-            g.setColour(palette().textPrimary);
+            labelColour = palette().textPrimary;
 
-        g.drawText(label, 5, y, rowHeaderWidth - 10, cellHeight,
+        if (badgeWidth > 0 && capacity > 1)
+            drawStereoPairGlyph(g, juce::Rectangle<float>(5.0f, static_cast<float>(y),
+                                                          static_cast<float>(badgeWidth),
+                                                          static_cast<float>(cellHeight)).reduced(2.0f, 0.0f),
+                                labelColour);
+
+        g.setColour(labelColour);
+        g.drawText(label, 5 + badgeWidth, y, rowHeaderWidth - 10 - badgeWidth, cellHeight,
                    juce::Justification::centredLeft);
 
         // Draw grid line
@@ -1348,6 +1371,31 @@ void PatchMatrixComponent::drawHeadphonesIcon(juce::Graphics& g, juce::Rectangle
 
     g.setColour(palette().textSecondary);
     g.strokePath(headphones, juce::PathStrokeType(1.5f));
+}
+
+void PatchMatrixComponent::drawStereoPairGlyph(juce::Graphics& g, juce::Rectangle<float> area,
+                                               juce::Colour colour)
+{
+    // Two circles of equal radius whose centres sit 1.5 radii apart, so they
+    // overlap by half a radius: the classical stereo mark. Never filled — a
+    // filled pair of discs reads as a level indicator, not as a channel count.
+    juce::Path glyph;
+    glyph.addEllipse(0.0f, 0.0f, 2.0f, 2.0f);
+    glyph.addEllipse(1.5f, 0.0f, 2.0f, 2.0f);
+
+    // Fit at the glyph's OWN aspect and take the stroke weight from that
+    // fitted box, not from `area`: the gutter is far taller than it is wide,
+    // and a weight scaled from its height would close the circles up solid.
+    const float aspect = glyph.getBounds().getAspectRatio();
+    const float fittedWidth = juce::jmin(area.getWidth(), area.getHeight() * aspect);
+    const auto target = area.withSizeKeepingCentre(fittedWidth, fittedWidth / aspect);
+
+    glyph.applyTransform(glyph.getTransformToScaleToFit(target, true));
+
+    g.setColour(colour);
+    g.strokePath(glyph, juce::PathStrokeType(juce::jmax(1.0f, target.getHeight() * 0.10f),
+                                             juce::PathStrokeType::curved,
+                                             juce::PathStrokeType::rounded));
 }
 
 //==============================================================================
@@ -1823,6 +1871,11 @@ void PatchMatrixComponent::announceSelectedCell()
         else
             announcement += ", not patched";
     }
+
+    // Matches the row-header glyph, which is otherwise the only indication
+    // that this row takes two hardware channels.
+    if (rowCapacity(wfsChannel) > 1)
+        announcement += ", stereo pair";
 
     announceNow(announcement);
 }

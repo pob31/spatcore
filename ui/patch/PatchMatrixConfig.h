@@ -145,6 +145,14 @@ struct PatchMatrixConfig
     //==========================================================================
     // Presentation.
 
+    /// Mark every row whose rowCapacityProvider capacity exceeds 1 with a
+    /// stereo-pair glyph in the row header, in place of the textual leg names.
+    /// The gutter it needs is reserved on ALL rows — a per-row gutter would
+    /// leave the row-id column with a ragged left edge — and is ADDED to the
+    /// row-header width, so a host that leaves this false keeps the historical
+    /// header geometry and the historical label to the pixel.
+    bool showRowCapacityBadge = false;
+
     std::function<PatchMatrixPalette()> paletteProvider;
 
     /// Localised string for a key. Returns the key itself if unresolvable.
