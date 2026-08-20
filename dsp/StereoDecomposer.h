@@ -11,10 +11,11 @@ namespace spatcore::dsp {
 
     POD on purpose: the caller snapshots it across threads via rt::RtSnapshot,
     and the control-rate side (slice geometry refresh, level-meter diagnostics)
-    reads the copy. Azimuth is NORMALISED — mapping it to metres on the array
-    (the usable-span clamp, the confidence-collapse curve) is deliberately the
-    application's job, implemented once for every backend, so spatcore never
-    learns about stage geometry.
+    reads the copy. Azimuth is NORMALISED and stays that way — placing it on the
+    stage (scaling by the channel's WIDTH IN METRES along its SPREAD AXIS, then
+    the confidence-collapse curve) is deliberately the application's job,
+    implemented once for every backend, so spatcore never learns about stage
+    geometry or about the units the width is dialled in.
 */
 struct StereoSliceState
 {
@@ -30,8 +31,13 @@ struct StereoDecomposerConfig
 {
     int   activeSlices  = 2;       ///< N, 2..kMaxSlices
     float crossoverHz   = 110.0f;  ///< below: mono to the anchor (Phase 1)
-    float widthFactor   = 1.0f;    ///< 0..1, scales azimuth toward the anchor
     float centreAnchor  = 0.0f;    ///< reserved (Phase 1)
+
+    // Deliberately NO width field. Image width is a distance in metres, which
+    // has no 0..1 form a backend could act on, and azimuth is normalised by
+    // contract, so no backend needs it. Carrying one pinned at 1.0 would only
+    // invite a Phase 1 implementer to re-derive the retired
+    // percentage-of-array semantics from it.
 
     /** Hop-phase staggering (handoff doc §6): with several stereo channels
         active, each backend offsets its STFT phase by hop * index / count so
@@ -79,7 +85,7 @@ public:
 
     /** Non-RT. Allocates everything the backend will ever need for any config
         reachable from `cfg` without a re-prepare — in particular any
-        activeSlices <= kMaxSlices and any crossover/width. Returns false on
+        activeSlices <= kMaxSlices and any crossover. Returns false on
         an unusable format (sampleRate/maxBlockSize <= 0). */
     virtual bool prepare (double sampleRate, int maxBlockSize,
                           const StereoDecomposerConfig& cfg) = 0;
@@ -167,7 +173,8 @@ public:
 
         // Centre at the anchor (silent here, but active so its row renders),
         // then the two pass-through slices at the width extremes with full
-        // confidence: the application maps ±1 to the channel's stereo width.
+        // confidence: the application maps ±1 to half the channel's stereo
+        // width in metres, along its spread axis.
         dest[0] = {  0.0f, 1.0f, 1.0f, true };
         dest[1] = { -1.0f, 1.0f, 1.0f, true };
         dest[2] = {  1.0f, 1.0f, 1.0f, true };
