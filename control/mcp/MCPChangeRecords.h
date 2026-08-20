@@ -37,6 +37,16 @@ struct AffectedGroup
 struct ChangeSubWrite
 {
     int channelIndex = -1;   // -1 for global; 0-based for per-channel
+
+    /** Permanent channel NUMBER this sub-write named, for scopes where the
+        number is not the slot position; 0 when the write is global or its
+        scope addresses channels by dense slot (output / reverb / cluster).
+        `channelIndex` is the slot as it stood when the batch was applied, and
+        a reorder or a delete before the undo moves the channel out from under
+        it, so a scope with permanent numbers must be re-resolved from this
+        number at reversal time instead of trusting the stored slot. */
+    int channelNumber = 0;
+
     int bandIndex    = -1;   // -1 for non-EQ; 0-based for output-EQ
     juce::var beforeState;   // {paramId: oldValue}
     juce::var afterState;    // {paramId: newValue}
