@@ -1680,6 +1680,33 @@ static void testBinauralHeadFrame()
         CHECK (std::fabs (d.distance - 5.0f) < tol);
     }
 
+    // Yaw is SEAT-RELATIVE, not a world heading. This is the property the app's
+    // two controls are built on: the placement angle picks a seat and points the
+    // head at the origin, and yaw turns the head from there — so yaw 0 faces the
+    // origin at EVERY seat, and a given yaw produces the same azimuth for the
+    // origin whatever the seat. Get this backwards and "turn my head 90° right"
+    // would mean different things at different seats, and a head tracker's Set
+    // Zero would stop meaning "looking at the stage".
+    {
+        float offset[9];
+        hf::yawPitchRollToMatrix (pi / 2.0f, 0.0f, 0.0f, offset);    // +90° = turn right
+
+        for (float alpha : { 0.0f, pi / 2.0f, -pi / 4.0f, 2.5f })
+        {
+            // Seat on the circle of radius 5 at bearing alpha, per the app's
+            // placement law (d·sin α, −d·cos α).
+            pose.x = 5.0f * std::sin (alpha);
+            pose.y = -5.0f * std::cos (alpha);
+            pose.z = 0.0f;
+            hf::composeWithBaseline (alpha, offset, pose.R);
+
+            // Having turned 90° to the right, the origin is now 90° to the LEFT.
+            auto d = hf::directionInHeadFrame (pose, 0.0f, 0.0f, 0.0f);
+            CHECK (std::fabs (d.azRad + pi / 2.0f) < tol);
+            CHECK (std::fabs (d.distance - 5.0f) < tol);
+        }
+    }
+
     // Composed rotation stays orthonormal (RᵀR = I).
     {
         float offset[9], R[9];

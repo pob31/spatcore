@@ -318,12 +318,6 @@ public:
         auto totalChannels = bufferToFill.buffer->getNumChannels();
         auto numSamples = bufferToFill.numSamples;
 
-        if (outputProcessors.empty())
-        {
-            bufferToFill.clearActiveBufferRegion();
-            return;
-        }
-
         // Determine actual available channels
         auto numChannels = juce::jmin(numInputChannels, inputBuffer.getNumChannels());
 
@@ -334,11 +328,26 @@ public:
             sharedInputBuffers[inChannel]->write(inputData, numSamples);
         }
 
-        // Notify all output processor threads and the analysis thread
-        for (auto& processor : outputProcessors)
-            processor->notifyInputAvailable(numSamples);
+        // Notify the analysis thread FIRST, and unconditionally: it drives the
+        // input level meters, and input levels do not depend on there being any
+        // outputs. This used to sit below an early return on empty
+        // outputProcessors, so a session with inputs patched but no outputs yet
+        // — a normal state while setting a rig up, and the state the meters
+        // would be most useful in — showed every input at -200 dB.
+        // sharedInputBuffers are sized from numInputs alone (see prepare), so
+        // they are valid here regardless.
         if (inputAnalysisThread)
             inputAnalysisThread->notifyInputAvailable(numSamples);
+
+        if (outputProcessors.empty())
+        {
+            bufferToFill.clearActiveBufferRegion();
+            return;
+        }
+
+        // Notify all output processor threads
+        for (auto& processor : outputProcessors)
+            processor->notifyInputAvailable(numSamples);
 
         // Clear output buffer
         bufferToFill.clearActiveBufferRegion();
