@@ -214,6 +214,9 @@ void PatchMatrixComponent::savePatchesToValueTree()
 
 void PatchMatrixComponent::clearAllPatches()
 {
+    if (onBeforeUserPatchEdit)
+        onBeforeUserPatchEdit();
+
     patches.clear();
     savePatchesToValueTree();
     repaint();
@@ -1421,6 +1424,9 @@ void PatchMatrixComponent::startPatchOperation(juce::Point<int> cell)
     // Check if clicking on existing patch to remove it
     if (existingPatch)
     {
+        if (onBeforeUserPatchEdit)
+            onBeforeUserPatchEdit();
+
         // Single click to remove
         patches.erase(
             std::remove_if(patches.begin(), patches.end(),
@@ -1494,6 +1500,9 @@ void PatchMatrixComponent::commitPatchOperation()
 {
     if (!patchDragState.isActive)
         return;
+
+    if (onBeforeUserPatchEdit)
+        onBeforeUserPatchEdit();
 
     // Remove conflicts and add new patches
     for (const auto& newPatch : patchDragState.previewPatches)
@@ -1902,6 +1911,9 @@ void PatchMatrixComponent::handleCellActivation(juce::Point<int> cell)
     }
     else if (currentMode == Mode::Patching)
     {
+        if (onBeforeUserPatchEdit)
+            onBeforeUserPatchEdit();
+
         // Patching mode: toggle patch
         if (isPatchActive(wfsChannel, hwChannel))
         {

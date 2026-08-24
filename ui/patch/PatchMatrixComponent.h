@@ -151,6 +151,16 @@ public:
     /** Callback when patch data changes (for auto-save to disk). */
     std::function<void()> onPatchChanged;
 
+    /** Fired before a USER patch edit mutates anything — a cell click, a drag
+     *  commit, a keyboard/controller cell toggle, Unpatch All. NOT fired by the
+     *  programmatic saves that react to channel-count changes: hosts use this
+     *  to distinguish "the operator authored this patch" from "the component
+     *  refreshed it", and a host may attach ownership side effects (WFS-DIY
+     *  latches its fresh-session channel numbering here) that a mere refresh
+     *  must never trigger. May fire more than once per gesture; keep it
+     *  idempotent. */
+    std::function<void()> onBeforeUserPatchEdit;
+
     //==========================================================================
     // Remote navigation / scrolling (for Stream Deck integration)
     //==========================================================================
