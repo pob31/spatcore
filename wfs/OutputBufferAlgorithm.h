@@ -329,11 +329,11 @@ public:
         }
 
         // Notify the analysis thread FIRST, and unconditionally: it drives the
-        // input level meters, and input levels do not depend on there being any
-        // outputs. This used to sit below an early return on empty
-        // outputProcessors, so a session with inputs patched but no outputs yet
-        // — a normal state while setting a rig up, and the state the meters
-        // would be most useful in — showed every input at -200 dB.
+        // Live Source Tamer's per-input detectors, and taming an input does not
+        // depend on there being any outputs. This used to sit below an early
+        // return on empty outputProcessors, so with inputs patched but no
+        // outputs yet — a normal state while setting a rig up — the detectors
+        // never saw a sample and the tamer silently did nothing.
         // sharedInputBuffers are sized from numInputs alone (see prepare), so
         // they are valid here regardless.
         if (inputAnalysisThread)
