@@ -93,6 +93,11 @@ _CONFIG_KEYS = (
 
 _CONFIGURED = False
 
+# Optional config key, defaulted here so the module is importable and
+# derive_schema is safe even if a config never mentions it. configure()
+# overwrites this from the app config when the key is present.
+SUB_INDEX_RULES: list = []
+
 # Compiled in configure() from COORDINATE_SECTION_SUFFIXES.
 _COORD_SUFFIX_RE: re.Pattern[str] | None = None
 
@@ -108,6 +113,12 @@ def configure(config: Any) -> None:
     g = globals()
     for k in _CONFIG_KEYS:
         g[k] = getattr(config, k)
+    # Optional, so a config written against an older core still loads. Rules
+    # attach extra index arguments to rows whose parameter lives deeper than
+    # one channel index can address - a sampler cell, a gradient-map layer, an
+    # ADM axis. Absent means "no such rows", which is what every config said
+    # before this existed.
+    g["SUB_INDEX_RULES"] = getattr(config, "SUB_INDEX_RULES", [])
     _COORD_SUFFIX_RE = re.compile(
         r"\s*\(("
         + "|".join(re.escape(s) for s in COORDINATE_SECTION_SUFFIXES)
@@ -770,6 +781,30 @@ def derive_schema(row: CSVRow, tool_name: str,
                 }
                 required.append(rule["name"])
                 break
+
+    # App-declared sub-index arguments. These are for parameters that live
+    # deeper in the tree than a channel index reaches: one <Input> has 36
+    # sampler cells and 3 gradient layers, one ADM mapping has 3 axes. Without
+    # them the generated tool names a parameter it cannot address, which is how
+    # whole families ended up writing nowhere.
+    #
+    # Rules match on csv_file + an explicit `variables` list rather than a
+    # prefix, because the sets are small, stable, and full of near-misses -
+    # gmLayer0Enabled carries its layer in the NAME and must not get an
+    # argument, while gmLayerBlack must.
+    for rule in SUB_INDEX_RULES:
+        if row.csv_file != rule["csv_file"]:
+            continue
+        if row.variable not in rule["variables"]:
+            continue
+        for arg in rule["args"]:
+            properties[arg["name"]] = {
+                "type": "integer",
+                "minimum": arg["min"], "maximum": arg["max"],
+                "description": arg["description"],
+            }
+            required.append(arg["name"])
+        break
 
     # Sub-index argument if applicable.
     if band:
