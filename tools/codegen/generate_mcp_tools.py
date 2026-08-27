@@ -98,6 +98,21 @@ _CONFIGURED = False
 # overwrites this from the app config when the key is present.
 SUB_INDEX_RULES: list = []
 
+# Optional config keys, defaulted here so the module is importable and every
+# existing config keeps its behaviour.
+#
+# GLOBAL_ROWS_IN_CHANNEL_CSVS: rows that live in a per-channel CSV for editorial
+# reasons but describe ONE global value. Without this they are handed a channel-id
+# argument they cannot use, and the caller has to pass an index that is then
+# ignored - which reads as a bug whichever way you look at it.
+#
+# EMIT_TRANSITION_SECONDS: whether a row whose OSC address accepts a ramp time
+# should advertise `transition_seconds` on its MCP tool too. The CSV column
+# describes the OSC address; an app whose MCP path has no ramper should say
+# False rather than promise interpolation it will not perform.
+GLOBAL_ROWS_IN_CHANNEL_CSVS: list = []
+EMIT_TRANSITION_SECONDS: bool = True
+
 # Compiled in configure() from COORDINATE_SECTION_SUFFIXES.
 _COORD_SUFFIX_RE: re.Pattern[str] | None = None
 
@@ -119,6 +134,9 @@ def configure(config: Any) -> None:
     # ADM axis. Absent means "no such rows", which is what every config said
     # before this existed.
     g["SUB_INDEX_RULES"] = getattr(config, "SUB_INDEX_RULES", [])
+    g["GLOBAL_ROWS_IN_CHANNEL_CSVS"] = getattr(
+        config, "GLOBAL_ROWS_IN_CHANNEL_CSVS", [])
+    g["EMIT_TRANSITION_SECONDS"] = getattr(config, "EMIT_TRANSITION_SECONDS", True)
     _COORD_SUFFIX_RE = re.compile(
         r"\s*\(("
         + "|".join(re.escape(s) for s in COORDINATE_SECTION_SUFFIXES)
@@ -640,7 +658,7 @@ def derive_description(row: CSVRow, csv_namespace: str,
         parts.append(f"Value in {row.unit.strip()}.")
     if row.enum.strip():
         parts.append(f"Enum: {row.enum.strip()}.")
-    if "transition" in row.osc_optional_value.lower():
+    if EMIT_TRANSITION_SECONDS and "transition" in row.osc_optional_value.lower():
         parts.append(
             "Optional `transition_seconds` argument for smooth interpolation."
         )
@@ -678,7 +696,12 @@ def append_tier_suffix(description: str, tier: int) -> str:
 
 
 def is_per_channel(row: CSVRow) -> bool:
-    return row.csv_file in CHANNEL_ID_RANGE
+    if row.csv_file not in CHANNEL_ID_RANGE:
+        return False
+    for rule in GLOBAL_ROWS_IN_CHANNEL_CSVS:
+        if row.csv_file == rule["csv_file"] and row.variable in rule["variables"]:
+            return False
+    return True
 
 
 def coerce_default(default_str: str, type_str: str,
@@ -931,7 +954,7 @@ def derive_schema(row: CSVRow, tool_name: str,
         required.append("value")
 
     # Optional transition_seconds argument.
-    if "transition" in row.osc_optional_value.lower():
+    if EMIT_TRANSITION_SECONDS and "transition" in row.osc_optional_value.lower():
         properties["transition_seconds"] = {
             "type": "number",
             "minimum": 0.0,
