@@ -32,6 +32,12 @@
       8. io/TestSignalGenerator  tone pitch survives prepare()/sample-rate
                                  change; the 500 ms protective ramp; seeded
                                  pink noise is reproducible
+      9. dsp/AcousticTap         the (delay + air absorption + level) cell the
+                                 direct WFS path, the reverb send and the reverb
+                                 return all run: bit-exact degeneracy to a plain
+                                 gain matrix at zero delay / zero damping,
+                                 delay placement from real geometry, and the
+                                 shelf leaving DC alone while cutting HF
 */
 
 // OSCParser.h / OSCSerializer.h use juce::OSC* types but (verbatim-moved,
@@ -50,6 +56,7 @@
 #include "spatcore/rt/RtThreadPriority.h"
 #include "spatcore/gpu/GpuHostWorkPool.h"
 #include "spatcore/dsp/DelayTargetSmoother.h"
+#include "spatcore/dsp/AcousticTap.h"
 #include "spatcore/dsp/BiquadResponse.h"
 #include "spatcore/dsp/OutputEQBiquadFilter.h"
 #include "spatcore/dsp/ReverbBiquadFilter.h"
@@ -2687,6 +2694,325 @@ static void checkStereoReconstruction (spatcore::dsp::StereoDecomposer& d,
             CHECK (slices[(size_t) k][(size_t) n] == 0.0f);
 }
 
+//==============================================================================
+// dsp/AcousticTap - the (smoothed fractional delay + air-absorption shelf +
+// level) cell shared by the direct WFS path, the reverb send (ReverbFeedThread)
+// and the reverb return (ReverbReturnProcessor).
+//==============================================================================
+
+namespace acoustictap_test
+{
+    constexpr int kLineLength = 4096;
+
+    // Deterministic, non-trivial source material.
+    inline float src (int n) noexcept
+    {
+        return 0.37f * std::sin (0.031f * (float) n)
+             + 0.19f * std::sin (0.211f * (float) n + 0.7f);
+    }
+
+    // Write one block into a ring at blockStart, wrapping.
+    inline void writeBlock (std::vector<float>& line, int blockStart,
+                            const std::vector<float>& block)
+    {
+        const int n = (int) block.size();
+        for (int i = 0; i < n; ++i)
+            line[(size_t) ((blockStart + i) % kLineLength)] = block[(size_t) i];
+    }
+}
+
+static void testAcousticTapNullIdentity()
+{
+    using namespace spatcore::dsp;
+    using namespace acoustictap_test;
+
+    // Zero delay and zero damping must degenerate EXACTLY to the scalar matrix
+    // the reverb feed and return used before this cell existed:
+    //     dest[s] += src[s] * level
+    // This is the regression guard for "the rewrite changed nothing at
+    // defaults" - reverbHFdamping defaults to 0.0 dB/m and a co-located source
+    // has zero propagation delay.
+    const int numSamples = 256;
+    const double sr = 48000.0;
+    const float level = 0.6431f;
+
+    AcousticTapCell cell;
+    cell.prepare (sr, (int) (sr * 0.010));
+
+    std::vector<float> line ((size_t) kLineLength, 0.0f);
+    std::int64_t counter = 0;
+    int blockStart = 0;
+
+    for (int block = 0; block < 8; ++block)
+    {
+        std::vector<float> in ((size_t) numSamples);
+        for (int i = 0; i < numSamples; ++i)
+            in[(size_t) i] = src (block * numSamples + i);
+
+        writeBlock (line, blockStart, in);
+
+        std::vector<float> got ((size_t) numSamples, 0.0f);
+
+        processAcousticTap (cell, line.data(), kLineLength, blockStart, counter,
+                            numSamples, 0.0f, 0.0f, level, sr, got.data());
+
+        for (int i = 0; i < numSamples; ++i)
+            CHECK (bitEqualFloat (got[(size_t) i], in[(size_t) i] * level));
+
+        blockStart = (blockStart + numSamples) % kLineLength;
+        counter += numSamples;
+    }
+}
+
+static void testAcousticTapDelayPlacement()
+{
+    using namespace spatcore::dsp;
+    using namespace acoustictap_test;
+
+    // An impulse must come back out delayed by distance / speedOfSound. Uses a
+    // 30 m path, the geometry the send matrix would produce for a source 30 m
+    // from a reverb node: 30 / 343 * 1000 = 87.463 ms.
+    const int numSamples = 512;
+    const double sr = 48000.0;
+    const float distanceM = 30.0f;
+    const float speedOfSound = 343.0f;
+    const float delayMs = (distanceM / speedOfSound) * 1000.0f;
+    const int expectedSamples = (int) ((delayMs / 1000.0f) * (float) sr);   // 4198
+
+    AcousticTapCell cell;
+    cell.prepare (sr, (int) (sr * 0.010));
+
+    // Long enough line for an 87 ms delay at 48 kHz.
+    const int lineLen = 1 << 15;
+    std::vector<float> line ((size_t) lineLen, 0.0f);
+
+    std::int64_t counter = 0;
+    int blockStart = 0;
+    int impulseAt = -1;
+    int foundAt = -1;
+    float peak = 0.0f;
+
+    // The smoother bootstraps on its first observation, so let it settle on
+    // silence for a few blocks before the impulse goes in.
+    const int settleBlocks = 4;
+    const int totalBlocks = 40;
+
+    for (int block = 0; block < totalBlocks; ++block)
+    {
+        std::vector<float> in ((size_t) numSamples, 0.0f);
+        if (block == settleBlocks)
+        {
+            in[0] = 1.0f;
+            impulseAt = block * numSamples;
+        }
+
+        for (int i = 0; i < numSamples; ++i)
+            line[(size_t) ((blockStart + i) % lineLen)] = in[(size_t) i];
+
+        std::vector<float> got ((size_t) numSamples, 0.0f);
+        processAcousticTap (cell, line.data(), lineLen, blockStart, counter,
+                            numSamples, delayMs, 0.0f, 1.0f, sr, got.data());
+
+        for (int i = 0; i < numSamples; ++i)
+        {
+            if (std::fabs (got[(size_t) i]) > peak)
+            {
+                peak = std::fabs (got[(size_t) i]);
+                foundAt = (int) (counter + i);
+            }
+        }
+
+        blockStart = (blockStart + numSamples) % lineLen;
+        counter += numSamples;
+    }
+
+    CHECK (impulseAt >= 0);
+    CHECK (foundAt >= 0);
+    CHECK (peak > 0.4f);   // linear interpolation splits it across two taps at most
+
+    // Within one sample of the geometric delay (the fractional part lands
+    // between two taps, and the box smoother has settled by then).
+    const int measured = foundAt - impulseAt;
+    CHECK (std::abs (measured - expectedSamples) <= 1);
+
+    // And it must NOT be at zero - the whole point is that distance costs time.
+    // 30 m of air is 87.5 ms, so anything under ~4000 samples means the delay
+    // was dropped somewhere.
+    CHECK (measured > 4000);
+}
+
+static void testAcousticTapAirAbsorptionShelf()
+{
+    using namespace spatcore::dsp;
+    using namespace acoustictap_test;
+
+    // The shelf is fixed at 800 Hz / Q 0.3, so a 100 Hz tone should pass
+    // essentially untouched while an 8 kHz tone takes close to the full cut.
+    const double sr = 48000.0;
+    const float shelfDb = -12.0f;
+    const int numSamples = 4096;
+
+    // RMS, not sample peak: at 8 kHz / 48 kHz a sine is only 6 samples per
+    // period, so its sample peak sits well below 1.0 for reasons that have
+    // nothing to do with the filter under test. A sine RMS is 0.7071 at every
+    // frequency, which makes the ratio a clean gain measurement.
+    auto measure = [&] (float freqHz, float hfDb) -> double
+    {
+        AcousticTapCell cell;
+        cell.prepare (sr, (int) (sr * 0.010));
+
+        const int lineLen = 1 << 14;
+        std::vector<float> line ((size_t) lineLen, 0.0f);
+
+        std::int64_t counter = 0;
+        int blockStart = 0;
+        double sumSq = 0.0;
+        int counted = 0;
+
+        const int blocks = 8;
+        for (int block = 0; block < blocks; ++block)
+        {
+            std::vector<float> got ((size_t) numSamples, 0.0f);
+
+            for (int i = 0; i < numSamples; ++i)
+            {
+                const double t = (double) (counter + i) / sr;
+                line[(size_t) ((blockStart + i) % lineLen)] =
+                    (float) std::sin (2.0 * 3.14159265358979 * (double) freqHz * t);
+            }
+
+            processAcousticTap (cell, line.data(), lineLen, blockStart, counter,
+                                numSamples, 0.0f, hfDb, 1.0f, sr, got.data());
+
+            // Ignore the early blocks: filter start-up transient.
+            if (block >= blocks - 2)
+            {
+                for (int i = 0; i < numSamples; ++i)
+                {
+                    const double v = (double) got[(size_t) i];
+                    sumSq += v * v;
+                    ++counted;
+                }
+            }
+
+            blockStart = (blockStart + numSamples) % lineLen;
+            counter += numSamples;
+        }
+
+        return counted > 0 ? std::sqrt (sumSq / (double) counted) : 0.0;
+    };
+
+    const double sineRms = 0.70710678;
+    const double lowRef  = measure (100.0f, 0.0f);
+    const double lowCut  = measure (100.0f, shelfDb);
+    const double highRef = measure (8000.0f, 0.0f);
+    const double highCut = measure (8000.0f, shelfDb);
+
+    // Bypass really is unity at both ends.
+    CHECK (std::fabs (lowRef - sineRms) < 0.01);
+    CHECK (std::fabs (highRef - sineRms) < 0.01);
+
+    // Below the corner: within ~1 dB of untouched.
+    CHECK (lowCut > lowRef * 0.89);
+
+    // Well above the corner: close to the full -12 dB shelf.
+    const double target = std::pow (10.0, (double) shelfDb / 20.0);   // 0.2512
+    CHECK (highCut < highRef * target * 1.25);
+    CHECK (highCut > highRef * target * 0.80);
+
+    // And a zero-damping cell must be bit-exact unity, not "nearly" unity.
+    {
+        AcousticTapCell cell;
+        cell.prepare (sr, (int) (sr * 0.010));
+        std::vector<float> line ((size_t) kLineLength, 0.0f);
+        std::vector<float> in ((size_t) 64), got ((size_t) 64, 0.0f);
+        for (int i = 0; i < 64; ++i)
+            in[(size_t) i] = src (i);
+        writeBlock (line, 0, in);
+        processAcousticTap (cell, line.data(), kLineLength, 0, 0, 64,
+                            0.0f, 0.0f, 1.0f, sr, got.data());
+        for (int i = 0; i < 64; ++i)
+            CHECK (bitEqualFloat (got[(size_t) i], in[(size_t) i]));
+    }
+}
+
+static void testAcousticTapAccumulatesAndClamps()
+{
+    using namespace spatcore::dsp;
+    using namespace acoustictap_test;
+
+    const double sr = 48000.0;
+    const int numSamples = 128;
+
+    // Accumulation, not assignment: the reverb return sums every node into the
+    // same speaker buffer, so a tap must add to what is already there.
+    {
+        AcousticTapCell a, b;
+        a.prepare (sr, 480);
+        b.prepare (sr, 480);
+
+        std::vector<float> lineA ((size_t) kLineLength, 0.0f);
+        std::vector<float> lineB ((size_t) kLineLength, 0.0f);
+        std::vector<float> inA ((size_t) numSamples), inB ((size_t) numSamples);
+        for (int i = 0; i < numSamples; ++i)
+        {
+            inA[(size_t) i] = src (i);
+            inB[(size_t) i] = src (i + 1000);
+        }
+        writeBlock (lineA, 0, inA);
+        writeBlock (lineB, 0, inB);
+
+        std::vector<float> got ((size_t) numSamples, 0.0f);
+        processAcousticTap (a, lineA.data(), kLineLength, 0, 0, numSamples,
+                            0.0f, 0.0f, 0.5f, sr, got.data());
+        processAcousticTap (b, lineB.data(), kLineLength, 0, 0, numSamples,
+                            0.0f, 0.0f, 0.25f, sr, got.data());
+
+        for (int i = 0; i < numSamples; ++i)
+            CHECK (bitEqualFloat (got[(size_t) i],
+                                  inA[(size_t) i] * 0.5f + inB[(size_t) i] * 0.25f));
+    }
+
+    // A delay longer than the line, a negative delay and a NaN must all clamp
+    // rather than read out of bounds. (The line is 4096 samples = 85 ms at
+    // 48 kHz; 10 000 ms is far past it.)
+    const float badDelays[3] = { 10000.0f, -50.0f,
+                                 std::numeric_limits<float>::quiet_NaN() };
+    for (float badDelayMs : badDelays)
+    {
+        AcousticTapCell cell;
+        cell.prepare (sr, 480);
+        std::vector<float> line ((size_t) kLineLength, 0.25f);
+        std::vector<float> got ((size_t) numSamples, 0.0f);
+
+        processAcousticTap (cell, line.data(), kLineLength, 0, 0, numSamples,
+                            badDelayMs, 0.0f, 1.0f, sr, got.data());
+
+        for (int i = 0; i < numSamples; ++i)
+            CHECK (std::isfinite (got[(size_t) i]));
+    }
+
+    // Degenerate arguments are no-ops, not crashes.
+    {
+        AcousticTapCell cell;
+        cell.prepare (sr, 480);
+        std::vector<float> line ((size_t) kLineLength, 1.0f);
+        std::vector<float> got ((size_t) numSamples, 7.0f);
+
+        processAcousticTap (cell, nullptr, kLineLength, 0, 0, numSamples,
+                            0.0f, 0.0f, 1.0f, sr, got.data());
+        processAcousticTap (cell, line.data(), kLineLength, 0, 0, numSamples,
+                            0.0f, 0.0f, 1.0f, sr, nullptr);
+        processAcousticTap (cell, line.data(), 1, 0, 0, numSamples,
+                            0.0f, 0.0f, 1.0f, sr, got.data());
+        processAcousticTap (cell, line.data(), kLineLength, 0, 0, 0,
+                            0.0f, 0.0f, 1.0f, sr, got.data());
+
+        for (int i = 0; i < numSamples; ++i)
+            CHECK (got[(size_t) i] == 7.0f);
+    }
+}
+
 static void testStereoPassThroughIdentity()
 {
     using namespace spatcore::dsp;
@@ -2791,6 +3117,10 @@ int main()
         testStereoReconstructionInvariant();
         testStereoInactiveSlotsCleared();
         testStereoConfigChangeStability();
+        testAcousticTapNullIdentity();
+        testAcousticTapDelayPlacement();
+        testAcousticTapAirAbsorptionShelf();
+        testAcousticTapAccumulatesAndClamps();
         testLockFreeRingBuffer();
         testDelayTargetSmootherDeterminism();
         testRtSnapshot();

@@ -73,6 +73,7 @@
 // variants + pre/post processors)
 #include "reverb/ReverbEngine.h"
 #include "reverb/ReverbFeedThread.h"
+#include "reverb/ReverbReturnProcessor.h"
 
 // gpu/ - host-facing surface (interfaces, device manager, plugin factory,
 // pipeline, host state/configs, compile-time backend selectors)
