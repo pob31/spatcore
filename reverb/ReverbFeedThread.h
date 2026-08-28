@@ -2,17 +2,30 @@
 
 #include <juce_audio_basics/juce_audio_basics.h>
 #include "../rt/SharedInputRingBuffer.h"
+#include "../rt/AudioParallelFor.h"
+#include "ReverbSendMatrix.h"
 #include "ReverbEngine.h"
 #include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <thread>
 #include <vector>
 
 namespace spatcore::reverb {
 
 /**
     Dedicated thread for computing reverb feed sums from input audio.
-    Reads from shared input ring buffers, computes weighted input->reverb sums,
-    handles downsampling, and pushes to ReverbEngine node inputs.
+    Reads from shared input ring buffers, computes the input->reverb send for
+    every (source, node) pair, handles downsampling, and pushes to ReverbEngine
+    node inputs.
+
+    Each send is a full acoustic path, not a bare gain: the source is read from
+    a per-source delay line at the propagation delay the calculation engine
+    derived from the geometry, filtered by an air-absorption high shelf, then
+    scaled by the send level. That mirrors the direct WFS path
+    (spatcore/wfs/InputBufferProcessor.h), which has always done all three.
+    The computation itself lives in ReverbSendMatrix so it can be tested
+    without a thread; this class is the plumbing around it.
 
     Runs one block behind the audio callback (2.67ms at 256/96kHz — imperceptible for reverb).
 */
@@ -20,19 +33,30 @@ class ReverbFeedThread : public juce::Thread
 {
 public:
     ReverbFeedThread() : juce::Thread("ReverbFeed") {}
-    ~ReverbFeedThread() override { stopThread(2000); }
+    ~ReverbFeedThread() override { stopThread(2000); feedPool.shutdown(); }
 
-    /** Optional: realtime workgroup to (re)join from the worker thread (macOS). */
+    /** Optional: realtime workgroup to (re)join from the worker thread (macOS).
+        Set this BEFORE prepare() — the send-path worker pool joins the same
+        workgroup and is created there. */
     void setWorkgroupCoordinator (AudioWorkgroupCoordinator* c) { workgroupCoordinator = c; }
 
+    /** Wire up the send path.
+
+        @param reverbLevelsPtr   linear send gain,   [input * calcReverbStride + node]
+        @param reverbDelaysPtr   send delay in ms,   same indexing (may be nullptr)
+        @param reverbHFPtr       send HF shelf dB,   same indexing (may be nullptr)
+    */
     void prepare(const std::vector<std::unique_ptr<SharedInputRingBuffer>>& sharedInputs,
                  ReverbEngine* engine,
                  const float* reverbLevelsPtr,
+                 const float* reverbDelaysPtr,
+                 const float* reverbHFPtr,
                  int calcReverbStride,
                  int numInputCh,
                  int numReverbNodes,
                  int blockSize,
-                 int srRatio)
+                 int srRatio,
+                 double newSampleRate)
     {
         inputBuffers.clear();
         for (auto& buf : sharedInputs)
@@ -40,6 +64,8 @@ public:
 
         reverbEngine = engine;
         reverbLevels = reverbLevelsPtr;
+        reverbDelays = reverbDelaysPtr;
+        reverbHF = reverbHFPtr;
         reverbStride = calcReverbStride;
         numInputs = numInputCh;
         numRevs = numReverbNodes;
@@ -52,9 +78,33 @@ public:
         inputBlocks.setSize(numInputCh, blockSize);
 
         feedBuffer.setSize(numReverbNodes, blockSize);
+        feedRowPtrs.assign((size_t)juce::jmax(0, numReverbNodes), nullptr);   // never grows in run()
 
         int dsBlockSize = (srRatio > 1) ? (blockSize / srRatio) : blockSize;
         downsampleBuffer.setSize(numReverbNodes, dsBlockSize);
+
+        // Delay lines + tap cells, at DEVICE rate: the tap runs before the
+        // decimation so its fractional resolution is the full one.
+        sendMatrix.prepare(newSampleRate, numInputCh, numReverbNodes);
+
+        // Node-parallel send computation. Each worker owns one node, so it
+        // writes one feedBuffer row and touches only its own cell column; the
+        // delay lines are written once before the sweep and read-only during it.
+        // Small configurations stay sequential — the fork/join costs more than
+        // the work saved.
+        {
+            feedPool.shutdown();
+            int workers = 0;
+            const size_t cells = (size_t)juce::jmax(0, numInputCh) * (size_t)juce::jmax(0, numReverbNodes);
+            if (cells >= 256)
+            {
+                int hwThreads = static_cast<int>(std::thread::hardware_concurrency());
+                workers = juce::jmin(hwThreads / 2 - 1, numReverbNodes - 1);
+                workers = juce::jlimit(0, 3, workers);
+            }
+            double blockMs = newSampleRate > 0.0 ? (blockSize / newSampleRate) * 1000.0 : 0.0;
+            feedPool.prepare(workers, blockMs, blockMs, workgroupCoordinator);
+        }
     }
 
     void notifyInputAvailable()
@@ -68,15 +118,18 @@ public:
         isMuted.store(muted, std::memory_order_relaxed);
     }
 
-    void updateReverbLevels(const float* newLevelsPtr, int newStride, int newNumReverbs)
+    void updateReverbMatrices(const float* newLevelsPtr, const float* newDelaysPtr,
+                              const float* newHFPtr, int newStride, int newNumReverbs)
     {
-        // Publish the triplet under a brief SpinLock so the worker thread
-        // can never observe a torn (pointer, stride, count) update. Matches
-        // the pattern used for pendingPreParams / pendingPostParams in
+        // Publish the tuple under a brief SpinLock so the worker thread can
+        // never observe a torn (pointers, stride, count) update. Matches the
+        // pattern used for pendingPreParams / pendingPostParams in
         // ReverbEngine. The worker snapshots once per batch in run(); the
         // hot inner loop never touches this lock.
         juce::SpinLock::ScopedLockType lock (matrixLock);
         reverbLevels = newLevelsPtr;
+        reverbDelays = newDelaysPtr;
+        reverbHF = newHFPtr;
         reverbStride = newStride;
         numRevs = newNumReverbs;
     }
@@ -120,21 +173,26 @@ private:
             }
             dataReady.store(false, std::memory_order_relaxed);
 
-            // Snapshot the (levels, stride, numRevs) triplet once per batch under
-            // the matrix lock. The rest of this batch uses only the locals, so
-            // the inner per-sample / per-input / per-node loop runs with zero
-            // synchronisation. A matrix update via updateReverbLevels() becomes
-            // visible on the *next* batch — one block of stale levels is
-            // inaudible for reverb send routing (matrix updates happen at
-            // user-interaction cadence, not per block).
+            // Snapshot the (levels, delays, HF, stride, numRevs) tuple once per
+            // batch under the matrix lock. The rest of this batch uses only the
+            // locals, so the inner per-sample / per-input / per-node loop runs
+            // with zero synchronisation. A matrix update via
+            // updateReverbMatrices() becomes visible on the *next* batch — one
+            // block of stale values is inaudible for reverb send routing (matrix
+            // updates happen at user-interaction cadence, not per block), and
+            // the delay smoothers absorb any step.
             const float* levelsSnap;
+            const float* delaysSnap;
+            const float* hfSnap;
             int strideSnap;
             int numRevsSnap;
             {
                 juce::SpinLock::ScopedLockType lock (matrixLock);
                 levelsSnap  = reverbLevels;
+                delaysSnap  = reverbDelays;
+                hfSnap      = reverbHF;
                 strideSnap  = reverbStride;
-                numRevsSnap = numRevs;
+                numRevsSnap = juce::jmin (numRevs, sendMatrix.getPreparedNodes());
             }
 
             if (reverbEngine == nullptr || numRevsSnap <= 0 || numInputs <= 0)
@@ -159,6 +217,10 @@ private:
             for (int ch = 0; ch < numInputs && ch < (int)inputBuffers.size(); ++ch)
                 inputBuffers[ch]->readWithPosition(readPositions[ch], inputBlocks.getWritePointer(ch), numSamples);
 
+            // Publish this batch into the per-source delay lines. Done even when
+            // muted, so unmuting does not replay stale history.
+            sendMatrix.writeInputs(inputBlocks, numSamples);
+
             int pushSamples = numSamples / reverbSRRatio;
 
             if (isMuted.load(std::memory_order_relaxed))
@@ -172,25 +234,26 @@ private:
             }
             else
             {
-                // Compute reverb feeds: for each node, sum weighted input contributions
-                feedBuffer.clear();
+                // Resolve the feed-row write pointers on THIS thread:
+                // AudioBuffer::getWritePointer clears the buffer's isClear flag
+                // as a side effect, so calling it from N workers at once is a
+                // data race. Each worker then owns one row pointer.
+                for (int r = 0; r < numRevsSnap; ++r)
+                    feedRowPtrs[(size_t)r] = feedBuffer.getWritePointer(r);
 
+                // Compute the sends. One node per work item: delay-tap, shelf
+                // and level for every source feeding it.
+                feedPool.parallelFor(numRevsSnap, [&](int revIdx)
+                {
+                    sendMatrix.computeNodeFeed(feedRowPtrs[(size_t)revIdx], numSamples, revIdx,
+                                               levelsSnap, delaysSnap, hfSnap, strideSnap);
+                });
+
+                // Downsample and push (serial: pushNodeInput notifies the engine)
                 for (int revIdx = 0; revIdx < numRevsSnap; ++revIdx)
                 {
-                    float* feedData = feedBuffer.getWritePointer(revIdx);
+                    float* feedData = feedRowPtrs[(size_t)revIdx];
 
-                    for (int inIdx = 0; inIdx < numInputs; ++inIdx)
-                    {
-                        float feedLevel = levelsSnap[inIdx * strideSnap + revIdx];
-
-                        if (feedLevel > 0.0001f)
-                        {
-                            const float* inputData = inputBlocks.getReadPointer(inIdx);
-                            juce::FloatVectorOperations::addWithMultiply(feedData, inputData, feedLevel, numSamples);
-                        }
-                    }
-
-                    // Downsample and push
                     if (reverbSRRatio > 1)
                     {
                         float* dsData = downsampleBuffer.getWritePointer(revIdx);
@@ -211,6 +274,8 @@ private:
                 }
             }
 
+            sendMatrix.advance(numSamples);
+
             lastBatchUs.store(std::chrono::duration<float, std::micro>(
                                   std::chrono::steady_clock::now() - batchStart).count(),
                               std::memory_order_relaxed);
@@ -223,12 +288,14 @@ private:
     ReverbEngine* reverbEngine = nullptr;
     AudioWorkgroupCoordinator* workgroupCoordinator = nullptr;
 
-    // (reverbLevels, reverbStride, numRevs) form a triplet published by
-    // updateReverbLevels() from the message thread and consumed by run() on
-    // the worker thread. matrixLock serialises publication so the worker
-    // never observes a torn triplet. See updateReverbLevels() and run() for
-    // the read-snapshot pattern.
+    // (reverbLevels, reverbDelays, reverbHF, reverbStride, numRevs) form a
+    // tuple published by updateReverbMatrices() from the message thread and
+    // consumed by run() on the worker thread. matrixLock serialises publication
+    // so the worker never observes a torn tuple. See updateReverbMatrices() and
+    // run() for the read-snapshot pattern.
     const float* reverbLevels = nullptr;
+    const float* reverbDelays = nullptr;
+    const float* reverbHF = nullptr;
     int reverbStride = 0;
     int numRevs = 0;
     juce::SpinLock matrixLock;
@@ -245,7 +312,11 @@ private:
 
     juce::AudioBuffer<float> inputBlocks;      // numInputs channels, one block each
     juce::AudioBuffer<float> feedBuffer;       // numReverbs channels, feed sums
+    std::vector<float*> feedRowPtrs;           // resolved per batch, feed thread only
     juce::AudioBuffer<float> downsampleBuffer;
+
+    ReverbSendMatrix sendMatrix;               // the actual send computation
+    AudioParallelFor feedPool;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(ReverbFeedThread)
 };
