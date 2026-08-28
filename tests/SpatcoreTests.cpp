@@ -38,6 +38,13 @@
                                  gain matrix at zero delay / zero damping,
                                  delay placement from real geometry, and the
                                  shelf leaving DC alone while cutting HF
+     10. reverb/ReverbReturnProcessor  node -> speaker distribution: the matrix
+                                 stride (engine max-channel) is honoured
+                                 independently of the cell stride (live output
+                                 count), per-output delay really is per-output,
+                                 the mix ACCUMULATES onto the direct sound
+                                 already in the buffer, and skipBlock keeps the
+                                 write head moving while post-muted
 */
 
 // OSCParser.h / OSCSerializer.h use juce::OSC* types but (verbatim-moved,
@@ -57,6 +64,7 @@
 #include "spatcore/gpu/GpuHostWorkPool.h"
 #include "spatcore/dsp/DelayTargetSmoother.h"
 #include "spatcore/dsp/AcousticTap.h"
+#include "spatcore/reverb/ReverbReturnProcessor.h"
 #include "spatcore/dsp/BiquadResponse.h"
 #include "spatcore/dsp/OutputEQBiquadFilter.h"
 #include "spatcore/dsp/ReverbBiquadFilter.h"
@@ -3013,6 +3021,306 @@ static void testAcousticTapAccumulatesAndClamps()
     }
 }
 
+//==============================================================================
+// reverb/ReverbReturnProcessor - node -> speaker distribution.
+//
+// The trap this pins down: the calculation engine indexes its return matrices
+// with the ENGINE stride (max reverb/output channels), while the processor
+// indexes its own tap cells with the LIVE output count. Those two are usually
+// equal on a dev box and never equal on a real rig, so a test that uses one
+// number for both proves nothing.
+//==============================================================================
+
+static void testAcousticTapFastPathMatchesGeneral()
+{
+    using namespace spatcore::dsp;
+    using namespace acoustictap_test;
+
+    // processAcousticTap has two loops: a run-walking one for a settled delay
+    // and a per-sample general one while the delay is moving. The general loop
+    // is the oracle: for identical inputs and identical cell state, a cell
+    // that is allowed the fast path must produce what a cell that is not
+    // would have - at every sample, across every crossover in both directions.
+    //
+    // The trajectory holds at FRACTIONAL delays on purpose (2.95 ms = 141.6
+    // samples), because an off-by-one in the run-walker's read position is
+    // invisible at a whole-sample delay and was exactly the bug this test was
+    // written to catch.
+    const double sr = 48000.0;
+    const int numSamples = 128;
+    const int lineLen = 1 << 14;
+
+    for (float hfDb : { 0.0f, -6.0f })
+    {
+        AcousticTapCell fast, ref;
+        fast.prepare (sr, (int) (sr * 0.010));
+        ref.prepare  (sr, (int) (sr * 0.010));
+
+        std::vector<float> line ((size_t) lineLen, 0.0f);
+        std::int64_t counter = 0;
+        int blockStart = 0;
+
+        double maxDiff = 0.0;
+        int steadyBlocks = 0, movingBlocks = 0;
+        float peak = 0.0f;
+
+        const int totalBlocks = 240;
+        for (int block = 0; block < totalBlocks; ++block)
+        {
+            for (int i = 0; i < numSamples; ++i)
+            {
+                const double t = (double) (counter + i) / sr;
+                line[(size_t) ((blockStart + i) % lineLen)] =
+                    (float) (0.5 * std::sin (2.0 * 3.14159265358979 * 220.0 * t)
+                           + 0.2 * std::sin (2.0 * 3.14159265358979 * 3100.0 * t));
+            }
+
+            // Move for 12 blocks, hold for 28, alternating between two
+            // fractional endpoints. Long holds so the smoother actually
+            // settles (it takes W + W/2 samples after the last change).
+            const int cycle = block % 80;
+            float delayMs;
+            if (cycle < 12)       delayMs = 2.95f + 0.0125f * (float) cycle;    // 2.95 -> 3.0875
+            else if (cycle < 40)  delayMs = 2.95f + 0.0125f * 11.0f;
+            else if (cycle < 52)  delayMs = 3.0875f - 0.0125f * (float) (cycle - 40);
+            else                  delayMs = 3.0875f - 0.0125f * 11.0f;         // 2.95
+
+            std::vector<float> a ((size_t) numSamples, 0.0f), b ((size_t) numSamples, 0.0f);
+            processAcousticTap (fast, line.data(), lineLen, blockStart, counter,
+                                numSamples, delayMs, hfDb, 0.8f, sr, a.data(), true);
+            processAcousticTap (ref,  line.data(), lineLen, blockStart, counter,
+                                numSamples, delayMs, hfDb, 0.8f, sr, b.data(), false);
+
+            float steady = 0.0f;
+            if (fast.smoother.isSteadyFrom (counter, steady)) ++steadyBlocks; else ++movingBlocks;
+
+            if (block >= 8)
+            {
+                for (int i = 0; i < numSamples; ++i)
+                {
+                    maxDiff = std::fmax (maxDiff, std::fabs ((double) a[(size_t) i] - (double) b[(size_t) i]));
+                    peak = std::fmax (peak, std::fabs (a[(size_t) i]));
+                }
+            }
+
+            blockStart = (blockStart + numSamples) % lineLen;
+            counter += numSamples;
+        }
+
+        // Both paths must actually have run, or the comparison is vacuous.
+        CHECK (steadyBlocks > 40);
+        CHECK (movingBlocks > 20);
+        CHECK (peak > 0.3f);
+
+        // Not bit-equal by construction: the general loop recomputes
+        // (blockStart + s - delay) per sample and its fractional part rounds
+        // differently as s crosses a power of two, while the run-walker fixes
+        // it once. That is one ulp of read position, ~1e-5 of signal. An
+        // off-by-one sample is ~1e-2 here and was caught at 0.017.
+        CHECK (maxDiff < 1.0e-4);
+    }
+}
+
+static void testReverbReturnProcessorMatrixStride()
+{
+    using namespace spatcore::reverb;
+
+    const double sr = 48000.0;
+    const int numSamples = 256;
+    const int nodes = 2;
+    const int outs = 3;
+    const int stride = 16;          // engine max-output stride, deliberately > outs
+
+    ReverbReturnProcessor proc;
+    proc.prepare (sr, numSamples, nodes, outs);
+    CHECK (proc.isPrepared());
+    CHECK (proc.getPreparedNodes() == nodes);
+    CHECK (proc.getPreparedOutputs() == outs);
+
+    // Node 0 -> output 0 only; node 1 -> output 2 only. Output 1 gets nothing.
+    std::vector<float> levels ((size_t) (nodes * stride), 0.0f);
+    std::vector<float> delays ((size_t) (nodes * stride), 0.0f);
+    std::vector<float> hf     ((size_t) (nodes * stride), 0.0f);
+    levels[(size_t) (0 * stride + 0)] = 0.5f;
+    levels[(size_t) (1 * stride + 2)] = 0.25f;
+
+    juce::AudioBuffer<float> out (outs, numSamples);
+    out.clear();
+
+    std::vector<float> wet0 ((size_t) numSamples), wet1 ((size_t) numSamples);
+    for (int i = 0; i < numSamples; ++i)
+    {
+        wet0[(size_t) i] = 0.31f * std::sin (0.05f * (float) i);
+        wet1[(size_t) i] = 0.17f * std::sin (0.11f * (float) i + 1.1f);
+    }
+
+    proc.pushNodeReturn (0, wet0.data(), numSamples);
+    proc.pushNodeReturn (1, wet1.data(), numSamples);
+    proc.mixToOutputs (out, 0, numSamples, nodes, outs,
+                       levels.data(), delays.data(), hf.data(), stride);
+
+    for (int i = 0; i < numSamples; ++i)
+    {
+        CHECK (bitEqualFloat (out.getSample (0, i), wet0[(size_t) i] * 0.5f));
+        CHECK (out.getSample (1, i) == 0.0f);
+        CHECK (bitEqualFloat (out.getSample (2, i), wet1[(size_t) i] * 0.25f));
+    }
+}
+
+static void testReverbReturnProcessorAccumulatesOntoDirect()
+{
+    using namespace spatcore::reverb;
+
+    // The return mixes into a speaker buffer the WFS renderer has ALREADY
+    // written. Overwriting instead of accumulating would delete the dry sound,
+    // which is the loudest possible way to get this wrong.
+    const double sr = 48000.0;
+    const int numSamples = 128;
+    const int nodes = 2;
+    const int outs = 2;
+    const int stride = outs;
+
+    ReverbReturnProcessor proc;
+    proc.prepare (sr, numSamples, nodes, outs);
+
+    std::vector<float> levels ((size_t) (nodes * stride), 0.0f);
+    levels[(size_t) (0 * stride + 0)] = 1.0f;
+    levels[(size_t) (1 * stride + 0)] = 1.0f;   // both nodes into output 0
+
+    juce::AudioBuffer<float> out (outs, numSamples);
+    std::vector<float> direct ((size_t) numSamples);
+    for (int i = 0; i < numSamples; ++i)
+    {
+        direct[(size_t) i] = 0.4f * std::sin (0.02f * (float) i);
+        out.setSample (0, i, direct[(size_t) i]);
+        out.setSample (1, i, 0.0f);
+    }
+
+    std::vector<float> wet ((size_t) numSamples, 0.125f);
+    proc.pushNodeReturn (0, wet.data(), numSamples);
+    proc.pushNodeReturn (1, wet.data(), numSamples);
+    proc.mixToOutputs (out, 0, numSamples, nodes, outs,
+                       levels.data(), nullptr, nullptr, stride);
+
+    // Same association order the two accumulating taps use - (a + b) + c is not
+    // bit-identical to a + (b + c) in float, and the point here is accumulation
+    // semantics, not a claim about summation order.
+    for (int i = 0; i < numSamples; ++i)
+        CHECK (bitEqualFloat (out.getSample (0, i),
+                              (direct[(size_t) i] + 0.125f) + 0.125f));
+}
+
+static void testReverbReturnProcessorPerOutputDelay()
+{
+    using namespace spatcore::reverb;
+
+    // Two speakers at different distances from one node: the far one must get
+    // the wet signal LATER, and by the amount the matrix asked for.
+    const double sr = 48000.0;
+    const int numSamples = 256;
+    const int nodes = 1;
+    const int outs = 2;
+    const int stride = outs;
+    const float farDelayMs = 20.0f;
+    const int farDelaySamples = (int) ((farDelayMs / 1000.0f) * (float) sr);   // 960
+
+    ReverbReturnProcessor proc;
+    proc.prepare (sr, numSamples, nodes, outs);
+
+    std::vector<float> levels ((size_t) (nodes * stride), 1.0f);
+    std::vector<float> delays ((size_t) (nodes * stride), 0.0f);
+    delays[(size_t) (0 * stride + 1)] = farDelayMs;    // output 1 is the far one
+
+    int nearAt = -1, farAt = -1;
+    float nearPeak = 0.0f, farPeak = 0.0f;
+    int impulseAt = -1;
+
+    const int settleBlocks = 4;
+    const int totalBlocks = 24;
+
+    for (int block = 0; block < totalBlocks; ++block)
+    {
+        std::vector<float> wet ((size_t) numSamples, 0.0f);
+        if (block == settleBlocks)
+        {
+            wet[0] = 1.0f;
+            impulseAt = block * numSamples;
+        }
+
+        juce::AudioBuffer<float> out (outs, numSamples);
+        out.clear();
+
+        proc.pushNodeReturn (0, wet.data(), numSamples);
+        proc.mixToOutputs (out, 0, numSamples, nodes, outs,
+                           levels.data(), delays.data(), nullptr, stride);
+
+        for (int i = 0; i < numSamples; ++i)
+        {
+            const float a = std::fabs (out.getSample (0, i));
+            if (a > nearPeak) { nearPeak = a; nearAt = block * numSamples + i; }
+
+            const float b = std::fabs (out.getSample (1, i));
+            if (b > farPeak) { farPeak = b; farAt = block * numSamples + i; }
+        }
+    }
+
+    CHECK (impulseAt >= 0);
+    CHECK (nearPeak > 0.9f);
+    CHECK (farPeak > 0.4f);
+    CHECK (nearAt == impulseAt);                                  // zero delay: same sample
+    CHECK (std::abs ((farAt - impulseAt) - farDelaySamples) <= 1);
+    CHECK (farAt > nearAt);
+}
+
+static void testReverbReturnProcessorSkipBlockAdvances()
+{
+    using namespace spatcore::reverb;
+
+    // While post-muted the callback calls skipBlock instead of push+mix. If it
+    // did not advance the write head, the next real block would land on top of
+    // the last one and the delay line would stop being a timeline.
+    const double sr = 48000.0;
+    const int numSamples = 64;
+    const int nodes = 1;
+    const int outs = 1;
+    const int stride = 1;
+    const float delayMs = (float) (numSamples * 1000.0 / sr);   // exactly one block
+
+    ReverbReturnProcessor proc;
+    proc.prepare (sr, numSamples, nodes, outs);
+
+    std::vector<float> levels ((size_t) 1, 1.0f);
+    std::vector<float> delays ((size_t) 1, delayMs);
+
+    // Block 0: real audio. Block 1: muted (skipBlock). Block 2: silence pushed.
+    // With a one-block delay, block 1's OUTPUT would be block 0's audio - but
+    // block 1 is muted so nothing is mixed. Block 2 taps block 1, which
+    // skipBlock filled with silence. If skipBlock had not advanced the head,
+    // block 2 would tap block 0 and the audio would reappear after the mute.
+    std::vector<float> tone ((size_t) numSamples);
+    for (int i = 0; i < numSamples; ++i)
+        tone[(size_t) i] = 0.5f + 0.1f * (float) i;
+
+    juce::AudioBuffer<float> out (outs, numSamples);
+
+    out.clear();
+    proc.pushNodeReturn (0, tone.data(), numSamples);
+    proc.mixToOutputs (out, 0, numSamples, nodes, outs,
+                       levels.data(), delays.data(), nullptr, stride);
+
+    proc.skipBlock (numSamples);                       // muted block
+
+    out.clear();
+    std::vector<float> silence ((size_t) numSamples, 0.0f);
+    proc.pushNodeReturn (0, silence.data(), numSamples);
+    proc.mixToOutputs (out, 0, numSamples, nodes, outs,
+                       levels.data(), delays.data(), nullptr, stride);
+
+    // Tapping one block back reaches the skipped (silent) block, not the tone.
+    for (int i = 0; i < numSamples; ++i)
+        CHECK (std::fabs (out.getSample (0, i)) < 1.0e-6f);
+}
+
 static void testStereoPassThroughIdentity()
 {
     using namespace spatcore::dsp;
@@ -3121,6 +3429,11 @@ int main()
         testAcousticTapDelayPlacement();
         testAcousticTapAirAbsorptionShelf();
         testAcousticTapAccumulatesAndClamps();
+        testAcousticTapFastPathMatchesGeneral();
+        testReverbReturnProcessorMatrixStride();
+        testReverbReturnProcessorAccumulatesOntoDirect();
+        testReverbReturnProcessorPerOutputDelay();
+        testReverbReturnProcessorSkipBlockAdvances();
         testLockFreeRingBuffer();
         testDelayTargetSmootherDeterminism();
         testRtSnapshot();

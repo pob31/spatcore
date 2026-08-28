@@ -196,6 +196,35 @@ public:
         return { evaluateSmoothed (sampleIndex), 1.0f };
     }
 
+    /** True when every sample from `sampleIndex` onward evaluates to the SAME
+        delay with unity gain, and writes it to `delayOut`.
+
+        This is the steady state a static source sits in between the 50 Hz
+        matrix updates - which is most blocks, most of the time. It lets a
+        caller replace the per-sample smoothedAt() call with a fixed fractional
+        read it can walk contiguously and vectorise. Conservative by
+        construction: it only reports steady once the C1 transition zone AND the
+        W/2-delayed linear ramp have both finished, so a true answer means the
+        slow path would have produced exactly this constant anyway.
+
+        Only the block's FIRST sample needs testing: tau only increases within a
+        block, and both conditions are monotonic in tau. */
+    bool isSteadyFrom (std::int64_t sampleIndex, float& delayOut) const noexcept
+    {
+        if (! initialized_ || teleportStart_ >= 0)
+            return false;
+
+        const std::int64_t mu = sampleIndex - rampStartSample_;
+        if (mu < static_cast<std::int64_t> (windowSamples_))
+            return false;                        // still inside the transition zone
+
+        if (mu - static_cast<std::int64_t> (halfWindow_) < rampDurationSamples_)
+            return false;                        // delayed linear ramp still moving
+
+        delayOut = rampEndValue_;
+        return true;
+    }
+
     bool isInitialized() const noexcept { return initialized_; }
 
 private:

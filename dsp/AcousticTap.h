@@ -60,11 +60,21 @@ struct AcousticTapCell
     @param level            linear send/return gain
     @param sampleRate       device sample rate
     @param dest             accumulation target, numSamples long
+    @param allowFastPath    tests pass false to force the general loop and use
+                            it as the oracle for the steady-state path
 
     A cell whose `hfGainDb` is effectively zero skips the biquad entirely rather
     than running it at unity. That keeps the default case cheap AND keeps it
     sample-identical to the plain `dest[s] += src[s] * level` matrix this
     replaced, which is what the null test asserts.
+
+    Two loops, one meaning: when the smoothed delay has settled to a constant
+    (a static source between 50 Hz matrix updates - most blocks), the ring is
+    walked in contiguous runs at a fixed fractional offset, which vectorises and
+    collapses to a plain MAC at a whole-sample delay with no shelf. The general
+    loop runs while the delay is moving or a teleport envelope is open.
+    `DelayTargetSmoother::isSteadyFrom` is conservative, so the two paths agree
+    sample for sample and there is no seam to hear at the crossover.
 */
 inline void processAcousticTap (AcousticTapCell& cell,
                                 const float* delayLine,
@@ -76,7 +86,8 @@ inline void processAcousticTap (AcousticTapCell& cell,
                                 float hfGainDb,
                                 float level,
                                 double sampleRate,
-                                float* dest)
+                                float* dest,
+                                bool allowFastPath = true)
 {
     if (delayLine == nullptr || dest == nullptr || delayLineLength <= 1 || numSamples <= 0)
         return;
@@ -105,6 +116,106 @@ inline void processAcousticTap (AcousticTapCell& cell,
         cell.shelfEngaged = false;
     }
 
+    // ---- Steady state: constant delay, unity gain, no teleport in flight ----
+    //
+    // A static source between 50 Hz matrix updates sits here for most blocks,
+    // and it is worth a lot: the general loop below spends most of its time in
+    // the per-sample smoothedAt() call and the two modulos, none of which
+    // depend on the sample when the delay is not moving. Walking the ring in
+    // contiguous runs instead lets the compiler vectorise, and at a whole-sample
+    // delay with no shelf it collapses to a plain multiply-accumulate.
+    //
+    // isSteadyFrom() is conservative: a true answer means the general path
+    // would have produced exactly this constant, so the two agree sample for
+    // sample and there is no fast/slow seam to hear.
+    float steadyDelay = 0.0f;
+    if (allowFastPath && cell.smoother.isSteadyFrom (sampleCounter, steadyDelay))
+    {
+        // Read position of the block's first sample, in the SAME floor
+        // convention as the general loop: pos = blockStart - delay, wrapped
+        // into [0, len); p is its integer part and frac the weight on p+1.
+        // A delay of 141.6 therefore reads 0.6*x[n-142] + 0.4*x[n-141] - the
+        // sample 141.6 back, not the one 140.4 back.
+        float pos0 = static_cast<float> (blockStartPos) - steadyDelay;
+        while (pos0 < 0.0f)
+            pos0 += static_cast<float> (delayLineLength);
+
+        int p = static_cast<int> (pos0);
+        const float frac = pos0 - static_cast<float> (p);
+        if (p >= delayLineLength)          // float rounding can land exactly on len
+            p -= delayLineLength;
+
+        int s = 0;
+
+        if (! useShelf && frac == 0.0f)
+        {
+            // Whole-sample delay, no air absorption: a straight MAC.
+            while (s < numSamples)
+            {
+                const int run = (numSamples - s) < (delayLineLength - p)
+                                    ? (numSamples - s) : (delayLineLength - p);
+                for (int k = 0; k < run; ++k)
+                    dest[s + k] += delayLine[p + k] * level;
+
+                s += run;
+                p += run;
+                if (p >= delayLineLength)
+                    p -= delayLineLength;
+            }
+            return;
+        }
+
+        while (s < numSamples)
+        {
+            // -1 so the k+1 interpolation partner stays inside this run.
+            int run = delayLineLength - p - 1;
+            if (run > numSamples - s)
+                run = numSamples - s;
+
+            if (run <= 0)
+            {
+                // The one sample whose partner is across the wrap.
+                const float a = delayLine[p];
+                const float b = delayLine[0];
+                float v = a + frac * (b - a);
+                if (useShelf)
+                    v = cell.shelf.processSample (v);
+                dest[s] += v * level;
+
+                ++s;
+                p = 0;
+                continue;
+            }
+
+            if (useShelf)
+            {
+                for (int k = 0; k < run; ++k)
+                {
+                    const float a = delayLine[p + k];
+                    const float b = delayLine[p + k + 1];
+                    dest[s + k] += cell.shelf.processSample (a + frac * (b - a)) * level;
+                }
+            }
+            else
+            {
+                for (int k = 0; k < run; ++k)
+                {
+                    const float a = delayLine[p + k];
+                    const float b = delayLine[p + k + 1];
+                    dest[s + k] += (a + frac * (b - a)) * level;
+                }
+            }
+
+            s += run;
+            p += run;
+            if (p >= delayLineLength)
+                p -= delayLineLength;
+        }
+
+        return;
+    }
+
+    // ---- General path: the delay is moving, or a teleport envelope is open ----
     for (int s = 0; s < numSamples; ++s)
     {
         const auto smoothed = cell.smoother.smoothedAt (sampleCounter + s);
