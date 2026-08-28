@@ -100,6 +100,8 @@ public:
         tapCells.assign(cells, AcousticTapCell{});
         for (auto& c : tapCells) c.prepare(newSampleRate, windowSamples);
 
+        feedRowPtrs.assign((size_t)juce::jmax(0, numReverbNodes), nullptr);   // never grows in run()
+
         // Node-parallel send computation. Each worker owns one node, so it
         // writes one feedBuffer row and touches only its own cell column; the
         // delay lines are written once before the sweep and read-only during it.
@@ -248,9 +250,18 @@ private:
             {
                 // Compute the sends. One node per work item: delay-tap, shelf
                 // and level for every source feeding it.
+                // Resolve the feed-row write pointers on THIS thread:
+                // AudioBuffer::getWritePointer clears the buffer's isClear flag
+                // as a side effect, so calling it from N workers at once is a
+                // data race. Each worker then owns one row pointer.
+                feedRowPtrs.resize((size_t)numRevsSnap);
+                for (int r = 0; r < numRevsSnap; ++r)
+                    feedRowPtrs[(size_t)r] = feedBuffer.getWritePointer(r);
+
                 feedPool.parallelFor(numRevsSnap, [&](int revIdx)
                 {
-                    computeNodeFeed(revIdx, numSamples, levelsSnap, delaysSnap, hfSnap, strideSnap);
+                    computeNodeFeed(feedRowPtrs[(size_t)revIdx], numSamples,
+                                    revIdx, levelsSnap, delaysSnap, hfSnap, strideSnap);
                 });
 
                 // Downsample and push (serial: pushNodeInput notifies the engine)
@@ -311,11 +322,13 @@ private:
 
     /** One node send bus: sum every active source through its own delay tap
         and air-absorption shelf. */
-    void computeNodeFeed(int revIdx, int numSamples,
+    void computeNodeFeed(float* feedData, int numSamples, int revIdx,
                          const float* levelsSnap, const float* delaysSnap,
                          const float* hfSnap, int strideSnap)
     {
-        float* feedData = feedBuffer.getWritePointer(revIdx);
+        if (feedData == nullptr)
+            return;
+
         juce::FloatVectorOperations::clear(feedData, numSamples);
 
         const int maxCh = juce::jmin(numInputs, feedDelayBuffer.getNumChannels());
@@ -381,6 +394,7 @@ private:
     int writePosition = 0;
     std::int64_t sampleCounter = 0;
     std::vector<AcousticTapCell> tapCells;   // [source * preparedNumRevs + node]
+    std::vector<float*> feedRowPtrs;         // resolved per batch, feed thread only
 
     AudioParallelFor feedPool;
 

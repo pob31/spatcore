@@ -61,6 +61,8 @@ public:
         tapCells.assign (cells, AcousticTapCell{});
         for (auto& c : tapCells) c.prepare (newSampleRate, windowSamples);
 
+        outputPtrs.assign ((size_t) preparedOutputs, nullptr);   // never grows in the callback
+
         {
             mixPool.shutdown();
             int workers = 0;
@@ -150,9 +152,18 @@ public:
             return;
         }
 
+        // Resolve the write pointers HERE, on the calling thread.
+        // AudioBuffer::getWritePointer clears the buffer's isClear flag as a
+        // side effect, so calling it from N workers at once is a real (if
+        // benign-looking) data race and TSan says so. Each worker then owns one
+        // channel pointer and no two ever touch the same sample.
+        outputPtrs.resize ((size_t) outs);
+        for (int i = 0; i < outs; ++i)
+            outputPtrs[(size_t) i] = outputBuffer.getWritePointer (i, startSample);
+
         mixPool.parallelFor (outs, [&] (int outIdx)
         {
-            mixOneOutput (outputBuffer, startSample, numSamples, outIdx, nodes,
+            mixOneOutput (outputPtrs[(size_t) outIdx], numSamples, outIdx, nodes,
                           levels, delaysMs, hfDb, stride);
         });
 
@@ -167,11 +178,12 @@ private:
         sampleCounter += numSamples;
     }
 
-    void mixOneOutput (juce::AudioBuffer<float>& outputBuffer, int startSample, int numSamples,
+    void mixOneOutput (float* outputData, int numSamples,
                        int outIdx, int nodes,
                        const float* levels, const float* delaysMs, const float* hfDb, int stride)
     {
-        float* outputData = outputBuffer.getWritePointer (outIdx, startSample);
+        if (outputData == nullptr)
+            return;
 
         for (int nodeIdx = 0; nodeIdx < nodes; ++nodeIdx)
         {
@@ -205,6 +217,7 @@ private:
     std::int64_t sampleCounter = 0;
 
     std::vector<AcousticTapCell> tapCells;   // [node * preparedOutputs + output]
+    std::vector<float*> outputPtrs;          // resolved per block, calling thread only
 
     AudioParallelFor mixPool;
 
