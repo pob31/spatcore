@@ -45,6 +45,10 @@
                                  the mix ACCUMULATES onto the direct sound
                                  already in the buffer, and skipBlock keeps the
                                  write head moving while post-muted
+     11. reverb/ReverbSendMatrix  source -> node send, the mirror image: same
+                                 stride trap, per-(source, node) delay, and a
+                                 node with no active source is silence rather
+                                 than stale data
 */
 
 // OSCParser.h / OSCSerializer.h use juce::OSC* types but (verbatim-moved,
@@ -65,6 +69,7 @@
 #include "spatcore/dsp/DelayTargetSmoother.h"
 #include "spatcore/dsp/AcousticTap.h"
 #include "spatcore/reverb/ReverbReturnProcessor.h"
+#include "spatcore/reverb/ReverbSendMatrix.h"
 #include "spatcore/dsp/BiquadResponse.h"
 #include "spatcore/dsp/OutputEQBiquadFilter.h"
 #include "spatcore/dsp/ReverbBiquadFilter.h"
@@ -3321,6 +3326,162 @@ static void testReverbReturnProcessorSkipBlockAdvances()
         CHECK (std::fabs (out.getSample (0, i)) < 1.0e-6f);
 }
 
+//==============================================================================
+// reverb/ReverbSendMatrix - source -> node send. The computation ReverbFeedThread
+// runs per batch, minus the thread, so the stride and delay semantics can be
+// pinned the same way the return side's are.
+//==============================================================================
+
+static void testReverbSendMatrixStride()
+{
+    using namespace spatcore::reverb;
+
+    const double sr = 48000.0;
+    const int numSamples = 256;
+    const int sources = 3;
+    const int nodes = 2;
+    const int stride = 16;          // engine max-reverb stride, deliberately > nodes
+
+    ReverbSendMatrix m;
+    m.prepare (sr, sources, nodes);
+    CHECK (m.isPrepared());
+    CHECK (m.getPreparedSources() == sources);
+    CHECK (m.getPreparedNodes() == nodes);
+
+    // Source 0 -> node 0 at 0.5; source 2 -> node 1 at 0.25; source 1 feeds nothing.
+    std::vector<float> levels ((size_t) (sources * stride), 0.0f);
+    levels[(size_t) (0 * stride + 0)] = 0.5f;
+    levels[(size_t) (2 * stride + 1)] = 0.25f;
+
+    juce::AudioBuffer<float> in (sources, numSamples);
+    for (int i = 0; i < numSamples; ++i)
+    {
+        in.setSample (0, i, 0.31f * std::sin (0.05f * (float) i));
+        in.setSample (1, i, 0.90f);                                   // must NOT leak
+        in.setSample (2, i, 0.17f * std::sin (0.11f * (float) i + 1.1f));
+    }
+
+    std::vector<float> feed0 ((size_t) numSamples, -1.0f), feed1 ((size_t) numSamples, -1.0f);
+
+    m.writeInputs (in, numSamples);
+    m.computeNodeFeed (feed0.data(), numSamples, 0, levels.data(), nullptr, nullptr, stride);
+    m.computeNodeFeed (feed1.data(), numSamples, 1, levels.data(), nullptr, nullptr, stride);
+    m.advance (numSamples);
+
+    for (int i = 0; i < numSamples; ++i)
+    {
+        CHECK (bitEqualFloat (feed0[(size_t) i], in.getSample (0, i) * 0.5f));
+        CHECK (bitEqualFloat (feed1[(size_t) i], in.getSample (2, i) * 0.25f));
+    }
+}
+
+static void testReverbSendMatrixPerNodeDelay()
+{
+    using namespace spatcore::reverb;
+
+    // One source, two nodes at different distances: the far node must receive
+    // the same impulse LATER, by the amount the matrix asked for.
+    const double sr = 48000.0;
+    const int numSamples = 256;
+    const int sources = 1;
+    const int nodes = 2;
+    const int stride = 32;
+    const float farDelayMs = 25.0f;
+    const int farDelaySamples = (int) ((farDelayMs / 1000.0f) * (float) sr);   // 1200
+
+    ReverbSendMatrix m;
+    m.prepare (sr, sources, nodes);
+
+    std::vector<float> levels ((size_t) (sources * stride), 0.0f);
+    std::vector<float> delays ((size_t) (sources * stride), 0.0f);
+    levels[(size_t) (0 * stride + 0)] = 1.0f;
+    levels[(size_t) (0 * stride + 1)] = 1.0f;
+    delays[(size_t) (0 * stride + 1)] = farDelayMs;
+
+    int nearAt = -1, farAt = -1, impulseAt = -1;
+    float nearPeak = 0.0f, farPeak = 0.0f;
+
+    const int settleBlocks = 4;
+    const int totalBlocks = 24;
+
+    for (int block = 0; block < totalBlocks; ++block)
+    {
+        juce::AudioBuffer<float> in (sources, numSamples);
+        in.clear();
+        if (block == settleBlocks)
+        {
+            in.setSample (0, 0, 1.0f);
+            impulseAt = block * numSamples;
+        }
+
+        std::vector<float> feed0 ((size_t) numSamples, 0.0f), feed1 ((size_t) numSamples, 0.0f);
+
+        m.writeInputs (in, numSamples);
+        m.computeNodeFeed (feed0.data(), numSamples, 0, levels.data(), delays.data(), nullptr, stride);
+        m.computeNodeFeed (feed1.data(), numSamples, 1, levels.data(), delays.data(), nullptr, stride);
+        m.advance (numSamples);
+
+        for (int i = 0; i < numSamples; ++i)
+        {
+            const float a = std::fabs (feed0[(size_t) i]);
+            if (a > nearPeak) { nearPeak = a; nearAt = block * numSamples + i; }
+            const float b = std::fabs (feed1[(size_t) i]);
+            if (b > farPeak) { farPeak = b; farAt = block * numSamples + i; }
+        }
+    }
+
+    CHECK (impulseAt >= 0);
+    CHECK (nearPeak > 0.9f);
+    CHECK (farPeak > 0.4f);
+    CHECK (nearAt == impulseAt);
+    CHECK (std::abs ((farAt - impulseAt) - farDelaySamples) <= 1);
+    CHECK (farAt > nearAt);
+}
+
+static void testReverbSendMatrixSilentNodeIsSilent()
+{
+    using namespace spatcore::reverb;
+
+    // computeNodeFeed OVERWRITES its destination. A node that no source feeds
+    // must come out as silence, not as whatever the buffer held before - the
+    // feed thread reuses the same row buffer batch after batch.
+    const double sr = 48000.0;
+    const int numSamples = 64;
+
+    ReverbSendMatrix m;
+    m.prepare (sr, 2, 2);
+
+    std::vector<float> levels ((size_t) (2 * 2), 0.0f);
+    levels[(size_t) (0 * 2 + 0)] = 1.0f;                 // only node 0 is fed
+
+    juce::AudioBuffer<float> in (2, numSamples);
+    for (int i = 0; i < numSamples; ++i)
+    {
+        in.setSample (0, i, 0.5f);
+        in.setSample (1, i, 0.5f);
+    }
+
+    std::vector<float> stale ((size_t) numSamples, 123.0f);
+
+    m.writeInputs (in, numSamples);
+    m.computeNodeFeed (stale.data(), numSamples, 1, levels.data(), nullptr, nullptr, 2);
+    m.advance (numSamples);
+
+    for (int i = 0; i < numSamples; ++i)
+        CHECK (stale[(size_t) i] == 0.0f);
+
+    // Out-of-range node and a null matrix are silence too, never a crash.
+    std::fill (stale.begin(), stale.end(), 123.0f);
+    m.computeNodeFeed (stale.data(), numSamples, 7, levels.data(), nullptr, nullptr, 2);
+    for (int i = 0; i < numSamples; ++i)
+        CHECK (stale[(size_t) i] == 0.0f);
+
+    std::fill (stale.begin(), stale.end(), 123.0f);
+    m.computeNodeFeed (stale.data(), numSamples, 0, nullptr, nullptr, nullptr, 2);
+    for (int i = 0; i < numSamples; ++i)
+        CHECK (stale[(size_t) i] == 0.0f);
+}
+
 static void testStereoPassThroughIdentity()
 {
     using namespace spatcore::dsp;
@@ -3434,6 +3595,9 @@ int main()
         testReverbReturnProcessorAccumulatesOntoDirect();
         testReverbReturnProcessorPerOutputDelay();
         testReverbReturnProcessorSkipBlockAdvances();
+        testReverbSendMatrixStride();
+        testReverbSendMatrixPerNodeDelay();
+        testReverbSendMatrixSilentNodeIsSilent();
         testLockFreeRingBuffer();
         testDelayTargetSmootherDeterminism();
         testRtSnapshot();

@@ -72,6 +72,7 @@
 // reverb/ - ReverbEngine.h pulls the whole algorithm tree (FDN/SDN/IR + GPU
 // variants + pre/post processors)
 #include "reverb/ReverbEngine.h"
+#include "reverb/ReverbSendMatrix.h"
 #include "reverb/ReverbFeedThread.h"
 #include "reverb/ReverbReturnProcessor.h"
 

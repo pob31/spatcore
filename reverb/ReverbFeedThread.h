@@ -3,12 +3,11 @@
 #include <juce_audio_basics/juce_audio_basics.h>
 #include "../rt/SharedInputRingBuffer.h"
 #include "../rt/AudioParallelFor.h"
-#include "../dsp/AcousticTap.h"
+#include "ReverbSendMatrix.h"
 #include "ReverbEngine.h"
 #include <atomic>
 #include <chrono>
 #include <cstdint>
-#include <cstring>
 #include <thread>
 #include <vector>
 
@@ -25,6 +24,8 @@ namespace spatcore::reverb {
     derived from the geometry, filtered by an air-absorption high shelf, then
     scaled by the send level. That mirrors the direct WFS path
     (spatcore/wfs/InputBufferProcessor.h), which has always done all three.
+    The computation itself lives in ReverbSendMatrix so it can be tested
+    without a thread; this class is the plumbing around it.
 
     Runs one block behind the audio callback (2.67ms at 256/96kHz — imperceptible for reverb).
 */
@@ -68,10 +69,8 @@ public:
         reverbStride = calcReverbStride;
         numInputs = numInputCh;
         numRevs = numReverbNodes;
-        preparedNumRevs = numReverbNodes;
         processingBlockSize = blockSize;
         reverbSRRatio = srRatio;
-        sampleRate = newSampleRate;
 
         readPositions.assign(inputBuffers.size(), 0);
 
@@ -79,28 +78,14 @@ public:
         inputBlocks.setSize(numInputCh, blockSize);
 
         feedBuffer.setSize(numReverbNodes, blockSize);
+        feedRowPtrs.assign((size_t)juce::jmax(0, numReverbNodes), nullptr);   // never grows in run()
 
         int dsBlockSize = (srRatio > 1) ? (blockSize / srRatio) : blockSize;
         downsampleBuffer.setSize(numReverbNodes, dsBlockSize);
 
-        // Per-source delay lines. One second matches the direct path rule and
-        // covers the worst geometry the parameter ranges allow (positions are
-        // +/-50 m on each axis, so the source->node path tops out near 505 ms,
-        // before the +/-100 ms reverbDelayLatency and the latency terms).
-        delayBufferLength = juce::jmax(2, (int)(newSampleRate * 1.0));
-        feedDelayBuffer.setSize(numInputCh, delayBufferLength);
-        feedDelayBuffer.clear();
-        writePosition = 0;
-        sampleCounter = 0;
-
-        // One (source, node) tap cell each: delay smoother + air-absorption
-        // shelf, ~10 ms box window like the direct path per-output smoothers.
-        const size_t cells = (size_t)juce::jmax(0, numInputCh) * (size_t)juce::jmax(0, numReverbNodes);
-        const int windowSamples = juce::jmax(2, (int)(newSampleRate * 0.010));
-        tapCells.assign(cells, AcousticTapCell{});
-        for (auto& c : tapCells) c.prepare(newSampleRate, windowSamples);
-
-        feedRowPtrs.assign((size_t)juce::jmax(0, numReverbNodes), nullptr);   // never grows in run()
+        // Delay lines + tap cells, at DEVICE rate: the tap runs before the
+        // decimation so its fractional resolution is the full one.
+        sendMatrix.prepare(newSampleRate, numInputCh, numReverbNodes);
 
         // Node-parallel send computation. Each worker owns one node, so it
         // writes one feedBuffer row and touches only its own cell column; the
@@ -110,6 +95,7 @@ public:
         {
             feedPool.shutdown();
             int workers = 0;
+            const size_t cells = (size_t)juce::jmax(0, numInputCh) * (size_t)juce::jmax(0, numReverbNodes);
             if (cells >= 256)
             {
                 int hwThreads = static_cast<int>(std::thread::hardware_concurrency());
@@ -206,7 +192,7 @@ private:
                 delaysSnap  = reverbDelays;
                 hfSnap      = reverbHF;
                 strideSnap  = reverbStride;
-                numRevsSnap = juce::jmin (numRevs, preparedNumRevs);
+                numRevsSnap = juce::jmin (numRevs, sendMatrix.getPreparedNodes());
             }
 
             if (reverbEngine == nullptr || numRevsSnap <= 0 || numInputs <= 0)
@@ -231,9 +217,9 @@ private:
             for (int ch = 0; ch < numInputs && ch < (int)inputBuffers.size(); ++ch)
                 inputBuffers[ch]->readWithPosition(readPositions[ch], inputBlocks.getWritePointer(ch), numSamples);
 
-            // Publish this block into the per-source delay lines. Done even when
+            // Publish this batch into the per-source delay lines. Done even when
             // muted, so unmuting does not replay stale history.
-            writeInputsToDelayLines(numSamples);
+            sendMatrix.writeInputs(inputBlocks, numSamples);
 
             int pushSamples = numSamples / reverbSRRatio;
 
@@ -248,26 +234,25 @@ private:
             }
             else
             {
-                // Compute the sends. One node per work item: delay-tap, shelf
-                // and level for every source feeding it.
                 // Resolve the feed-row write pointers on THIS thread:
                 // AudioBuffer::getWritePointer clears the buffer's isClear flag
                 // as a side effect, so calling it from N workers at once is a
                 // data race. Each worker then owns one row pointer.
-                feedRowPtrs.resize((size_t)numRevsSnap);
                 for (int r = 0; r < numRevsSnap; ++r)
                     feedRowPtrs[(size_t)r] = feedBuffer.getWritePointer(r);
 
+                // Compute the sends. One node per work item: delay-tap, shelf
+                // and level for every source feeding it.
                 feedPool.parallelFor(numRevsSnap, [&](int revIdx)
                 {
-                    computeNodeFeed(feedRowPtrs[(size_t)revIdx], numSamples,
-                                    revIdx, levelsSnap, delaysSnap, hfSnap, strideSnap);
+                    sendMatrix.computeNodeFeed(feedRowPtrs[(size_t)revIdx], numSamples, revIdx,
+                                               levelsSnap, delaysSnap, hfSnap, strideSnap);
                 });
 
                 // Downsample and push (serial: pushNodeInput notifies the engine)
                 for (int revIdx = 0; revIdx < numRevsSnap; ++revIdx)
                 {
-                    float* feedData = feedBuffer.getWritePointer(revIdx);
+                    float* feedData = feedRowPtrs[(size_t)revIdx];
 
                     if (reverbSRRatio > 1)
                     {
@@ -289,68 +274,12 @@ private:
                 }
             }
 
-            writePosition = (writePosition + numSamples) % delayBufferLength;
-            sampleCounter += numSamples;
+            sendMatrix.advance(numSamples);
 
             lastBatchUs.store(std::chrono::duration<float, std::micro>(
                                   std::chrono::steady_clock::now() - batchStart).count(),
                               std::memory_order_relaxed);
             batchCounter.fetch_add(1, std::memory_order_relaxed);
-        }
-    }
-
-    /** Copy this block into each source delay line at the current write head.
-        writePosition stays at the block START until the sends have been taken. */
-    void writeInputsToDelayLines(int numSamples)
-    {
-        if (delayBufferLength <= 0)
-            return;
-
-        const int first = juce::jmin(numSamples, delayBufferLength - writePosition);
-        const int second = numSamples - first;
-
-        for (int ch = 0; ch < numInputs && ch < feedDelayBuffer.getNumChannels(); ++ch)
-        {
-            const float* src = inputBlocks.getReadPointer(ch);
-            float* dst = feedDelayBuffer.getWritePointer(ch);
-
-            std::memcpy(dst + writePosition, src, (size_t)first * sizeof(float));
-            if (second > 0)
-                std::memcpy(dst, src + first, (size_t)second * sizeof(float));
-        }
-    }
-
-    /** One node send bus: sum every active source through its own delay tap
-        and air-absorption shelf. */
-    void computeNodeFeed(float* feedData, int numSamples, int revIdx,
-                         const float* levelsSnap, const float* delaysSnap,
-                         const float* hfSnap, int strideSnap)
-    {
-        if (feedData == nullptr)
-            return;
-
-        juce::FloatVectorOperations::clear(feedData, numSamples);
-
-        const int maxCh = juce::jmin(numInputs, feedDelayBuffer.getNumChannels());
-
-        for (int inIdx = 0; inIdx < maxCh; ++inIdx)
-        {
-            const int matrixIdx = inIdx * strideSnap + revIdx;
-            const float feedLevel = levelsSnap[matrixIdx];
-
-            if (feedLevel <= 0.0001f)
-                continue;
-
-            const size_t cell = (size_t)inIdx * (size_t)preparedNumRevs + (size_t)revIdx;
-
-            const float delayMs = (delaysSnap != nullptr) ? delaysSnap[matrixIdx] : 0.0f;
-            const float hfDb = (hfSnap != nullptr) ? hfSnap[matrixIdx] : 0.0f;
-
-            processAcousticTap (tapCells[cell],
-                                feedDelayBuffer.getReadPointer(inIdx), delayBufferLength,
-                                writePosition, sampleCounter, numSamples,
-                                delayMs, hfDb, feedLevel, sampleRate,
-                                feedData);
         }
     }
 
@@ -372,10 +301,8 @@ private:
     juce::SpinLock matrixLock;
 
     int numInputs = 0;
-    int preparedNumRevs = 0;      // cell-array stride; numRevs is clamped to it
     int processingBlockSize = 256;
     int reverbSRRatio = 1;
-    double sampleRate = 48000.0;
     std::atomic<bool> dataReady{false};
     std::atomic<bool> isMuted{false};
 
@@ -385,17 +312,10 @@ private:
 
     juce::AudioBuffer<float> inputBlocks;      // numInputs channels, one block each
     juce::AudioBuffer<float> feedBuffer;       // numReverbs channels, feed sums
+    std::vector<float*> feedRowPtrs;           // resolved per batch, feed thread only
     juce::AudioBuffer<float> downsampleBuffer;
 
-    // Send path state: one delay line per source, one (source, node) cell each
-    // for the delay smoother and the air-absorption shelf.
-    juce::AudioBuffer<float> feedDelayBuffer;
-    int delayBufferLength = 0;
-    int writePosition = 0;
-    std::int64_t sampleCounter = 0;
-    std::vector<AcousticTapCell> tapCells;   // [source * preparedNumRevs + node]
-    std::vector<float*> feedRowPtrs;         // resolved per batch, feed thread only
-
+    ReverbSendMatrix sendMatrix;               // the actual send computation
     AudioParallelFor feedPool;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(ReverbFeedThread)
