@@ -76,6 +76,15 @@ and macOS × Metal.
 
 ## License
 
-Core code follows the consumer projects' licensing; note `juce_simpleweb`
-(required by the MCP transport) is GPLv3 — see the consumer-provides contract
-above.
+**GPL-3.0-or-later** — see [`LICENSE`](LICENSE).
+
+spatcore was extracted from WFS-DIY, which is GPL-3, and it is consumed by
+WFS-DIY, XOA, Tight-WFS and Go.dot, all of which are GPL-3. Its dependencies are
+compatible with that and in two cases require it: JUCE is used under the AGPLv3
+path, Tracktion Engine (where a consumer links it) under the GPLv3 path, and
+`juce_simpleweb`, which the MCP transport needs, is GPLv3 — see the
+consumer-provides contract above.
+
+Stating this in a file rather than leaving it to "whatever the consumer is"
+matters for one practical reason: a repository with no licence grants nobody any
+rights, including a future consumer that wants to pin it.
