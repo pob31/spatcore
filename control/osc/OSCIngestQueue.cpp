@@ -23,6 +23,10 @@ OSCIngestQueue::OSCIngestQueue (Classifier classifierIn)
             rules.push_back (std::move (rule));
     }
 
+    for (const auto& address : classifierIn.bypassAddresses)
+        if (address.isNotEmpty())
+            bypassAddresses.push_back (address.toStdString());
+
     // Drain at a fixed cadence on the MessageManager thread. This
     // guarantees the GUI gets idle slices between batches, which
     // callAsync-on-demand draining cannot (each call piles onto the MM
@@ -63,6 +67,11 @@ bool OSCIngestQueue::tryClassify (const char* data, int dataSize,
         ++addrEnd;
     if (addrEnd == 0 || addrEnd >= dataSize)
         return false;
+
+    // Addresses the app keeps in arrival order go through the FIFO.
+    for (const auto& b : bypassAddresses)
+        if (addrEnd == static_cast<int> (b.size()) && std::memcmp (data, b.data(), b.size()) == 0)
+            return false;
 
     // Match against the injected prefix set.
     const Rule* matched = nullptr;

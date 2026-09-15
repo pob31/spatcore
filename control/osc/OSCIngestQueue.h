@@ -74,6 +74,14 @@ public:
          *  "/wfs/input/7/positionX") bypasses coalescing and goes
          *  through the FIFO path uncanonicalised. */
         bool digitAfterPrefixBypasses = true;
+
+        /** Exact addresses that never coalesce, even under a matching
+         *  prefix: families whose messages mean more than "the latest
+         *  value of this channel", such as an edit to one element of a
+         *  per-channel list, where two quick writes to one channel are
+         *  two different edits. They take the FIFO path, in arrival
+         *  order. */
+        std::vector<juce::String> bypassAddresses;
     };
 
     using DispatchFn = std::function<void (const juce::MemoryBlock& data,
@@ -143,8 +151,9 @@ private:
     void timerCallback() override;
     void drainBatch();
 
-    std::vector<Rule> rules;
-    bool              digitAfterPrefixBypasses = true;
+    std::vector<Rule>        rules;
+    std::vector<std::string> bypassAddresses;
+    bool                     digitAfterPrefixBypasses = true;
 
     juce::CriticalSection                            lock;
     std::unordered_map<juce::String, IngestItem>     coalesced;
