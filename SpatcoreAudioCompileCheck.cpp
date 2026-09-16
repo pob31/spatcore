@@ -141,6 +141,16 @@ template class spatcore::dsp::MultiChannelEQBank<6>;
 // POD static_assert against the real EffectChannelParams rather than a stub.
 template class spatcore::rt::RtTripleBuffer<spatcore::effects::EffectChannelParams>;
 
+// The effects-channel ceiling is declared TWICE - once in effects/EffectsTypes.h
+// for the chain vocabulary and once in wfs/RenderSourceMap.h for the slot array -
+// because wfs/ may not include effects/. Nothing else in the tree sees both, so
+// without this the two could drift and the render-source map would silently
+// under-size its array by the difference: a buffer overrun inside spatcore with
+// no compile error anywhere.
+static_assert (spatcore::wfs::RenderSourceMap::kMaxEffectChannels
+                   == spatcore::effects::kMaxEffectChannels,
+               "RenderSourceMap and effects/EffectsTypes.h disagree on the effects-channel ceiling");
+
 namespace spatcore
 {
     // Referenced by nothing at runtime; exists so the archive is never empty.

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <juce_audio_basics/juce_audio_basics.h>
+#include <cstdint>
 #include <atomic>
 
 namespace spatcore::rt {
@@ -25,6 +26,7 @@ public:
         buffer.setSize(1, bufferSize);
         buffer.clear();
         writePos.store(0, std::memory_order_relaxed);
+        totalWritten.store(0, std::memory_order_relaxed);
     }
 
     /** Write samples (called by single producer — audio callback thread). */
@@ -43,6 +45,10 @@ public:
             std::memcpy(dst, data + firstChunk, static_cast<size_t>(secondChunk) * sizeof(float));
 
         wp = (wp + toWrite) % bufferSize;
+
+        // Published before the position, so a consumer that reads the counter
+        // first can never conclude it is further behind than it really is.
+        totalWritten.fetch_add(static_cast<std::uint64_t>(toWrite), std::memory_order_relaxed);
         writePos.store(wp, std::memory_order_release);
         return toWrite;
     }
@@ -77,15 +83,41 @@ public:
     void reset()
     {
         writePos.store(0, std::memory_order_relaxed);
+        totalWritten.store(0, std::memory_order_relaxed);
         buffer.clear();
     }
 
     int getBufferSize() const { return bufferSize; }
 
+    /** Total samples ever written, monotonic since the last setSize/reset.
+
+        The position alone cannot tell a consumer it has been LAPPED: the write
+        head wraps, so a producer that has run a whole buffer ahead looks
+        exactly like one that has not moved, and getAvailableAt() happily
+        returns a small number computed from stale data. The consumer then reads
+        samples the producer has already overwritten and hears a glitch with no
+        counter anywhere to explain it.
+
+        Against this counter a consumer that remembers how much it has taken can
+        test `totalWritten - consumed > getBufferSize() - block` and know it has
+        been overrun, in time to resync and count the event. Monotonic and
+        additive: it never wraps in any practical session (at 192 kHz it lasts
+        about three million years), and it is only ever incremented, so a torn
+        read cannot invent a smaller value than the truth.
+
+        Relaxed is enough. The consumer's synchronisation with the audio comes
+        from the acquire load of the write position in readWithPosition; this
+        value is only compared against the consumer's own running total. */
+    std::uint64_t getTotalWritten() const noexcept
+    {
+        return totalWritten.load(std::memory_order_relaxed);
+    }
+
 private:
     juce::AudioBuffer<float> buffer;
     int bufferSize = 0;
     std::atomic<int> writePos{0};
+    std::atomic<std::uint64_t> totalWritten{0};
 
     int getAvailableAt(int wp, int rp) const
     {

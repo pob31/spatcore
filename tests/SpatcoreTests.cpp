@@ -79,6 +79,9 @@
                                  keyed dither) and the EQ (bit-identical to the
                                  output EQ bank it wraps); plus every module
                                  bit-transparent when bypassed and at identity
+     19. the effects ENGINE's foundations  the shared input ring's wrap
+                                 counter, and effect returns appearing in the
+                                 render-source map as their own kind of source
      18. effects/modules, part 2 distortion, dynamics, chorus/flanger, phaser,
                                  reverb and multitap delay: each one's
                                  characteristic law pinned numerically, identity
@@ -152,6 +155,7 @@
 #include "spatcore/binaural/StructuralHrtfRenderer.h"
 #include "spatcore/dsp/OneEuroFilter.h"
 #include "spatcore/wfs/RenderSourceMap.h"
+#include "spatcore/rt/SharedInputRingBuffer.h"
 #include "spatcore/dsp/StereoDecomposer.h"
 #ifdef SPATCORE_TEST_SOFA_FIXTURE
 #include "spatcore/binaural/SofaLoader.h"
@@ -9722,6 +9726,362 @@ static void testMultitapDelayExtremesAndRates()
     }
 }
 
+//==============================================================================
+// The effects engine's foundations: knowing when a producer has lapped you, and
+// giving effect returns a slot of their own in the render-source map.
+//==============================================================================
+
+static void testSharedInputRingWrapCounter()
+{
+    using namespace spatcore::rt;
+
+    SharedInputRingBuffer ring;
+    ring.setSize (1024);
+    CHECK (ring.getTotalWritten() == 0);
+
+    std::vector<float> block (256);
+    for (int i = 0; i < 256; ++i)
+        block[(size_t) i] = 0.001f * (float) i;
+
+    // The counter is the number of samples WRITTEN, not the position, so it
+    // keeps counting past the wrap.
+    for (int b = 0; b < 3; ++b)
+        ring.write (block.data(), 256);
+    CHECK (ring.getTotalWritten() == 768);
+
+    for (int b = 0; b < 5; ++b)
+        ring.write (block.data(), 256);
+    CHECK (ring.getTotalWritten() == 2048);      // twice round a 1024 ring
+
+    // This is the whole point: a consumer that has stopped reading can DETECT
+    // that it has been lapped. The position alone cannot tell it - after a full
+    // buffer the write head is back where the consumer left it, and the
+    // available count reads zero, which is indistinguishable from a producer
+    // that has not run at all.
+    {
+        SharedInputRingBuffer r2;
+        r2.setSize (1024);
+
+        int cursor = 0;
+        std::uint64_t consumed = 0;
+        std::vector<float> out (256);
+
+        // Read along politely for a while.
+        for (int b = 0; b < 2; ++b)
+        {
+            r2.write (block.data(), 256);
+            consumed += (std::uint64_t) r2.readWithPosition (cursor, out.data(), 256);
+        }
+        CHECK (consumed == 512);
+        CHECK (r2.getTotalWritten() - consumed == 0);
+
+        // Now stall the consumer and let the producer run a whole buffer past it.
+        for (int b = 0; b < 4; ++b)
+            r2.write (block.data(), 256);
+
+        const std::uint64_t behind = r2.getTotalWritten() - consumed;
+        CHECK (behind == 1024);
+        CHECK (behind > (std::uint64_t) (r2.getBufferSize() - 256));   // lapped, and knowable
+
+        // The position is NOT knowable: it reads as if nothing had happened.
+        CHECK (r2.getAvailableAt (cursor) == 0);
+    }
+
+    // reset() and setSize() both zero it, so a resync starts from a clean slate.
+    ring.reset();
+    CHECK (ring.getTotalWritten() == 0);
+    ring.write (block.data(), 256);
+    CHECK (ring.getTotalWritten() == 256);
+    ring.setSize (512);
+    CHECK (ring.getTotalWritten() == 0);
+}
+
+static void testRenderSourceMapEffectsLayout()
+{
+    using Map = spatcore::wfs::RenderSourceMap;
+    using spatcore::wfs::SourceKind;
+
+    // 6 inputs, two of them stereo, plus 4 effects channels.
+    std::array<uint8_t, 6> types { Map::Mono, Map::Stereo, Map::Mono, Map::Stereo, Map::Mono, Map::Mono };
+    Map m;
+    CHECK (Map::build (types.data(), 6, 4, m));
+
+    const int expectedFirstEffect = 6 + 2 * Map::kDerivedPerStereo;   // 16
+    CHECK (m.numInputChannels == 6);
+    CHECK (m.numEffectChannels == 4);
+    CHECK (m.firstEffectSlot == expectedFirstEffect);
+    CHECK (m.count == expectedFirstEffect + 4);
+
+    for (int fx = 0; fx < 4; ++fx)
+    {
+        const auto& d = m.desc[(size_t) (m.firstEffectSlot + fx)];
+        CHECK (d.kind == SourceKind::EffectReturn);
+        CHECK (d.owningEffectChannel == (int16_t) fx);
+        CHECK (d.owningInputChannel == -1);     // a return belongs to no input
+        CHECK (d.sliceIndex == 0);
+        CHECK (! d.isStereoSlice);
+        CHECK (d.active);
+        CHECK (d.gainLinear == 1.0f);
+    }
+
+    // Every input and derived slot is still an Input, so a consumer that keys
+    // on kind cannot mistake one for the other.
+    for (int i = 0; i < expectedFirstEffect; ++i)
+        CHECK (m.desc[(size_t) i].kind == SourceKind::Input);
+
+    // ADDING EFFECTS MOVES NOTHING. This is what lets an engine hold a matrix
+    // row index across a channel-count change without it silently changing
+    // meaning.
+    {
+        Map without;
+        CHECK (Map::build (types.data(), 6, 0, without));
+        CHECK (without.firstEffectSlot == -1);
+        CHECK (without.numEffectChannels == 0);
+        CHECK (without.count == expectedFirstEffect);
+
+        for (int i = 0; i < without.count; ++i)
+        {
+            CHECK (m.desc[(size_t) i].owningInputChannel == without.desc[(size_t) i].owningInputChannel);
+            CHECK (m.desc[(size_t) i].sliceIndex == without.desc[(size_t) i].sliceIndex);
+            CHECK (m.desc[(size_t) i].isStereoSlice == without.desc[(size_t) i].isStereoSlice);
+        }
+        for (int i = 0; i < 6; ++i)
+            CHECK (m.firstDerivedSlot[(size_t) i] == without.firstDerivedSlot[(size_t) i]);
+    }
+
+    // The two-argument overload is the old behaviour exactly.
+    {
+        Map twoArg;
+        CHECK (Map::build (types.data(), 6, twoArg));
+        CHECK (twoArg.numEffectChannels == 0);
+        CHECK (twoArg.firstEffectSlot == -1);
+        CHECK (twoArg.count == expectedFirstEffect);
+        for (int i = 0; i < twoArg.count; ++i)
+            CHECK (twoArg.desc[(size_t) i].kind == SourceKind::Input);
+    }
+
+    // The full budget fits, and one more of anything does not.
+    {
+        std::array<uint8_t, Map::kMaxInputChannels> full {};
+        for (int i = 0; i < Map::kMaxStereoChannels; ++i)
+            full[(size_t) i] = Map::Stereo;
+
+        Map big;
+        CHECK (Map::build (full.data(), Map::kMaxInputChannels, Map::kMaxEffectChannels, big));
+        CHECK (big.count == Map::kMaxRenderSourceSlots);
+        CHECK (big.count == Map::kMaxInputRenderSources + Map::kMaxEffectChannels);
+        CHECK (big.firstEffectSlot == Map::kMaxInputRenderSources);
+
+        Map refused;
+        CHECK (! Map::build (full.data(), Map::kMaxInputChannels, Map::kMaxEffectChannels + 1, refused));
+        CHECK (refused.count == 0);
+        CHECK (! Map::build (full.data(), Map::kMaxInputChannels, -1, refused));
+        CHECK (refused.count == 0);
+    }
+
+    // buildIdentity still means what it meant.
+    {
+        Map ident;
+        CHECK (Map::buildIdentity (8, ident));
+        CHECK (ident.count == 8);
+        CHECK (ident.firstEffectSlot == -1);
+    }
+}
+
+//==============================================================================
+// dsp/AcousticSendMatrix - the source range the effects loop guard needs, and
+// the history length the second matrix needs.
+//==============================================================================
+
+static void testAcousticSendMatrixSourceRange()
+{
+    using spatcore::dsp::AcousticSendMatrix;
+
+    const double sr = 48000.0;
+    const int numSamples = 256;
+    const int sources = 6;
+    const int nodes = 2;
+    const int stride = 8;
+    const int split = 4;                  // rows 0..3 are "inputs", 4..5 are "effects"
+
+    // Levels, delays and shelves all non-trivial, so the split has to preserve
+    // per-cell smoother and filter state, not just the arithmetic.
+    std::vector<float> levels ((size_t) (sources * stride), 0.0f);
+    std::vector<float> delays ((size_t) (sources * stride), 0.0f);
+    std::vector<float> hf ((size_t) (sources * stride), 0.0f);
+    for (int src = 0; src < sources; ++src)
+    {
+        levels[(size_t) (src * stride + 0)] = 0.2f + 0.1f * (float) src;
+        delays[(size_t) (src * stride + 0)] = 1.5f * (float) src;     // fractional ms
+        hf[(size_t) (src * stride + 0)] = -1.5f * (float) src;        // engages the shelf
+    }
+
+    auto makeInput = [sources, numSamples] (int block)
+    {
+        juce::AudioBuffer<float> in (sources, numSamples);
+        for (int ch = 0; ch < sources; ++ch)
+            for (int i = 0; i < numSamples; ++i)
+                in.setSample (ch, i, FrDiffusion::hashNoiseBipolar (
+                    (std::uint32_t) (block * numSamples + i), (std::uint32_t) (ch + 1)));
+        return in;
+    };
+
+    AcousticSendMatrix whole, halves;
+    whole.prepare (sr, sources, nodes);
+    halves.prepare (sr, sources, nodes);
+
+    bool identical = true;
+
+    for (int block = 0; block < 12; ++block)
+    {
+        const auto in = makeInput (block);
+
+        std::vector<float> a ((size_t) numSamples, -1.0f), b ((size_t) numSamples, -1.0f);
+
+        whole.writeInputs (in, numSamples);
+        whole.computeNodeFeed (a.data(), numSamples, 0, levels.data(), delays.data(), hf.data(), stride);
+        whole.advance (numSamples);
+
+        // The same feed, rendered as two passes: the second ACCUMULATES.
+        halves.writeInputs (in, numSamples);
+        halves.computeNodeFeed (b.data(), numSamples, 0, levels.data(), delays.data(), hf.data(),
+                                stride, 0, split, true);
+        halves.computeNodeFeed (b.data(), numSamples, 0, levels.data(), delays.data(), hf.data(),
+                                stride, split, -1, false);
+        halves.advance (numSamples);
+
+        if (! eqtests::bitEqualBlock (a, b))
+            identical = false;
+    }
+
+    CHECK (identical);
+
+    // A range that touches nothing leaves the destination alone when asked to
+    // accumulate, and clears it when asked to overwrite.
+    {
+        AcousticSendMatrix m;
+        m.prepare (sr, sources, nodes);
+        const auto in = makeInput (0);
+        m.writeInputs (in, numSamples);
+
+        std::vector<float> keep ((size_t) numSamples, 7.0f);
+        m.computeNodeFeed (keep.data(), numSamples, 0, levels.data(), nullptr, nullptr,
+                           stride, 2, 2, false);          // empty range, accumulate
+        for (int i = 0; i < numSamples; ++i)
+            CHECK (keep[(size_t) i] == 7.0f);
+
+        m.computeNodeFeed (keep.data(), numSamples, 0, levels.data(), nullptr, nullptr,
+                           stride, 2, 2, true);           // empty range, overwrite
+        for (int i = 0; i < numSamples; ++i)
+            CHECK (keep[(size_t) i] == 0.0f);
+    }
+
+    // Out-of-range bounds clamp rather than reading past the prepared sources.
+    {
+        AcousticSendMatrix m;
+        m.prepare (sr, sources, nodes);
+        const auto in = makeInput (1);
+        m.writeInputs (in, numSamples);
+
+        std::vector<float> wide ((size_t) numSamples, 0.0f), all ((size_t) numSamples, 0.0f);
+        m.computeNodeFeed (wide.data(), numSamples, 0, levels.data(), nullptr, nullptr,
+                           stride, -5, 1000, true);
+        AcousticSendMatrix ref;
+        ref.prepare (sr, sources, nodes);
+        ref.writeInputs (in, numSamples);
+        ref.computeNodeFeed (all.data(), numSamples, 0, levels.data(), nullptr, nullptr, stride);
+        CHECK (eqtests::bitEqualBlock (wide, all));
+    }
+}
+
+static void testAcousticSendMatrixHistoryLength()
+{
+    using spatcore::dsp::AcousticSendMatrix;
+
+    // A shorter history is a smaller allocation, not a different sound: any
+    // delay the line can actually hold must land in exactly the same place it
+    // would with the default one second.
+    //
+    // "Can actually hold" is stricter than it looks. writeInputs fills the
+    // current block before the taps read it, so the usable span is the line
+    // length MINUS one block; a delay closer to the length than that reads the
+    // block just written. 50 ms of history at 48 kHz is 2400 samples, so with
+    // 256-sample blocks anything up to about 2144 samples (44 ms) is honest.
+    const double sr = 48000.0;
+    const int numSamples = 256;
+    const int stride = 4;
+    const float delayMs = 20.0f;                                  // 960 samples, well inside
+    const int expected = (int) ((delayMs / 1000.0f) * (float) sr);
+
+    auto arrival = [&] (double historySeconds) -> int
+    {
+        AcousticSendMatrix m;
+        if (historySeconds > 0.0)
+            m.prepare (sr, 1, 1, historySeconds);
+        else
+            m.prepare (sr, 1, 1);                                 // default: one second
+
+        std::vector<float> levels ((size_t) stride, 0.0f), delays ((size_t) stride, 0.0f);
+        levels[0] = 1.0f;
+        delays[0] = delayMs;
+
+        int impulseAt = -1, peakAt = -1;
+        float peak = 0.0f;
+
+        // Eight settle blocks: the per-cell smoother has a 10 ms window, so a
+        // measurement taken earlier measures the glide rather than the delay.
+        for (int block = 0; block < 32; ++block)
+        {
+            juce::AudioBuffer<float> in (1, numSamples);
+            in.clear();
+            if (block == 8)
+            {
+                in.setSample (0, 0, 1.0f);
+                impulseAt = block * numSamples;
+            }
+
+            std::vector<float> out ((size_t) numSamples, 0.0f);
+            m.writeInputs (in, numSamples);
+            m.computeNodeFeed (out.data(), numSamples, 0, levels.data(), delays.data(), nullptr, stride);
+            m.advance (numSamples);
+
+            for (int i = 0; i < numSamples; ++i)
+                if (std::fabs (out[(size_t) i]) > peak)
+                {
+                    peak = std::fabs (out[(size_t) i]);
+                    peakAt = block * numSamples + i;
+                }
+        }
+
+        CHECK (peak > 0.4f);
+        return (impulseAt >= 0 && peakAt >= 0) ? peakAt - impulseAt : -1;
+    };
+
+    CHECK (std::abs (arrival (0.0) - expected) <= 1);             // default history
+    CHECK (std::abs (arrival (0.05) - expected) <= 1);            // 50 ms history, same answer
+    CHECK (std::abs (arrival (0.25) - expected) <= 1);            // and in between
+
+    // A nonsensical history falls back to the default rather than producing a
+    // two-sample line that nothing can read through.
+    {
+        AcousticSendMatrix m;
+        m.prepare (sr, 1, 1, -3.0);
+        CHECK (m.isPrepared());
+
+        std::vector<float> levels ((size_t) stride, 0.0f), delays ((size_t) stride, 0.0f);
+        levels[0] = 1.0f;
+        delays[0] = 100.0f;                                       // 4800 samples: needs the default
+        juce::AudioBuffer<float> in (1, numSamples);
+        in.clear();
+        std::vector<float> out ((size_t) numSamples, 0.0f);
+        m.writeInputs (in, numSamples);
+        m.computeNodeFeed (out.data(), numSamples, 0, levels.data(), delays.data(), nullptr, stride);
+        m.advance (numSamples);
+        for (int i = 0; i < numSamples; ++i)
+            CHECK (std::isfinite (out[(size_t) i]));
+    }
+}
+
 static void testStereoPassThroughIdentity()
 {
     using namespace spatcore::dsp;
@@ -9822,6 +10182,8 @@ int main()
     try
     {
         testRenderSourceMapBuild();
+        testRenderSourceMapEffectsLayout();
+        testSharedInputRingWrapCounter();
         testStereoPassThroughIdentity();
         testStereoReconstructionInvariant();
         testStereoInactiveSlotsCleared();
@@ -9839,6 +10201,8 @@ int main()
         testReverbSendMatrixPerNodeDelay();
         testReverbSendMatrixSilentNodeIsSilent();
         testAcousticSendMatrixAlias();
+        testAcousticSendMatrixSourceRange();
+        testAcousticSendMatrixHistoryLength();
         testLockFreeRingBuffer();
         testDelayTargetSmootherDeterminism();
         testRtSnapshot();
