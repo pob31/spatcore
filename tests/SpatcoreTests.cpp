@@ -54,6 +54,10 @@
                                  so the three tests of item 11 are its tests and
                                  run unmodified; a dsp-qualified instance behaves
                                  identically
+     13. rt/RtTripleBuffer      wait-free parameter hand-off: latest wins, the
+                                 reader keeps its slot until something new is
+                                 published, and a value read while a writer
+                                 thread hammers publish() is never torn
 */
 
 // OSCParser.h / OSCSerializer.h use juce::OSC* types but (verbatim-moved,
@@ -69,6 +73,7 @@
 
 #include "spatcore/rt/LockFreeRingBuffer.h"
 #include "spatcore/rt/RtSnapshot.h"
+#include "spatcore/rt/RtTripleBuffer.h"
 #include "spatcore/rt/RtThreadPriority.h"
 #include "spatcore/gpu/GpuHostWorkPool.h"
 #include "spatcore/dsp/DelayTargetSmoother.h"
@@ -102,10 +107,13 @@
 #endif
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <thread>
 #include <type_traits>
 #include <vector>
 
@@ -246,6 +254,134 @@ static void testRtSnapshot()
 }
 
 //==============================================================================
+//==============================================================================
+// rt/RtTripleBuffer - the wait-free twin of RtSnapshot. Two properties matter:
+// a reader that polls once per block always sees the NEWEST published value
+// (never a queue, never a stale one), and a value it reads is never a mixture
+// of two publishes - which is the whole point of the three-slot dance.
+//==============================================================================
+
+namespace triplebuffer_test
+{
+    struct Payload
+    {
+        std::uint32_t seq = 0;
+        std::uint32_t twice = 0;      // must always be 2*seq
+        std::uint32_t inverted = 0;   // must always be ~seq
+        float scaled = 0.0f;          // must always be seq * 0.5f
+
+        static Payload make (std::uint32_t n) noexcept
+        {
+            return { n, n * 2u, ~n, (float) n * 0.5f };
+        }
+
+        bool isConsistent() const noexcept
+        {
+            return twice == seq * 2u && inverted == ~seq && scaled == (float) seq * 0.5f;
+        }
+    };
+}
+
+static void testRtTripleBuffer()
+{
+    using namespace spatcore::rt;
+    using triplebuffer_test::Payload;
+
+    // --- single threaded: the hand-off protocol ------------------------------
+    {
+        RtTripleBuffer<Payload> buf;
+
+        // Before anything is published the reader sees a value-initialised T.
+        CHECK (! buf.hasPending());
+        CHECK (buf.acquire().seq == 0);
+        CHECK (buf.acquire().scaled == 0.0f);
+
+        buf.publish (Payload::make (7));
+        CHECK (buf.hasPending());
+        CHECK (buf.acquire().seq == 7);
+        CHECK (! buf.hasPending());
+
+        // Nothing new: the reader keeps the slot it holds.
+        CHECK (buf.acquire().seq == 7);
+
+        // Latest wins - the intermediate publish is dropped, not queued.
+        buf.publish (Payload::make (8));
+        buf.publish (Payload::make (9));
+        CHECK (buf.acquire().seq == 9);
+        CHECK (buf.acquire().seq == 9);
+
+        // Many publishes without a reader in between must not corrupt anything.
+        for (std::uint32_t i = 10; i < 200; ++i)
+            buf.publish (Payload::make (i));
+        const Payload& p = buf.acquire();
+        CHECK (p.seq == 199);
+        CHECK (p.isConsistent());
+    }
+
+    // --- two threads: never torn, never stale, never blocking ---------------
+    {
+        RtTripleBuffer<Payload> buf;
+        constexpr std::uint32_t kLast = 199999;
+
+        std::atomic<bool> writerDone { false };
+        std::thread writer ([&buf, &writerDone, kLast]
+        {
+            for (std::uint32_t i = 1; i <= kLast; ++i)      // seq 0 is the pre-publish default
+                buf.publish (Payload::make (i));
+            writerDone.store (true, std::memory_order_release);
+        });
+
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds (10);
+        std::uint32_t highest = 0, previous = 0;
+        long long iterations = 0, acquired = 0;
+        bool torn = false, wentBackwards = false;
+
+        for (;;)
+        {
+            const Payload& p = buf.acquire();
+            ++iterations;
+
+            // seq 0 is the value-initialised payload the reader sees until the
+            // first publish lands - not a torn read.
+            if (p.seq != 0 && ! p.isConsistent())
+                torn = true;                       // a mixture of two publishes
+            if (p.seq < previous)
+                wentBackwards = true;              // an older value after a newer one
+            if (p.seq > highest)
+            {
+                highest = p.seq;
+                ++acquired;
+            }
+            previous = p.seq;
+
+            if (highest == kLast)
+                break;
+            if (writerDone.load (std::memory_order_acquire) && iterations > 4)
+                break;                             // writer finished: one more sweep is plenty
+            if (iterations > 50000000 || std::chrono::steady_clock::now() > deadline)
+                break;                             // never hang the suite
+        }
+
+        writer.join();
+
+        // Drain whatever landed after the loop exited.
+        for (int i = 0; i < 4; ++i)
+        {
+            const Payload& p = buf.acquire();
+            if (p.seq != 0 && ! p.isConsistent())
+                torn = true;
+            if (p.seq > highest)
+                highest = p.seq;
+        }
+
+        CHECK (! torn);
+        CHECK (! wentBackwards);
+        CHECK (highest == kLast);          // the last publish is always observable
+        CHECK (acquired >= 1);
+        CHECK (acquired <= iterations);    // the reader never spun waiting for a value
+    }
+}
+
 static void testOscRoundtrip()
 {
     juce::OSCMessage msg (juce::OSCAddressPattern ("/spatcore/test"));
@@ -3649,6 +3785,7 @@ int main()
         testLockFreeRingBuffer();
         testDelayTargetSmootherDeterminism();
         testRtSnapshot();
+        testRtTripleBuffer();
         testOscRoundtrip();
         testRtThreadPriority();
         testGpuHostWorkPoolDeterminism();

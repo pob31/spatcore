@@ -40,6 +40,7 @@
 #include "rt/RtThreadPriority.h"
 #include "rt/ReverbDiagnostics.h"
 #include "rt/RtSnapshot.h"
+#include "rt/RtTripleBuffer.h"
 #include "rt/SharedInputRingBuffer.h"
 
 // dsp/ - smoothers, filters, detectors
