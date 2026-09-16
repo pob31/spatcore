@@ -350,6 +350,16 @@ The CPU DSP path is **hand-rolled per-sample**, not `juce::dsp`.
   (peak/RMS, attack and release), `Waveshaper` curves, and `FastDecibels` — libm-free log2/exp2, so a
   render hashed on one platform matches another. `rt/RtTripleBuffer.h` is the wait-free parameter
   hand-off (`RtSnapshot` holds a SpinLock on both sides). **[V]**
+- **The effects module set** (2026-09, spatcore-only so far). Nine module types behind one
+  `IEffectModule` interface, eleven slots per chain (EQ and dynamics doubled). Six are ports of the
+  user's Max gen~ prototypes, re-decoded and independently re-traced before implementation, and they
+  deliberately do NOT reproduce four defects found in those patches (a bracket slip in the shelf
+  alpha, a doubled dB conversion on shelf gain, an expander ratio of 2 − 1/R, and a stale 20 Hz
+  sidechain default) — see `Documentation/effects-channels-plan.md` §5.13 in the app repo. The
+  phaser and the reverb have no prototype and are designed to the plan. The reverb wraps ONE node of
+  `reverb/ReverbFDNAlgorithm.h` per channel, which is why that class gained a delay-ceiling
+  constructor argument and a node-index offset: without the offset every per-channel reverb would be
+  node 0 and 32 of them would share one modal structure. **[V]**
 - **Prefilter — the headline divergence.** There is **no √(jω) / +3 dB-per-octave WFS
   field-correction filter (FIR or IIR) anywhere in `Source/`** (independently re-grepped: all
   "pre-filter" hits are the Floor-Reflection chain). The only per-tap spectral shaping is a

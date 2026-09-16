@@ -92,6 +92,13 @@
 #include "effects/modules/TremoloModule.h"
 #include "effects/modules/BitcrusherModule.h"
 #include "effects/modules/EffectEQModule.h"
+#include "effects/modules/DistortionModule.h"
+#include "effects/modules/DynamicsModule.h"
+#include "effects/modules/ModulationModule.h"
+#include "effects/modules/PhaserModule.h"
+#include "effects/modules/EffectReverbModule.h"
+#include "effects/modules/MultitapDelayModule.h"
+#include "effects/EffectPresets.h"
 #include "effects/EffectChain.h"
 
 // gpu/ - host-facing surface (interfaces, device manager, plugin factory,

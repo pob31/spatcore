@@ -79,6 +79,12 @@
                                  keyed dither) and the EQ (bit-identical to the
                                  output EQ bank it wraps); plus every module
                                  bit-transparent when bypassed and at identity
+     18. effects/modules, part 2 distortion, dynamics, chorus/flanger, phaser,
+                                 reverb and multitap delay: each one's
+                                 characteristic law pinned numerically, identity
+                                 settings transparent, tails cleared by reset,
+                                 and no parameter in range able to produce a
+                                 non-finite sample or a runaway
      17. effects/EffectChain     eleven slots in a user-chosen order: a reorder
                                  out and back returns to the reference bit for
                                  bit (module state survives it), latency is the
@@ -116,6 +122,12 @@
 #include "spatcore/effects/modules/TremoloModule.h"
 #include "spatcore/effects/modules/BitcrusherModule.h"
 #include "spatcore/effects/modules/EffectEQModule.h"
+#include "spatcore/effects/modules/DistortionModule.h"
+#include "spatcore/effects/modules/DynamicsModule.h"
+#include "spatcore/effects/modules/ModulationModule.h"
+#include "spatcore/effects/modules/PhaserModule.h"
+#include "spatcore/effects/modules/EffectReverbModule.h"
+#include "spatcore/effects/modules/MultitapDelayModule.h"
 #include "spatcore/effects/EffectChain.h"
 #include "spatcore/dsp/AcousticTap.h"
 #include "spatcore/reverb/ReverbReturnProcessor.h"
@@ -5461,6 +5473,4255 @@ static void testChainNeutralAndGuarded()
     CHECK (chain.nanTrips.load() == 1);
 }
 
+//==============================================================================
+// effects/modules - Distortion (FxDist)
+//==============================================================================
+
+namespace disttest
+{
+    using namespace spatcore::effects;
+
+    /** Active, oversampling off, every stage at its identity: drive and output
+        at 0 dB are EXACTLY 1, the four shelves at 0 dB are switched off, and
+        the shaper sits on the hard clip. */
+    inline EffectChannelParams flat()
+    {
+        EffectChannelParams p;
+        p.dist.bypass = 0;
+        p.dist.oversample = 1;                      // off: nothing here depends on JUCE
+        p.dist.driveDb = 0.0f;
+        p.dist.shape = 0.0f;
+        p.dist.bias = 0.0f;
+        p.dist.outputDb = 0.0f;
+        p.dist.mix = 100.0f;
+        p.dist.preLoShelfDb = p.dist.preHiShelfDb = 0.0f;
+        p.dist.postLoShelfDb = p.dist.postHiShelfDb = 0.0f;
+        return p;
+    }
+
+    /** First output sample for a DC input, from a module whose first (and so
+        snapping) parameter set is p. Sample 0 is before the DC blocker or any
+        filter has had a chance to move it. */
+    inline float firstOut (const EffectChannelParams& p, float dcIn)
+    {
+        DistortionModule m;
+        m.prepare (module_test::config (48000.0, 256));
+        m.applyParams (p, 0);
+        std::vector<float> buf = module_test::dc (64, dcIn);
+        module_test::render (m, buf);
+        return buf[0];
+    }
+
+    /** Small enough that a +6 dB shelf still cannot reach the clip ceiling. */
+    inline std::vector<float> smallNoise (int n, int seed)
+    {
+        std::vector<float> v ((size_t) n);
+        for (int i = 0; i < n; ++i)
+            v[(size_t) i] = 0.05f * FrDiffusion::hashNoiseBipolar ((std::uint32_t) (i + seed * 977), 17u);
+        return v;
+    }
+}
+
+static void testDistortionBypassAndIdentity()
+{
+    using namespace spatcore::effects;
+
+    // Bypassed in a slot at the defaults: the slot never runs the module, so
+    // the buffer comes back untouched, negative zeros and denormals included.
+    {
+        ModuleSlot slot;
+        slot.prepare (module_test::config (48000.0, 256), std::make_unique<DistortionModule>());
+        EffectChannelParams p;                              // dist.bypass == 1
+        slot.applyParams (p, 0);
+        std::vector<float> buf = eqtests::makeAwkwardSignal (256);
+        const std::vector<float> reference = buf;
+        for (int b = 0; b < 4; ++b)
+            slot.process (buf.data(), 256);
+        CHECK (eqtests::bitEqualBlock (buf, reference));
+    }
+
+    // Mix 0 while ACTIVE is the identity AT THE LATENCY THE MODULE REPORTS.
+    // With no oversampler there is no latency to honour, so it is the plain
+    // identity and has to be BIT-exact: the module returns early rather than
+    // crossfading the input against itself, and the negative zero and the two
+    // denormals come back untouched. 40 dB of drive would be unmissable at any
+    // other mix.
+    {
+        DistortionModule m;
+        m.prepare (module_test::config (48000.0, 256));
+        EffectChannelParams p = disttest::flat();
+        p.dist.mix = 0.0f;
+        p.dist.driveDb = 40.0f;
+        p.dist.oversample = 1;
+        CHECK (! m.applyParams (p, 0).bypass);
+        CHECK (m.getLatencySamples() == 0);
+        std::vector<float> buf = eqtests::makeAwkwardSignal (256);
+        const std::vector<float> reference = buf;
+        module_test::render (m, buf);
+        CHECK (eqtests::bitEqualBlock (buf, reference));
+    }
+
+    // With the oversampler ON the module reports a latency, and what mix 0
+    // owes is the input DELAYED BY IT. Handing back an UNDELAYED block here
+    // would be a module that reports five samples of delay on a block it just
+    // passed through, and a channel that jumps five samples through time the
+    // moment the mix smoother lands on zero - testDistortionMixAlignment
+    // measures that step. Still bit-exact, because the alignment line is a
+    // plain ring: the awkward signal arrives intact, five samples late. The
+    // first L samples are the module's own pre-roll.
+    {
+        DistortionModule m;
+        m.prepare (module_test::config (48000.0, 256));
+        EffectChannelParams p = disttest::flat();
+        p.dist.mix = 0.0f;
+        p.dist.driveDb = 40.0f;
+        p.dist.oversample = 3;
+        CHECK (! m.applyParams (p, 0).bypass);
+        const int L = m.getLatencySamples();
+        CHECK (L > 0);
+
+        std::vector<float> buf = eqtests::makeAwkwardSignal (256);
+        const std::vector<float> reference = buf;
+        module_test::render (m, buf);
+
+        bool delayedIdentity = true;
+        for (int i = L; i < 256; ++i)
+            if (! bitEqualFloat (buf[(size_t) i], reference[(size_t) (i - L)]))
+                delayedIdentity = false;
+        CHECK (delayedIdentity);
+    }
+
+    // Fully wet with every stage at its identity is bit-exact too: 0 dB is
+    // exactly 1, a 0 dB shelf is switched OFF rather than run at unity, and
+    // the hard clip leaves anything inside +-0.8 alone. The exceptions are the
+    // two +-1e7 samples, which it must catch.
+    {
+        DistortionModule m;
+        m.prepare (module_test::config (48000.0, 256));
+        m.applyParams (disttest::flat(), 0);
+        std::vector<float> buf = eqtests::makeAwkwardSignal (256);
+        const std::vector<float> reference = buf;
+        module_test::render (m, buf);
+
+        bool transparent = true;
+        for (int i = 0; i < 256; ++i)
+            if (i != 3 && i != 4 && ! bitEqualFloat (buf[(size_t) i], reference[(size_t) i]))
+                transparent = false;
+        CHECK (transparent);
+        CHECK (bitEqualFloat (buf[3], 0.8f));
+        CHECK (bitEqualFloat (buf[4], -0.8f));
+    }
+}
+
+static void testDistortionShaperLaw()
+{
+    using namespace spatcore::effects;
+    namespace fd = spatcore::dsp::FastDecibels;
+    EffectChannelParams p = disttest::flat();
+
+    // Hard clip with 12 dB of drive: 0.5 * 10^(12/20) = 1.991, past the +-0.8
+    // ceiling. That SAMPLE 0 already sits on it pins the first applyParams
+    // after prepare snapping its smoothers rather than gliding up.
+    p.dist.driveDb = 12.0f;
+    CHECK (bitEqualFloat (disttest::firstOut (p, 0.5f), 0.8f));
+
+    // Pure tanh: tanh(0.2) = 0.1973753. Shape 0.5 is the plain crossfade,
+    // 0.5 + 0.5*(tanh(0.5) - 0.5) = 0.5 + 0.5*(0.4621172 - 0.5) = 0.4810586,
+    // which also pins the SENSE of the control (0 clip, 1 tanh - the
+    // prototype's percentage reads the other way). Tolerances because
+    // std::tanh moves by an ULP or two across platforms.
+    p.dist.driveDb = 0.0f;
+    p.dist.shape = 1.0f;
+    CHECK (std::fabs (disttest::firstOut (p, 0.2f) - 0.1973753f) < 1.0e-6f);
+    p.dist.shape = 0.5f;
+    CHECK (std::fabs (disttest::firstOut (p, 0.5f) - 0.4810586f) < 1.0e-6f);
+
+    // Bias, the plan's addition. The curve still passes through the origin, so
+    // tanh(0 + 0.3) - tanh(0.3) is exactly 0 and silence stays silent; DC in
+    // gives tanh(0.5) - tanh(0.3) = 0.4621172 - 0.2913126 = 0.1708046 at
+    // sample 0, before the DC blocker the bias engages removes the offset.
+    p.dist.shape = 1.0f;
+    p.dist.bias = 0.3f;
+    CHECK (disttest::firstOut (p, 0.0f) == 0.0f);
+    CHECK (std::fabs (disttest::firstOut (p, 0.2f) - 0.1708046f) < 1.0e-6f);
+
+    // The output control is a GAIN: the prototype's inlet is named
+    // "outputAttenuation" but a positive value boosts, and the plan keeps that
+    // arithmetic. 0.1 never reaches the ceiling, so this is the gain alone,
+    // computed the same way and therefore bit-exact.
+    p = disttest::flat();
+    p.dist.outputDb = 12.0f;
+    CHECK (bitEqualFloat (disttest::firstOut (p, 0.1f), 0.1f * fd::dbToGain (12.0f)));
+}
+
+static void testDistortionShelves()
+{
+    using namespace spatcore::effects;
+    using spatcore::dsp::OutputEQBiquadFilter;
+
+    // With the clipper chosen and the signal well inside +-0.8 the shaper is
+    // the identity and both gains are exactly 1, so the module IS its four
+    // shelves: the shared RBJ pair, in the prototype's order, at slope 0.7
+    // with the gain in the GAIN slot. A q/slope mix-up or a shelf in the wrong
+    // place breaks the bit match.
+    {
+        DistortionModule m;
+        m.prepare (module_test::config (48000.0, 256));
+        EffectChannelParams p = disttest::flat();
+        p.dist.preLoShelfHz  = 120.0f;  p.dist.preLoShelfDb  =  6.0f;
+        p.dist.preHiShelfHz  = 6000.0f; p.dist.preHiShelfDb  = -4.0f;
+        p.dist.postLoShelfHz = 200.0f;  p.dist.postLoShelfDb = -8.0f;
+        p.dist.postHiShelfHz = 9000.0f; p.dist.postHiShelfDb =  3.0f;
+        m.applyParams (p, 0);
+
+        OutputEQBiquadFilter ref[4];
+        for (int i = 0; i < 4; ++i)
+            ref[i].prepare (48000.0);
+        ref[0].setParameters (2, 120.0f,   6.0f, 0.7f, 0.7f);
+        ref[1].setParameters (5, 6000.0f, -4.0f, 0.7f, 0.7f);
+        ref[2].setParameters (2, 200.0f,  -8.0f, 0.7f, 0.7f);
+        ref[3].setParameters (5, 9000.0f,  3.0f, 0.7f, 0.7f);
+
+        bool matches = true;
+        for (int block = 0; block < 4; ++block)
+        {
+            std::vector<float> a = disttest::smallNoise (256, 11 + block);
+            std::vector<float> b = a;
+            module_test::render (m, a);
+            for (int i = 0; i < 4; ++i)
+                ref[i].processBlock (b.data(), 256);
+            if (! eqtests::bitEqualBlock (a, b))
+                matches = false;
+        }
+        CHECK (matches);
+    }
+
+    // The CORRECTED RBJ gain law: a low shelf passes DC at A^2 =
+    // 10^(gainDb/20), so 0.1 in gives 0.1, 0.398107 and 0.0251189. The
+    // prototype's shelves can only ever BOOST (0 dB is +1.00 dB there, -12 dB
+    // still +0.25 dB), so a faithful port fails the cut. 20000 samples is ~46
+    // time constants of a 20 Hz corner; 2 % covers the float32 steady state.
+    {
+        const float gains[3]    = { 0.0f, 12.0f, -12.0f };
+        const float expected[3] = { 0.0f, 0.398107f, 0.0251189f };  // [0] unused: 0 dB takes the bit-exact branch
+
+        for (int k = 0; k < 3; ++k)
+        {
+            DistortionModule m;
+            m.prepare (module_test::config (48000.0, 256));
+            EffectChannelParams p = disttest::flat();
+            p.dist.preLoShelfHz = 20.0f;
+            p.dist.preLoShelfDb = gains[k];
+            m.applyParams (p, 0);
+            std::vector<float> buf = module_test::dc (20000, 0.1f);
+            module_test::render (m, buf);
+
+            if (k == 0)
+                CHECK (bitEqualFloat (buf[19999], 0.1f));   // 0 dB is OFF, not "nearly unity"
+            else
+                CHECK (std::fabs (buf[19999] - expected[k]) < 0.02f * expected[k]);
+        }
+    }
+}
+
+static void testDistortionMixAlignment()
+{
+    using namespace spatcore::effects;
+
+    // The dry leg of the mix is delayed to match the oversampler, and nothing
+    // else in this file looks at it: the latency probe in
+    // testDistortionOversampling runs at mix 100, so it measures the WET leg
+    // alone and would pass unchanged with the alignment line deleted.
+
+    // 1. NO COMB AT A PARTIAL MIX. A 0.2 sine never reaches the +-0.8 ceiling
+    // and the clipper is the chosen curve, so the shaper is the identity and
+    // the wet leg is a bare oversampler round trip. A 50 % mix must then be
+    // exactly half the DELAYED dry plus half that wet leg. Summing an
+    // undelayed dry against it instead is a comb - five samples of offset puts
+    // a notch at 4.8 kHz - and even at 1 kHz it costs level and turns the
+    // phase.
+    {
+        const int n = 4096;
+        std::vector<float> in ((size_t) n);
+        for (int i = 0; i < n; ++i)
+            in[(size_t) i] = 0.2f * std::sin (6.283185307f * 1000.0f * (float) i / 48000.0f);
+
+        EffectChannelParams p = disttest::flat();
+        p.dist.oversample = 3;
+
+        DistortionModule wetOnly;
+        wetOnly.prepare (module_test::config (48000.0, 256));
+        wetOnly.applyParams (p, 0);
+        std::vector<float> wet = in;
+        module_test::render (wetOnly, wet);
+
+        p.dist.mix = 50.0f;
+        DistortionModule halfway;
+        halfway.prepare (module_test::config (48000.0, 256));
+        halfway.applyParams (p, 0);
+        const int L = halfway.getLatencySamples();
+        std::vector<float> half = in;
+        module_test::render (halfway, half);
+
+        CHECK (L > 0);
+
+        float worst = 0.0f;
+        for (int i = L; i < n; ++i)
+        {
+            const float want = 0.5f * in[(size_t) (i - L)] + 0.5f * wet[(size_t) i];
+            worst = std::fmax (worst, std::fabs (half[(size_t) i] - want));
+        }
+        CHECK (worst < 1.0e-6f);
+    }
+
+    // 2. MIX 0 AND MIX 1 % AGREE ABOUT WHERE IN TIME THE OUTPUT SITS, and the
+    // module reports that delay honestly at both. An early-out that skips the
+    // alignment line returns x[n] at mix 0 and x[n - 5] one per cent later,
+    // while claiming five samples of latency at both.
+    {
+        const int n = 4096;
+        std::vector<float> in ((size_t) n);
+        for (int i = 0; i < n; ++i)
+            in[(size_t) i] = 0.2f * std::sin (6.283185307f * 1000.0f * (float) i / 48000.0f)
+                           + 0.1f * std::sin (6.283185307f * 3100.0f * (float) i / 48000.0f);
+
+        const float mixes[2] = { 0.0f, 1.0f };
+        int measured[2] = { -1, -1 };
+
+        for (int k = 0; k < 2; ++k)
+        {
+            EffectChannelParams p = disttest::flat();
+            p.dist.oversample = 3;
+            p.dist.mix = mixes[k];
+
+            DistortionModule m;
+            m.prepare (module_test::config (48000.0, 256));
+            m.applyParams (p, 0);
+            std::vector<float> out = in;
+            module_test::render (m, out);
+
+            double bestErr = -1.0;
+            for (int d = 0; d < 16; ++d)
+            {
+                double err = 0.0;
+                for (int i = 1024; i < 3072; ++i)
+                {
+                    const double e = (double) out[(size_t) i] - (double) in[(size_t) (i - d)];
+                    err += e * e;
+                }
+                if (bestErr < 0.0 || err < bestErr) { bestErr = err; measured[k] = d; }
+            }
+
+            CHECK (measured[k] == m.getLatencySamples());
+        }
+
+        CHECK (measured[0] == measured[1]);
+    }
+
+    // 3. CROSSING MIX 0 DOES NOT MOVE THE CHANNEL IN TIME. oversample 0 is
+    // auto, which is 4x at 48 kHz, so this is the DEFAULT configuration: an
+    // ordinary fader ride to zero in 64-sample blocks. Before the dry leg was
+    // delivered at mix 0 this measured an excess step of 0.143 on a 0.30-peak
+    // sine - 48 % of the amplitude, at exactly the block where the mix smoother
+    // landed on zero.
+    {
+        const int n = 24000, block = 64, dropAt = 4096;
+        std::vector<float> in ((size_t) n);
+        for (int i = 0; i < n; ++i)
+            in[(size_t) i] = 0.30f * std::sin (6.283185307f * 1000.0f * (float) i / 48000.0f);
+        std::vector<float> out = in;
+
+        float natural = 0.0f;
+        for (int i = 1; i < n; ++i)
+            natural = std::fmax (natural, std::fabs (in[(size_t) i] - in[(size_t) (i - 1)]));
+
+        EffectChannelParams p = disttest::flat();
+        p.dist.oversample = 0;                              // auto
+        DistortionModule m;
+        m.prepare (module_test::config (48000.0, block));
+        m.applyParams (p, 0);
+        CHECK (m.getLatencySamples() > 0);                  // auto really did pick a factor
+
+        for (int off = 0; off + block <= n; off += block)
+        {
+            if (off == dropAt)
+            {
+                p.dist.mix = 0.0f;
+                m.applyParams (p, 0);
+            }
+            m.process (out.data() + off, block);
+        }
+
+        float excess = 0.0f;
+        for (int i = dropAt; i < n; ++i)
+            excess = std::fmax (excess, std::fabs (out[(size_t) i] - out[(size_t) (i - 1)]) - natural);
+        CHECK (excess < 0.01f);
+    }
+}
+
+static void testDistortionDcBlocker()
+{
+    using namespace spatcore::effects;
+
+    // 1. IT REMOVES DC. tanh(x + bias) - tanh(bias) passes through the origin,
+    // so silence stays silent, but it is not odd-symmetric: the mean of a sine
+    // through it is NOT zero. The same curve applied by hand is the reference
+    // for how much there was to remove, so this cannot pass by the blocker
+    // doing nothing to a signal that had no offset.
+    {
+        const int n = 48000;
+        std::vector<float> in ((size_t) n);
+        for (int i = 0; i < n; ++i)
+            in[(size_t) i] = 0.6f * std::sin (6.283185307f * 200.0f * (float) i / 48000.0f);
+
+        EffectChannelParams p = disttest::flat();
+        p.dist.shape = 1.0f;
+        p.dist.bias = 0.4f;
+
+        DistortionModule m;
+        m.prepare (module_test::config (48000.0, 256));
+        m.applyParams (p, 0);
+        std::vector<float> out = in;
+        module_test::render (m, out);
+
+        const float tb = std::tanh (0.4f);
+        double shaped = 0.0, blocked = 0.0;
+
+        for (int i = n / 2; i < n; ++i)                     // past the blocker's own settling
+        {
+            shaped  += (double) spatcore::dsp::Waveshaper::blend (in[(size_t) i], 1.0f, 0.4f, tb);
+            blocked += (double) out[(size_t) i];
+        }
+
+        shaped  /= (double) (n / 2);
+        blocked /= (double) (n / 2);
+
+        CHECK (std::fabs (shaped) > 0.01);                  // there really was DC to remove
+        CHECK (std::fabs (blocked) < 0.05 * std::fabs (shaped));
+    }
+
+    // 2. IT IS NOT TAKEN BACK OUT OF LIVE AUDIO. A 5 Hz high pass is not
+    // transparent to low-frequency material - it turns a 50 Hz tone by 5.7
+    // degrees - so switching it out in one sample is a step, not a no-op. Both
+    // routes into the gate are checked: the shape control leaving the tanh leg,
+    // and the bias itself going to zero. Before this was fixed the worst second
+    // difference after the move was 1300x and 2300x the baseline; it is now
+    // within a factor of a few, which is the block-endpoint ramp of shape and
+    // bias, not a switch. The amplitude stays inside the +-0.8 ceiling so the
+    // clipper contributes no corner of its own to the measurement.
+    {
+        for (int route = 0; route < 2; ++route)
+        {
+            const int n = 24000, block = 64, moveAt = 6400;
+            std::vector<float> out ((size_t) n);
+            for (int i = 0; i < n; ++i)
+                out[(size_t) i] = 0.25f * std::sin (6.283185307f * 50.0f * (float) i / 48000.0f);
+
+            EffectChannelParams p = disttest::flat();
+            p.dist.shape = 1.0f;
+            p.dist.bias = 0.3f;
+
+            DistortionModule m;
+            m.prepare (module_test::config (48000.0, block));
+            m.applyParams (p, 0);
+
+            for (int off = 0; off + block <= n; off += block)
+            {
+                if (off == moveAt)
+                {
+                    if (route == 0) p.dist.shape = 0.0f;    // the tanh leg leaves
+                    else            p.dist.bias = 0.0f;     // the asymmetry leaves
+                    m.applyParams (p, 0);
+                }
+                m.process (out.data() + off, block);
+            }
+
+            float before = 0.0f, after = 0.0f;
+            for (int i = 1; i + 1 < moveAt; ++i)
+                before = std::fmax (before, std::fabs (out[(size_t) (i + 1)] - 2.0f * out[(size_t) i] + out[(size_t) (i - 1)]));
+            for (int i = moveAt; i + 1 < n; ++i)
+                after = std::fmax (after, std::fabs (out[(size_t) (i + 1)] - 2.0f * out[(size_t) i] + out[(size_t) (i - 1)]));
+
+            CHECK (before > 0.0f);
+            CHECK (after < 10.0f * before);
+        }
+    }
+}
+
+static void testDistortionOversampling()
+{
+    using namespace spatcore::effects;
+
+    // The enum is 0 auto, 1 off, 2 = 2x, 3 = 4x. Off reports NO latency, and
+    // the factor is a VARIANT: it stays pending, the module running the old
+    // value, until the slot reaches silence and commits.
+    DistortionModule m;
+    m.prepare (module_test::config (48000.0, 512));
+    EffectChannelParams p = disttest::flat();               // oversample = 1, off
+    CHECK (! m.applyParams (p, 0).variantPending);          // off IS the running factor, nothing to commit
+    CHECK (m.getLatencySamples() == 0);                     // (the snap itself is pinned in testDistortionShaperLaw)
+
+    p.dist.oversample = 3;
+    CHECK (m.applyParams (p, 0).variantPending);
+    CHECK (m.getLatencySamples() == 0);                     // still running the old one
+
+    p.dist.oversample = 1;                                  // taken back before the fade ends
+    CHECK (! m.applyParams (p, 0).variantPending);          // cancels itself, no reset
+
+    p.dist.oversample = 3;
+    CHECK (m.applyParams (p, 0).variantPending);
+    m.reset();
+    m.commitPendingVariant();
+    const int l4 = m.getLatencySamples();
+    CHECK (l4 > 0);
+    CHECK (! m.applyParams (p, 0).variantPending);          // now it IS the running value
+
+    // Auto: 4x through 48 kHz, 2x at 96 kHz (one stage, so no more latency
+    // than 4x), off from 176.4 kHz up.
+    {
+        EffectChannelParams a = disttest::flat();
+        a.dist.oversample = 0;
+        DistortionModule low, mid, high;
+        low.prepare (module_test::config (48000.0, 256));
+        mid.prepare (module_test::config (96000.0, 256));
+        high.prepare (module_test::config (192000.0, 256));
+        low.applyParams (a, 0);
+        mid.applyParams (a, 0);
+        high.applyParams (a, 0);
+        CHECK (low.getLatencySamples() == l4);
+        CHECK (mid.getLatencySamples() > 0 && mid.getLatencySamples() <= l4);
+        CHECK (high.getLatencySamples() == 0);
+    }
+
+    // The reported latency is the delay the module really applies. A 1 kHz
+    // sine at 0.05 stays in the linear part of both curves (tanh's third
+    // harmonic is near -74 dB), so this is close to a bare oversampler round
+    // trip. One sample of slack: half-band IIR group delay is only near flat.
+    {
+        p.dist.shape = 1.0f;
+        m.applyParams (p, 0);
+        m.reset();                                          // snap the shape glide away
+
+        std::vector<float> in ((size_t) 4096);
+        for (int i = 0; i < 4096; ++i)
+            in[(size_t) i] = 0.05f * std::sin (6.283185307f * 1000.0f * (float) i / 48000.0f);
+        std::vector<float> out = in;
+        module_test::render (m, out);
+
+        int best = 0;
+        double bestErr = -1.0;
+        for (int d = 0; d < 16; ++d)
+        {
+            double err = 0.0;
+            for (int i = 1024; i < 3072; ++i)
+            {
+                const double e = (double) out[(size_t) i] - (double) in[(size_t) (i - d)];
+                err += e * e;
+            }
+            if (bestErr < 0.0 || err < bestErr) { bestErr = err; best = d; }
+        }
+        CHECK (best - l4 <= 1 && l4 - best <= 1);
+    }
+}
+
+static void testDistortionResetAndRange()
+{
+    using namespace spatcore::effects;
+
+    // reset() must leave nothing behind: four shelves, a DC blocker, an
+    // oversampler and the dry leg's alignment line all carry state. Exact zero
+    // is the right assertion - a cleared linear filter fed zeros rounds
+    // nothing, and blend(0) is exactly 0 whenever the bias and its tanh agree,
+    // which settled smoothers give. The mix is PARTIAL on purpose: at 100 %
+    // wet the alignment line is not in the output at all, and it is the one
+    // piece of state the mix-0 path deliberately does not drop, so nothing
+    // else here would notice reset() forgetting it - the first five samples
+    // would come back as the last five of the loud block, at 40 %.
+    {
+        DistortionModule m;
+        m.prepare (module_test::config (48000.0, 256));
+        EffectChannelParams p = disttest::flat();
+        p.dist.mix = 60.0f;
+        p.dist.oversample = 3;
+        p.dist.driveDb = 24.0f;
+        p.dist.shape = 1.0f;
+        p.dist.bias = 0.4f;
+        p.dist.preLoShelfHz  = 40.0f;   p.dist.preLoShelfDb  =  18.0f;
+        p.dist.postHiShelfHz = 3000.0f; p.dist.postHiShelfDb = -18.0f;
+        m.applyParams (p, 0);
+
+        std::vector<float> loud = module_test::awkwardBlock (256, 3);
+        module_test::render (m, loud);
+        m.reset();
+
+        std::vector<float> silence = module_test::dc (512, 0.0f);
+        module_test::render (m, silence);
+
+        bool silent = true;
+        for (int i = 0; i < 512; ++i)
+            if (silence[(size_t) i] != 0.0f)
+                silent = false;
+        CHECK (silent);
+    }
+
+    // Every control at a stop, plus NaN, must stay finite and bounded. The
+    // bound is a BLOW-UP DETECTOR, not a level check: by hand the worst steady
+    // state is about 63 (no drive pushes the shaper past 1, +24 dB of shelf is
+    // 15.85x and +12 dB of output 3.98x), and 2000 is thirty times that, so it
+    // catches an oscillation or a NaN leak and would happily pass a 20 dB
+    // gain-staging error. The NaN frequency lands on a LIVE shelf on purpose,
+    // because OutputEQBiquadFilter's own std::min/std::max pair passes a NaN
+    // through.
+    {
+        const float drives[3] = { 0.0f, 40.0f, std::numeric_limits<float>::quiet_NaN() };
+        const float shapes[3] = { 0.0f, 0.5f, 1.0f };
+        const float biases[3] = { -0.5f, 0.0f, 0.5f };
+        const std::uint8_t factors[3] = { 1, 2, 3 };
+
+        DistortionModule m;
+        m.prepare (module_test::config (48000.0, 256));
+        bool finite = true, bounded = true;
+
+        for (int a = 0; a < 3; ++a)
+        for (int b = 0; b < 3; ++b)
+        for (int c = 0; c < 3; ++c)
+        {
+            EffectChannelParams p = disttest::flat();
+            p.dist.driveDb = drives[a];
+            p.dist.shape = shapes[b];
+            p.dist.bias = biases[c];
+            p.dist.oversample = factors[(a + b + c) % 3];
+            p.dist.outputDb = 12.0f;
+            p.dist.mix = (c == 1) ? 0.0f : 55.0f;
+            p.dist.preLoShelfDb = 24.0f;
+            p.dist.postHiShelfDb = 24.0f;
+            p.dist.preHiShelfDb = -12.0f;
+            p.dist.preHiShelfHz = std::numeric_limits<float>::quiet_NaN();
+
+            m.applyParams (p, 0);
+            m.reset();
+            m.commitPendingVariant();
+            m.applyParams (p, 0);
+
+            std::vector<float> buf = module_test::awkwardBlock (256, 7 + a * 9 + b * 3 + c);
+            module_test::render (m, buf);
+
+            for (int i = 0; i < 256; ++i)
+            {
+                const float v = buf[(size_t) i];
+                if (! std::isfinite (v))     finite = false;
+                if (std::fabs (v) > 2000.0f) bounded = false;
+            }
+        }
+        CHECK (finite);
+        CHECK (bounded);
+    }
+
+    // Two instances, same settings, same audio - and no dependence on where
+    // the block boundaries fall. The module carries per-block ramps and
+    // retunes its shelves once a block, so a SETTLED parameter set must render
+    // the same whatever size the host hands over. Both factors are checked,
+    // because the oversampler is the one stage that could carry a block size
+    // into its own state.
+    {
+        EffectChannelParams base = disttest::flat();
+        base.dist.driveDb = 18.0f;
+        base.dist.shape = 0.6f;
+        base.dist.bias = 0.2f;
+        base.dist.outputDb = -6.0f;
+        base.dist.mix = 70.0f;
+        base.dist.preLoShelfDb = 5.0f;
+        base.dist.postHiShelfDb = -5.0f;
+
+        const std::uint8_t factors[2] = { 1, 3 };           // off, and 4x
+
+        for (int k = 0; k < 2; ++k)
+        {
+            EffectChannelParams p = base;
+            p.dist.oversample = factors[k];
+
+            DistortionModule whole, chunked;
+            whole.prepare (module_test::config (48000.0, 512));
+            chunked.prepare (module_test::config (48000.0, 512));
+            whole.applyParams (p, 0);
+            chunked.applyParams (p, 0);
+
+            std::vector<float> va = disttest::smallNoise (1024, 4);
+            std::vector<float> vb = va;
+            whole.process (va.data(), 1024);
+            for (int off = 0; off < 1024; off += 128)
+                chunked.process (vb.data() + off, 128);
+            CHECK (eqtests::bitEqualBlock (va, vb));
+        }
+    }
+
+    // And the limit of that, stated rather than avoided: while shape or bias is
+    // MOVING the render does depend on the block size, because both are a
+    // linear ramp between the endpoints of whatever block arrives and the
+    // shelves are retuned once per block. One 1024-sample call against 8 x 128
+    // over a full shape glide differs by 2.8e-2 on a 0.4 signal - about -23 dB,
+    // inaudible as a difference between two renders but a long way from zero,
+    // and the reason a hash of a render taken DURING a parameter move is not a
+    // portable reference.
+    {
+        EffectChannelParams p = disttest::flat();
+        p.dist.driveDb = 12.0f;
+        p.dist.shape = 1.0f;
+        p.dist.mix = 100.0f;
+
+        DistortionModule whole, chunked;
+        whole.prepare (module_test::config (48000.0, 1024));
+        chunked.prepare (module_test::config (48000.0, 1024));
+        whole.applyParams (p, 0);                           // snaps to shape 1
+        chunked.applyParams (p, 0);
+
+        p.dist.shape = 0.0f;                                // now GLIDE it away
+        whole.applyParams (p, 0);
+        chunked.applyParams (p, 0);
+
+        std::vector<float> va ((size_t) 1024);
+        for (int i = 0; i < 1024; ++i)
+            va[(size_t) i] = 0.4f * std::sin (0.07f * (float) i);
+        std::vector<float> vb = va;
+
+        whole.process (va.data(), 1024);
+        for (int off = 0; off < 1024; off += 128)
+            chunked.process (vb.data() + off, 128);
+
+        float worst = 0.0f;
+        for (int i = 0; i < 1024; ++i)
+            worst = std::fmax (worst, std::fabs (va[(size_t) i] - vb[(size_t) i]));
+        CHECK (worst > 0.0f);                               // it really is block-size dependent
+        CHECK (worst < 0.05f);                              // and only by the ramp's own resolution
+    }
+}
+
+//==============================================================================
+// effects/modules - Dynamics (FxDyn, x2)
+//==============================================================================
+
+//==============================================================================
+// effects/modules/DynamicsModule
+//==============================================================================
+
+namespace dyntests
+{
+    using namespace spatcore::effects;
+
+    /** Instance 0 switched on with both stages neutral, so each test switches
+        on only the thing it means to measure. */
+    inline EffectChannelParams base()
+    {
+        EffectChannelParams p;
+        DynamicsParams& d = p.dyn[0];
+        d.bypass = 0;   d.compOn = 0;      d.expOn = 0;
+        d.makeupDb = 0.0f;  d.lookaheadMs = 0.0f;  d.compDetectorDelayMs = 0.0f;
+        return p;
+    }
+
+    /** The sample rate is a PARAMETER, not a literal. Every law below used to
+        be measured at 48 kHz only, which is how a sidechain that diverged below
+        40 kHz reached the shipped defaults unnoticed. */
+    inline std::vector<float> sine (int n, float freqHz, float amp, float sr = 48000.0f)
+    {
+        std::vector<float> v ((size_t) n);
+        for (int i = 0; i < n; ++i)
+            v[(size_t) i] = amp * std::sin (6.283185307179586f * freqHz * (float) i / sr);
+        return v;
+    }
+
+    inline float peak (const std::vector<float>& v, int from, int to)
+    {
+        float m = 0.0f;
+        for (int i = from; i < to && i < (int) v.size(); ++i)
+            m = std::max (m, std::fabs (v[(size_t) i]));
+        return m;
+    }
+
+    /** The gain a settled stage is applying, averaged over a window so the
+        detector's ripple does not decide the answer. Samples near a zero
+        crossing are skipped: their ratio is all rounding.
+
+        Every steady-state tolerance below is 0.008 on this number, and the
+        ripple it has to absorb is set by DynamicsModule::kRmsWindowMs (10 ms).
+        Retune that constant and these tests go loose or start failing, with
+        nothing in the failure text to say why - so: this comment. */
+    inline float steadyGain (const std::vector<float>& out, const std::vector<float>& in,
+                             int from, int to)
+    {
+        const float floorLevel = 0.2f * peak (in, from, to);
+        float sum = 0.0f;
+        int count = 0;
+
+        for (int i = from; i < to; ++i)
+            if (std::fabs (in[(size_t) i]) > floorLevel)
+            {
+                sum += out[(size_t) i] / in[(size_t) i];
+                ++count;
+            }
+
+        return count > 0 ? sum / (float) count : 0.0f;
+    }
+
+    /** The first sample the module did not pass through untouched. -1 if it
+        passed the whole buffer. */
+    inline int firstAltered (const std::vector<float>& out, const std::vector<float>& in)
+    {
+        for (int i = 0; i < (int) out.size() && i < (int) in.size(); ++i)
+            if (! bitEqualFloat (out[(size_t) i], in[(size_t) i]))
+                return i;
+
+        return -1;
+    }
+}
+
+static void testDynamicsBypassAndIdentity()
+{
+    using namespace spatcore::effects;
+    ChainConfig cfg = module_test::config (48000.0, 256);
+
+    // Bypassed in a slot at the shipped defaults: the buffer is not touched.
+    {
+        ModuleSlot slot;
+        slot.prepare (cfg, std::make_unique<DynamicsModule>());
+        slot.applyParams (EffectChannelParams(), 0);
+        CHECK (slot.isBypassedSettled());
+        CHECK (slot.getLatencySamples() == 0);
+
+        for (int block = 0; block < 4; ++block)
+        {
+            std::vector<float> buf = (block == 0) ? eqtests::makeAwkwardSignal (256)
+                                                  : module_test::awkwardBlock (256, block);
+            const std::vector<float> reference = buf;
+            slot.process (buf.data(), 256);
+            CHECK (eqtests::bitEqualBlock (buf, reference));
+        }
+
+        CHECK (slot.nanTrips.load() == 0);
+    }
+
+    // Active and transparent, to the bit in both cases. Variant 0 is both
+    // stages off, which returns early; variant 1 runs both at 1:1, where the
+    // slope is exactly 0, so the gain computer returns exactly 0 dB and
+    // FastDecibels::dbToGain (0) is exactly 1.
+    //
+    // Variant 1 is the one that needs the module to WRITE the sample through
+    // rather than multiply it by one: makeAwkwardSignal plants two denormals,
+    // and the audio thread runs inside juce::ScopedNoDenormals, where
+    // denormal * 1.0f is 0.0f. This suite does not arm FTZ/DAZ, so it cannot
+    // observe that on its own - it is pinned here by inspection of the fact
+    // that process() stores y unmultiplied when the total gain is exactly 1.
+    for (int variant = 0; variant < 2; ++variant)
+    {
+        DynamicsModule m;
+        m.prepare (cfg);
+
+        EffectChannelParams p = dyntests::base();
+        p.dyn[0].compOn = (std::uint8_t) variant;
+        p.dyn[0].expOn = (std::uint8_t) variant;
+        p.dyn[0].compRatio = 1.0f;
+        p.dyn[0].expRatio = 1.0f;
+        m.applyParams (p, 0);
+
+        std::vector<float> buf = eqtests::makeAwkwardSignal (256);
+        const std::vector<float> reference = buf;
+        module_test::render (m, buf);
+        CHECK (eqtests::bitEqualBlock (buf, reference));
+        CHECK (m.getLatencySamples() == 0);
+    }
+
+    // The same, with the two denormals swapped for ordinary values, so that the
+    // assertion above is not the only thing standing between a multiply-by-one
+    // and a green suite: this one would pass either way, and its job is to say
+    // that nothing ELSE in the 1:1 path moves a bit.
+    {
+        DynamicsModule m;
+        m.prepare (cfg);
+
+        EffectChannelParams p = dyntests::base();
+        p.dyn[0].compOn = p.dyn[0].expOn = 1;
+        p.dyn[0].compRatio = p.dyn[0].expRatio = 1.0f;
+        m.applyParams (p, 0);
+
+        std::vector<float> buf = module_test::awkwardBlock (256, 3);
+        const std::vector<float> reference = buf;
+        module_test::render (m, buf);
+        CHECK (eqtests::bitEqualBlock (buf, reference));
+    }
+}
+
+static void testDynamicsCompressorLaw()
+{
+    using namespace spatcore::effects;
+
+    // A 1 kHz sine at 0.5 read as RMS settles at 20*log10 (0.5/sqrt 2) =
+    // -9.031 dBFS. Threshold -20, ratio 4:1, so the gain is
+    // (1/4 - 1)*(-9.031 + 20) = -8.227 dB = 0.3878 linear. The sidechain (a
+    // 20 Hz low cut and a 20 kHz high cut) moves the level by under 0.01 dB at
+    // 1 kHz, so 2 % is generous rather than loose.
+    DynamicsModule m;
+    m.prepare (module_test::config());
+
+    EffectChannelParams p = dyntests::base();
+    p.dyn[0].compOn = 1;
+    p.dyn[0].detector = 1;                      // RMS: a steady level to predict from
+    p.dyn[0].compThresholdDb = -20.0f;  p.dyn[0].compRatio = 4.0f;
+    p.dyn[0].compAttackMs = 5.0f;       p.dyn[0].compReleaseMs = 50.0f;
+    m.applyParams (p, 0);
+
+    const std::vector<float> in = dyntests::sine (48000, 1000.0f, 0.5f);
+    std::vector<float> out = in;
+    module_test::render (m, out);
+
+    CHECK (std::fabs (dyntests::steadyGain (out, in, 40000, 48000) - 0.38785f) <= 0.008f);
+    CHECK (std::fabs (m.getMeterDb() + 8.227f) <= 0.3f);
+
+    // The same settings 23 dB below the threshold: nothing engages, and
+    // "nothing" is bit-exact rather than nearly so.
+    DynamicsModule quiet;
+    quiet.prepare (module_test::config());
+    quiet.applyParams (p, 0);
+
+    std::vector<float> below = dyntests::sine (4800, 1000.0f, 0.01f);
+    const std::vector<float> reference = below;
+    module_test::render (quiet, below);
+    CHECK (eqtests::bitEqualBlock (below, reference));
+    CHECK (quiet.getMeterDb() == 0.0f);
+}
+
+static void testDynamicsPeakDetectorLaw()
+{
+    using namespace spatcore::effects;
+
+    // PEAK is the shipped default and the prototype's only mode, and it needs
+    // its own derivation: with attack and release both 0 ms the follower is the
+    // bare rectifier, so the level sweeps from the signal peak down to kMinDb
+    // and back twice per cycle and there is no closed form for the average.
+    //
+    // A release long enough to be negligible removes the sweep from the answer.
+    // At 2000 ms the ramp recovers about 1/96000 of its distance per sample, so
+    // over one 1 kHz period it gives back ~0.05 % while the 0.05 ms attack
+    // takes the whole gap at each peak: the gain RATCHETS down to the static
+    // law evaluated at the PEAK level and stays there.
+    //
+    //   peak of a 0.5 sine = -6.0206 dBFS, threshold -20 -> over = 13.9794
+    //   slope = 1/4 - 1 = -0.75  ->  -10.4845 dB  ->  0.299066 linear
+    //
+    // Measured 0.3012, i.e. the residual recovery, so the band is one-sided in
+    // the direction the derivation predicts.
+    DynamicsModule m;
+    m.prepare (module_test::config());
+
+    EffectChannelParams p = dyntests::base();
+    p.dyn[0].compOn = 1;
+    p.dyn[0].detector = 0;                      // PEAK
+    p.dyn[0].compThresholdDb = -20.0f;  p.dyn[0].compRatio = 4.0f;
+    p.dyn[0].compAttackMs = 0.05f;      p.dyn[0].compReleaseMs = 2000.0f;
+    m.applyParams (p, 0);
+
+    const std::vector<float> in = dyntests::sine (48000, 1000.0f, 0.5f);
+    std::vector<float> out = in;
+    module_test::render (m, out);
+
+    const float g = dyntests::steadyGain (out, in, 40000, 48000);
+    CHECK (g >= 0.299066f - 0.002f);
+    CHECK (g <= 0.299066f + 0.006f);
+    CHECK (std::fabs (m.getMeterDb() + 10.4845f) <= 0.3f);
+
+    // And the two modes really are different laws, not a flag with no effect:
+    // the same numbers in RMS settle at 0.3878, because the RMS of the sine is
+    // 3 dB under its peak and the compressor works on 3 dB less overshoot.
+    DynamicsModule rms;
+    rms.prepare (module_test::config());
+    p.dyn[0].detector = 1;
+    rms.applyParams (p, 0);
+
+    std::vector<float> rmsOut = in;
+    module_test::render (rms, rmsOut);
+    const float gr = dyntests::steadyGain (rmsOut, in, 40000, 48000);
+    CHECK (std::fabs (gr - 0.38785f) <= 0.008f);
+    CHECK (gr - g > 0.05f);
+}
+
+static void testDynamicsExpanderLawAndRange()
+{
+    using namespace spatcore::effects;
+
+    // A 1 kHz sine at 0.05 reads as -29.031 dBFS RMS, 9.031 dB under a
+    // threshold of -20. A 2:1 downward expander takes (R - 1)*over = -9.031 dB
+    // off, a gain of 0.3536. The prototype's (1 - 1/R) slope would give
+    // -4.52 dB = 0.594, which this separates by a factor of 1.7.
+    DynamicsModule m;
+    m.prepare (module_test::config());
+
+    EffectChannelParams p = dyntests::base();
+    p.dyn[0].expOn = 1;                 p.dyn[0].detector = 1;
+    p.dyn[0].expThresholdDb = -20.0f;   p.dyn[0].expRatio = 2.0f;
+    p.dyn[0].expRangeDb = -60.0f;       p.dyn[0].expHoldMs = 0.0f;
+    p.dyn[0].expAttackMs = 5.0f;        p.dyn[0].expReleaseMs = 50.0f;
+    m.applyParams (p, 0);
+
+    const std::vector<float> in = dyntests::sine (48000, 1000.0f, 0.05f);
+    std::vector<float> out = in;
+    module_test::render (m, out);
+    CHECK (std::fabs (dyntests::steadyGain (out, in, 40000, 48000) - 0.35355f) <= 0.008f);
+
+    // The meter is the deepest reduction of the block, so on a settled tone it
+    // is the law's own answer read back - the expander's side of the derived
+    // meter check the compressor law already makes.
+    CHECK (std::fabs (m.getMeterDb() + 9.031f) <= 0.3f);
+
+    // At 100:1 the law asks for 99*(-9.031) = -894 dB; the range floor stops it
+    // at -20 dB, a gain of exactly 0.1.
+    p.dyn[0].expRatio = 100.0f;
+    p.dyn[0].expRangeDb = -20.0f;
+    m.applyParams (p, 0);
+
+    std::vector<float> floored = in;
+    module_test::render (m, floored);
+    CHECK (std::fabs (dyntests::steadyGain (floored, in, 40000, 48000) - 0.1f) <= 0.002f);
+}
+
+static void testDynamicsKneeAndAutoMakeup()
+{
+    using namespace spatcore::effects;
+
+    // The soft knee is the plan's main addition to the prototype and the whole
+    // of it is one line - slope * t * t / (2 * knee) with t = over + knee/2 - so
+    // a one-character slip there would survive every other test in this file.
+    // Nine points across three widths and three overs, against the law written
+    // out by hand rather than recomputed from the same expression.
+    //
+    //   W = 0:   hard, so 0 dB below the threshold and slope*over above it
+    //   W = 12:  the quadratic runs over -6..+6, meeting both lines exactly
+    //   W = 24:  the quadratic runs over -12..+12, so all three points are in it
+    struct KneePoint { float widthDb, overDb, expectDb; };
+
+    static const KneePoint points[9] =
+    {
+        {  0.0f, -6.0f,  0.0000f }, {  0.0f, 0.0f,  0.0000f }, {  0.0f, 6.0f, -4.5000f },
+        { 12.0f, -6.0f,  0.0000f }, { 12.0f, 0.0f, -1.1250f }, { 12.0f, 6.0f, -4.5000f },
+        { 24.0f, -6.0f, -0.5625f }, { 24.0f, 0.0f, -2.2500f }, { 24.0f, 6.0f, -5.0625f }
+    };
+
+    for (const KneePoint& pt : points)
+    {
+        // RMS of a sine is its amplitude over sqrt 2, so this amplitude puts the
+        // detector exactly `overDb` above the -20 dB threshold.
+        const float amp = std::pow (10.0f, (-20.0f + pt.overDb) / 20.0f) * 1.41421356f;
+
+        DynamicsModule m;
+        m.prepare (module_test::config());
+
+        EffectChannelParams p = dyntests::base();
+        p.dyn[0].compOn = 1;                p.dyn[0].detector = 1;
+        p.dyn[0].compThresholdDb = -20.0f;  p.dyn[0].compRatio = 4.0f;
+        p.dyn[0].compKneeDb = pt.widthDb;
+        p.dyn[0].compAttackMs = 5.0f;       p.dyn[0].compReleaseMs = 50.0f;
+        m.applyParams (p, 0);
+
+        const std::vector<float> in = dyntests::sine (48000, 1000.0f, amp);
+        std::vector<float> out = in;
+        module_test::render (m, out);
+
+        const float gainDb = 20.0f * std::log10 (dyntests::steadyGain (out, in, 40000, 48000));
+        CHECK (std::fabs (gainDb - pt.expectDb) <= 0.06f);
+    }
+
+    // Auto makeup is HALF of what the gain computer takes off a signal sitting
+    // exactly at the threshold: -T*(1 - 1/R)/2 = 20*0.75/2 = +7.5 dB at T = -20,
+    // R = 4. The plan carries an open question on that /2, so what is pinned
+    // here is that the code implements what the plan currently says.
+    //
+    // Measured as a RATIO of the same render with auto makeup off, so the
+    // compressor's own -8.227 dB cancels and only the makeup is under test.
+    float withAuto = 0.0f, without = 0.0f;
+
+    for (int variant = 0; variant < 2; ++variant)
+    {
+        DynamicsModule m;
+        m.prepare (module_test::config());
+
+        EffectChannelParams p = dyntests::base();
+        p.dyn[0].compOn = 1;                p.dyn[0].detector = 1;
+        p.dyn[0].autoMakeup = (std::uint8_t) variant;
+        p.dyn[0].compThresholdDb = -20.0f;  p.dyn[0].compRatio = 4.0f;
+        p.dyn[0].compAttackMs = 5.0f;       p.dyn[0].compReleaseMs = 50.0f;
+        m.applyParams (p, 0);
+
+        const std::vector<float> in = dyntests::sine (48000, 1000.0f, 0.5f);
+        std::vector<float> out = in;
+        module_test::render (m, out);
+
+        (variant == 0 ? without : withAuto) = dyntests::steadyGain (out, in, 40000, 48000);
+
+        // The meter is gain reduction with makeup EXCLUDED, so it reads the
+        // same -8.227 dB whether the makeup is there or not.
+        CHECK (std::fabs (m.getMeterDb() + 8.227f) <= 0.3f);
+    }
+
+    CHECK (std::fabs (without - 0.38785f) <= 0.008f);
+    CHECK (std::fabs (withAuto - 0.91955f) <= 0.020f);
+    CHECK (std::fabs (withAuto / without - 2.37137f) <= 0.020f);      // +7.5 dB
+}
+
+static void testDynamicsLookaheadAndDetectorDelay()
+{
+    using namespace spatcore::effects;
+    ChainConfig cfg = module_test::config();
+
+    // Lookahead delays the AUDIO by exactly what it reports as latency.
+    {
+        DynamicsModule m;
+        m.prepare (cfg);
+        EffectChannelParams p = dyntests::base();
+        p.dyn[0].lookaheadMs = 1.0f;                 // 48 samples at 48 kHz
+        m.applyParams (p, 0);
+        CHECK (m.getLatencySamples() == 48);
+
+        std::vector<float> buf (128, 0.0f);
+        buf[0] = 1.0f;
+        module_test::render (m, buf);
+
+        CHECK (buf[48] == 1.0f);                     // whole samples, so no interpolation
+        float elsewhere = 0.0f;
+        for (int i = 0; i < 128; ++i)
+            if (i != 48)
+                elsewhere += std::fabs (buf[(size_t) i]);
+        CHECK (elsewhere == 0.0f);
+    }
+
+    // The detector delay delays the DETECTOR and costs no latency. With 5 ms of
+    // it the first 240 samples of a burst come out at exactly unity, because
+    // the detector is still reading the silence in front of the burst, and the
+    // reduction lands behind them. Without it the burst is crushed from the
+    // first sample.
+    //
+    // WHERE it lands is the assertion that matters: 5 ms at 48 kHz is 240
+    // samples, so the first altered sample is 240 and not 239 or 2400. A
+    // "nothing is touched for a while" check alone passes on a detector delay
+    // ten times too long, and on one that never engages at all.
+    EffectChannelParams p = dyntests::base();
+    p.dyn[0].compOn = 1;                p.dyn[0].compThresholdDb = -60.0f;
+    p.dyn[0].compRatio = 100.0f;
+    p.dyn[0].compAttackMs = 0.05f;      p.dyn[0].compReleaseMs = 5.0f;
+
+    const std::vector<float> in = dyntests::sine (1024, 1000.0f, 0.5f);
+
+    DynamicsModule late;
+    late.prepare (cfg);
+    p.dyn[0].compDetectorDelayMs = 5.0f;
+    late.applyParams (p, 0);
+    std::vector<float> delayed = in;
+    module_test::render (late, delayed);
+    CHECK (late.getLatencySamples() == 0);
+
+    bool untouched = true;
+    for (int i = 0; i < 200; ++i)
+        untouched = untouched && bitEqualFloat (delayed[(size_t) i], in[(size_t) i]);
+    CHECK (untouched);
+    CHECK (dyntests::firstAltered (delayed, in) == 241);
+    CHECK (dyntests::peak (delayed, 400, 700) < 0.25f * dyntests::peak (in, 400, 700));
+
+    DynamicsModule prompt;
+    prompt.prepare (cfg);
+    p.dyn[0].compDetectorDelayMs = 0.0f;
+    prompt.applyParams (p, 0);
+    std::vector<float> immediate = in;
+    module_test::render (prompt, immediate);
+    CHECK (dyntests::firstAltered (immediate, in) == 1);     // sample 0 is the sine's own zero
+    CHECK (dyntests::peak (immediate, 100, 200) < 0.25f * dyntests::peak (in, 100, 200));
+}
+
+static void testDynamicsHoldAndReset()
+{
+    using namespace spatcore::effects;
+
+    // 100 ms of a 1 kHz sine at 0.5, well above the gate's threshold, then
+    // 300 ms at 0.001, well below it. Peak detection sees the level cross back
+    // under the threshold at every zero crossing, so hold is what keeps the
+    // gate open between the very peaks that opened it, and for 50 ms after the
+    // signal stops.
+    //
+    // Three windows, not one: the hold has to EXPIRE as well as hold. 50 ms at
+    // 48 kHz is 2400 samples from the drop at 4800, so the gate is wide open
+    // through 7199 and must then close. A counter that reloaded instead of
+    // decrementing passes both of the first two windows.
+    std::vector<float> in = dyntests::sine (19200, 1000.0f, 1.0f);
+    for (int i = 0; i < 19200; ++i)
+        in[(size_t) i] *= (i < 4800) ? 0.5f : 0.001f;
+
+    float inHold[2] = { 0.0f, 0.0f };
+    float atExpiry[2] = { 0.0f, 0.0f };
+    float afterExpiry[2] = { 0.0f, 0.0f };
+
+    for (int variant = 0; variant < 2; ++variant)
+    {
+        DynamicsModule m;
+        m.prepare (module_test::config());
+
+        EffectChannelParams p = dyntests::base();
+        p.dyn[0].expOn = 1;                 p.dyn[0].expThresholdDb = -40.0f;
+        p.dyn[0].expRatio = 4.0f;           p.dyn[0].expRangeDb = -60.0f;
+        p.dyn[0].expAttackMs = 5.0f;        p.dyn[0].expReleaseMs = 5.0f;
+        p.dyn[0].expHoldMs = (variant == 0) ? 50.0f : 0.0f;
+        m.applyParams (p, 0);
+
+        std::vector<float> out = in;
+        module_test::render (m, out);
+        inHold[variant]      = dyntests::peak (out, 5600, 6000)   / dyntests::peak (in, 5600, 6000);
+        atExpiry[variant]    = dyntests::peak (out, 7000, 7150)   / dyntests::peak (in, 7000, 7150);
+        afterExpiry[variant] = dyntests::peak (out, 12000, 12400) / dyntests::peak (in, 12000, 12400);
+    }
+
+    CHECK (inHold[0] > 0.9f);            // 50 ms of hold: still wide open
+    CHECK (atExpiry[0] > 0.9f);          // and still open at 7000, just inside it
+    CHECK (afterExpiry[0] < 0.01f);      // expired and shut: the -60 dB range floor
+    CHECK (inHold[1] < 0.2f);            // no hold: shut as soon as the level fell
+    CHECK (afterExpiry[1] < 0.01f);
+
+    // reset() clears the tail. A loud burst leaves the lookahead line loaded
+    // and both gain states away from unity; silence fed afterwards must come
+    // out as true zeros rather than replaying any of it.
+    DynamicsModule m;
+    m.prepare (module_test::config());
+
+    EffectChannelParams p = dyntests::base();
+    p.dyn[0].compOn = 1;  p.dyn[0].expOn = 1;  p.dyn[0].lookaheadMs = 2.0f;
+    m.applyParams (p, 0);
+
+    std::vector<float> burst = dyntests::sine (2048, 1000.0f, 0.9f);
+    module_test::render (m, burst);
+    m.reset();
+
+    std::vector<float> silence (512, 0.0f);
+    module_test::render (m, silence);
+
+    bool allZero = true;
+    for (float v : silence)
+        allZero = allZero && (v == 0.0f);
+    CHECK (allZero);
+
+    // Stronger than a list of members: a module dirtied through every piece of
+    // state it owns - RMS detector history, a 25 ms detector delay line, a 4 ms
+    // lookahead line, a knee, a hold counter and an auto makeup smoother - must
+    // render bit-identically to one that was only ever prepared. Anything reset
+    // forgets to clear shows up here without having to be named.
+    {
+        EffectChannelParams dirty = dyntests::base();
+        dirty.dyn[0].compOn = 1;                dirty.dyn[0].expOn = 1;
+        dirty.dyn[0].detector = 1;              dirty.dyn[0].autoMakeup = 1;
+        dirty.dyn[0].compDetectorDelayMs = 25.0f;
+        dirty.dyn[0].lookaheadMs = 4.0f;        dirty.dyn[0].compKneeDb = 9.0f;
+        dirty.dyn[0].expHoldMs = 250.0f;        dirty.dyn[0].makeupDb = 6.0f;
+
+        DynamicsModule used, fresh;
+        used.prepare (module_test::config());
+        fresh.prepare (module_test::config());
+        used.applyParams (dirty, 0);
+        fresh.applyParams (dirty, 0);
+
+        std::vector<float> loud = dyntests::sine (4000, 130.0f, 0.9f);
+        module_test::render (used, loud);
+        used.reset();
+
+        std::vector<float> a = eqtests::makeAwkwardSignal (1024);
+        std::vector<float> b = a;
+        module_test::render (used, a);
+        module_test::render (fresh, b);
+        CHECK (eqtests::bitEqualBlock (a, b));
+    }
+}
+
+static void testDynamicsVariantAndLatency()
+{
+    using namespace spatcore::effects;
+
+    // The variant contract is this module's only conversation with ModuleSlot
+    // beyond bypass, and all four of its clauses are separately breakable.
+    DynamicsModule m;
+    m.prepare (module_test::config());
+
+    EffectChannelParams p = dyntests::base();
+    p.dyn[0].lookaheadMs = 1.0f;
+
+    // 1. The first apply after prepare SNAPS: no variant is pending and the
+    //    latency is already the new one.
+    CHECK (m.applyParams (p, 0).variantPending == false);
+    CHECK (m.getLatencySamples() == 48);
+
+    // 2. A later change is a pending STATE: the old lookahead keeps running and
+    //    the reported latency does not move yet.
+    p.dyn[0].lookaheadMs = 3.0f;
+    CHECK (m.applyParams (p, 0).variantPending == true);
+    CHECK (m.getLatencySamples() == 48);
+
+    // 3. A state, not an edge: handed the same value again it still says yes.
+    CHECK (m.applyParams (p, 0).variantPending == true);
+    CHECK (m.getLatencySamples() == 48);
+
+    // 4. Revoked before the slot got to silence: it cancels itself, with no
+    //    reset and nothing for the slot to do.
+    p.dyn[0].lookaheadMs = 1.0f;
+    CHECK (m.applyParams (p, 0).variantPending == false);
+    CHECK (m.getLatencySamples() == 48);
+
+    // 5. The latency moves at the COMMIT, which is where the slot has faded out
+    //    and called reset() first.
+    p.dyn[0].lookaheadMs = 3.0f;
+    CHECK (m.applyParams (p, 0).variantPending == true);
+    m.reset();
+    m.commitPendingVariant();
+    CHECK (m.getLatencySamples() == 144);
+    CHECK (m.applyParams (p, 0).variantPending == false);
+
+    // 6. A detector switch is a variant too, and costs no latency.
+    p.dyn[0].detector = 1;
+    CHECK (m.applyParams (p, 0).variantPending == true);
+    CHECK (m.getLatencySamples() == 144);
+    m.reset();
+    m.commitPendingVariant();
+    CHECK (m.getLatencySamples() == 144);
+    CHECK (m.applyParams (p, 0).variantPending == false);
+
+    // And the slot agrees with the module about all of it.
+    {
+        ModuleSlot slot;
+        slot.prepare (module_test::config(), std::make_unique<DynamicsModule>());
+        EffectChannelParams q = dyntests::base();
+        q.dyn[0].lookaheadMs = 2.0f;
+        slot.applyParams (q, 0);
+        CHECK (slot.getLatencySamples() == 96);
+
+        q.dyn[0].bypass = 1;
+        slot.applyParams (q, 0);
+        CHECK (slot.getLatencySamples() == 0);      // a bypassed slot reports none
+    }
+}
+
+static void testDynamicsSampleRates()
+{
+    using namespace spatcore::effects;
+
+    // Everything else here runs at 48 kHz, which is how a sidechain high cut
+    // that leaves the unit circle below 40 kHz reached the shipped defaults:
+    // OutputEQBiquadFilter clamps frequency to 20..20000 Hz with no Nyquist
+    // guard, so the default 20 kHz low pass designs w0 > pi at 32 kHz and
+    // 22.05 kHz and the detector chain diverges to NaN. The audio never passes
+    // through those filters, so the slot's NaN trap does not fire - what
+    // happens instead is that both gain computers read kMinDb and the meter
+    // reports a reduction with no relation to the signal (-14.2 dB at
+    // 22.05 kHz, -9.7 at 32 kHz, against a true -8.98).
+    //
+    // So: the SHIPPED defaults, the same tone, at every rate a device may
+    // offer. The answer must be the same one everywhere.
+    const double rates[] = { 22050.0, 32000.0, 40000.0, 44100.0, 48000.0, 88200.0, 96000.0 };
+
+    for (double sr : rates)
+    {
+        DynamicsModule m;
+        m.prepare (module_test::config (sr));
+
+        EffectChannelParams p;                  // SHIPPED defaults, not base()
+        p.dyn[0].bypass = 0;
+        p.dyn[0].compOn = 1;
+        p.dyn[0].expOn = 1;                     // both sidechains, both high cuts
+        p.dyn[0].lookaheadMs = 0.0f;            // so out[i]/in[i] IS the gain
+        m.applyParams (p, 0);
+
+        const int n = (int) (sr / 2.0);
+        const std::vector<float> in = dyntests::sine (n, 1000.0f, 0.5f, (float) sr);
+        std::vector<float> out = in;
+        module_test::render (m, out);
+
+        bool finite = true;
+        for (float v : out)
+            finite = finite && std::isfinite (v);
+
+        CHECK (finite);
+        CHECK (std::fabs (dyntests::steadyGain (out, in, n - 4000, n) - 0.35617f) <= 0.008f);
+        CHECK (std::fabs (m.getMeterDb() + 8.97f) <= 0.3f);
+    }
+
+    // The compressor law itself, at the two rates the plan's latency table
+    // cares about besides 48 kHz. The detector window is a time, not a sample
+    // count, so the settled answer is the same constant with the same
+    // tolerance; only the ripple around it changes.
+    for (double sr : { 44100.0, 96000.0 })
+    {
+        DynamicsModule m;
+        m.prepare (module_test::config (sr));
+
+        EffectChannelParams p = dyntests::base();
+        p.dyn[0].compOn = 1;                p.dyn[0].detector = 1;
+        p.dyn[0].compThresholdDb = -20.0f;  p.dyn[0].compRatio = 4.0f;
+        p.dyn[0].compAttackMs = 5.0f;       p.dyn[0].compReleaseMs = 50.0f;
+        m.applyParams (p, 0);
+
+        const int n = (int) sr;
+        const std::vector<float> in = dyntests::sine (n, 1000.0f, 0.5f, (float) sr);
+        std::vector<float> out = in;
+        module_test::render (m, out);
+
+        CHECK (std::fabs (dyntests::steadyGain (out, in, n - 8000, n) - 0.38785f) <= 0.008f);
+        CHECK (std::fabs (m.getMeterDb() + 8.227f) <= 0.3f);
+    }
+
+    // Lookahead and detector delay are times too, so their sample counts scale.
+    {
+        DynamicsModule m;
+        m.prepare (module_test::config (96000.0));
+        EffectChannelParams p = dyntests::base();
+        p.dyn[0].lookaheadMs = 1.0f;
+        m.applyParams (p, 0);
+        CHECK (m.getLatencySamples() == 96);
+
+        std::vector<float> buf (256, 0.0f);
+        buf[0] = 1.0f;
+        module_test::render (m, buf);
+        CHECK (buf[96] == 1.0f);
+    }
+}
+
+static void testDynamicsExtremesAndDeterminism()
+{
+    using namespace spatcore::effects;
+    ChainConfig cfg = module_test::config();
+
+    // Every control at an end stop, both detectors, auto makeup on and off, and
+    // a pass with NaNs in four of them: the negated clamps must land those on
+    // their low bound instead of letting a NaN into the audio. The compressor's
+    // sidechain is crossed over on purpose, so its detector sees almost
+    // nothing while the expander's sees everything.
+    //
+    // The ceiling is arithmetic, not a round number: makeAwkwardSignal peaks at
+    // 1e7, both gains are at most 1, and the largest makeup reachable here is
+    // 24 dB by hand plus -T*(1 - 1/R)/2 = 29.7 dB of auto makeup at T = -60,
+    // R = 100, i.e. 53.7 dB = x484. So 4.84e9, and anything materially above it
+    // is a sign error rather than a rounding one.
+    for (int variant = 0; variant < 4; ++variant)
+    {
+        EffectChannelParams p = dyntests::base();
+        DynamicsParams& d = p.dyn[0];
+        d.compOn = d.expOn = 1;
+        d.detector = (std::uint8_t) (variant & 1);
+        d.autoMakeup = (std::uint8_t) ((variant >> 1) & 1);
+        d.lookaheadMs = 5.0f;   d.makeupDb = 24.0f;
+        d.compThresholdDb = -60.0f;  d.compRatio = 100.0f;  d.compKneeDb = 24.0f;
+        d.compAttackMs = 0.05f;      d.compReleaseMs = 2000.0f;
+        d.compDetectorDelayMs = 50.0f;
+        d.compScLoCutHz = 2000.0f;   d.compScHiCutHz = 1000.0f;
+        d.expThresholdDb = 0.0f;     d.expRatio = 100.0f;   d.expRangeDb = -80.0f;
+        d.expAttackMs = 200.0f;      d.expReleaseMs = 5.0f; d.expHoldMs = 500.0f;
+
+        if (variant == 3)
+        {
+            const float notANumber = std::numeric_limits<float>::quiet_NaN();
+            d.compThresholdDb = d.compRatio = d.expRangeDb = d.lookaheadMs = notANumber;
+        }
+
+        DynamicsModule m;
+        m.prepare (cfg);
+        m.applyParams (p, 0);
+
+        std::vector<float> buf = eqtests::makeAwkwardSignal (2048);
+        module_test::render (m, buf);
+
+        bool sane = true;
+        for (float v : buf)
+            sane = sane && std::isfinite (v) && std::fabs (v) < 5.0e9f;
+        CHECK (sane);
+
+        // Strictly negative, not merely non-positive: these settings DO reduce,
+        // so a meter stuck at 0 - or at any constant - fails here. The derived
+        // meter values live in the law tests above.
+        CHECK (std::isfinite (m.getMeterDb()));
+        CHECK (m.getMeterDb() < 0.0f);
+        CHECK (m.getMeterDb() >= spatcore::dsp::FastDecibels::kMinDb);
+
+        if (variant == 3)
+            CHECK (m.getLatencySamples() == 0);      // a NaN lookahead clamps to none
+    }
+
+    // Determinism: the second chain slot with the same numbers is bit-identical
+    // to the first, and the same module repeats itself exactly after a reset.
+    EffectChannelParams p = dyntests::base();
+    p.dyn[0].compOn = 1;                    p.dyn[0].expOn = 1;
+    p.dyn[0].compThresholdDb = -30.0f;      p.dyn[0].compDetectorDelayMs = 3.0f;
+    p.dyn[0].lookaheadMs = 1.0f;            p.dyn[0].makeupDb = 3.0f;
+    p.dyn[1] = p.dyn[0];
+
+    DynamicsModule first, second;
+    first.prepare (cfg);
+    second.prepare (cfg);
+    first.applyParams (p, 0);
+    second.applyParams (p, 1);
+
+    std::vector<float> a = module_test::awkwardBlock (1024, 7);
+    std::vector<float> b = a;
+    module_test::render (first, a);
+    module_test::render (second, b);
+    CHECK (eqtests::bitEqualBlock (a, b));
+
+    first.reset();
+    std::vector<float> again = module_test::awkwardBlock (1024, 7);
+    module_test::render (first, again);
+    CHECK (eqtests::bitEqualBlock (a, again));
+
+    // Block size must not be audible: one long call and many short ones give
+    // the same samples, which is what lets the slot chunk at maxBlock.
+    DynamicsModule whole, chunked;
+    whole.prepare (cfg);
+    chunked.prepare (cfg);
+    whole.applyParams (p, 0);
+    chunked.applyParams (p, 0);
+
+    std::vector<float> longCall = module_test::awkwardBlock (4096, 11);
+    std::vector<float> shortCalls = longCall;
+    whole.process (longCall.data(), 4096);
+    for (int offset = 0; offset < 4096; offset += 64)
+        chunked.process (shortCalls.data() + offset, 64);
+    CHECK (eqtests::bitEqualBlock (longCall, shortCalls));
+}
+
+//==============================================================================
+// effects/modules - Chorus / Flanger (FxMod)
+//==============================================================================
+
+//==============================================================================
+// effects/modules/ModulationModule - chorus and flanger.
+//==============================================================================
+
+namespace modtests
+{
+    using namespace spatcore::effects;
+
+    /** One voice, no depth, no feedback and the slowest rate the range allows,
+        so any test that wants a STATIC delay gets one. */
+    inline EffectChannelParams basic()
+    {
+        EffectChannelParams p;
+        p.mod.bypass = 0;   p.mod.mode = 0;       p.mod.voices = 1;
+        p.mod.shape = 1;    p.mod.throughZero = 0;
+        p.mod.rateHz = 0.05f;   p.mod.depth = 0.0f;     p.mod.delayMs = 15.0f;
+        p.mod.feedback = 0.0f;  p.mod.phaseDeg = 0.0f;  p.mod.loCutHz = 20.0f;
+        p.mod.mix = 50.0f;
+        return p;
+    }
+
+    inline std::vector<float> impulse (int n)
+    {
+        std::vector<float> v ((size_t) n, 0.0f);
+        v[0] = 1.0f;
+        return v;
+    }
+
+    inline std::vector<float> sine (int n, float hz, double sr = 48000.0)
+    {
+        std::vector<float> v ((size_t) n);
+        for (int i = 0; i < n; ++i)
+            v[(size_t) i] = std::sin (6.2831853071795864f * hz * (float) i / (float) sr);
+        return v;
+    }
+
+    inline int peakIndex (const std::vector<float>& v)
+    {
+        int best = 0;
+        for (size_t i = 0; i < v.size(); ++i)
+            if (std::fabs (v[i]) > std::fabs (v[(size_t) best])) best = (int) i;
+        return best;
+    }
+
+    /** The SIGNED sample of largest magnitude in [from, to). */
+    inline float signedPeak (const std::vector<float>& v, int from, int to)
+    {
+        float best = 0.0f;
+        for (int i = from; i < to; ++i)
+            if (std::fabs (v[(size_t) i]) > std::fabs (best)) best = v[(size_t) i];
+        return best;
+    }
+
+    inline float rmsTail (const std::vector<float>& v, int from)
+    {
+        double acc = 0.0;
+        for (size_t i = (size_t) from; i < v.size(); ++i) acc += (double) v[i] * (double) v[i];
+        return (float) std::sqrt (acc / (double) ((int) v.size() - from));
+    }
+
+    /** The steepest sample-to-sample move in [from, end) - the measure a click
+        shows up in and a sweep does not. */
+    inline float worstStep (const std::vector<float>& v, int from)
+    {
+        float worst = 0.0f;
+        for (size_t i = (size_t) (from < 1 ? 1 : from); i < v.size(); ++i)
+            worst = std::max (worst, std::fabs (v[i] - v[i - 1]));
+        return worst;
+    }
+
+    inline bool bounded (const std::vector<float>& v, float limit)
+    {
+        for (float s : v) if (! std::isfinite (s) || std::fabs (s) > limit) return false;
+        return true;
+    }
+
+    inline float dbRatio (float a, float b)
+    {
+        return 20.0f * std::log10 (a / b);
+    }
+}
+
+static void testModulationTransparency()
+{
+    using namespace spatcore::effects;
+    // Bypassed at defaults, through a real slot: the buffer is not touched.
+    {
+        ModuleSlot slot;
+        slot.prepare (module_test::config (48000.0, 256), std::make_unique<ModulationModule>());
+        slot.applyParams (EffectChannelParams(), 0);
+        CHECK (slot.isBypassedSettled());
+        for (int block = 0; block < 6; ++block)
+        {
+            std::vector<float> buf = (block == 0) ? eqtests::makeAwkwardSignal (256)
+                                                  : module_test::awkwardBlock (256, block);
+            const std::vector<float> reference = buf;
+            slot.process (buf.data(), 256);
+            CHECK (eqtests::bitEqualBlock (buf, reference));
+        }
+    }
+    // ACTIVE at mix 0 with everything else at an extreme. Bit-identical rather
+    // than merely close, because the module leaves the block alone instead of
+    // crossfading against a wet leg scaled to zero - a crossfade at g = 0 still
+    // turns the negative zeros in the signal positive. Through-zero is OFF
+    // here, and that is the whole condition: with it on the dry leg is itself a
+    // delay and there is no transparent answer to give, which is what
+    // testModulationThroughZeroAtMixZero pins. Latency must agree - a module
+    // handing back the block it was given cannot be claiming 10 ms.
+    {
+        ModulationModule m;
+        m.prepare (module_test::config (48000.0, 256));
+        EffectChannelParams p = modtests::basic();
+        p.mod.mix = 0.0f;       p.mod.depth = 100.0f;   p.mod.feedback = 95.0f;
+        p.mod.voices = 3;       p.mod.rateHz = 10.0f;   p.mod.throughZero = 0;
+        p.mod.delayMs = 10.0f;
+        CHECK (! m.applyParams (p, 0).bypass);
+        CHECK (m.getLatencySamples() == 0);
+        for (int block = 0; block < 4; ++block)
+        {
+            std::vector<float> buf = (block == 0) ? eqtests::makeAwkwardSignal (256)
+                                                  : module_test::awkwardBlock (256, 40 + block);
+            const std::vector<float> reference = buf;
+            module_test::render (m, buf);
+            CHECK (eqtests::bitEqualBlock (buf, reference));
+        }
+    }
+}
+
+static void testModulationThroughZeroAtMixZero()
+{
+    using namespace spatcore::effects;
+    // Through-zero delays the DRY leg, so at mix 0 the honest output is the
+    // delayed dry and not the input. An early-out that handed the block back
+    // untouched would swap x[n-480] for x[n] the instant the mix settled - a
+    // step of up to twice the signal amplitude, and a channel that jumps 10 ms
+    // forward in time. The dry leg is raw, so the impulse arrives at full
+    // height: the low cut is in the wet path only.
+    {
+        ModulationModule m;
+        m.prepare (module_test::config (48000.0, 256));
+        EffectChannelParams p = modtests::basic();
+        p.mod.delayMs = 10.0f;  p.mod.throughZero = 1;  p.mod.mix = 0.0f;
+        m.applyParams (p, 0);
+        CHECK (m.getLatencySamples() == 480);          // and the audio had better match
+        std::vector<float> buf = modtests::impulse (2048);
+        module_test::render (m, buf);
+        CHECK (modtests::peakIndex (buf) == 480);
+        CHECK (buf[480] == 1.0f);                      // exactly: an unfiltered whole-sample read
+        CHECK (buf[0] == 0.0f);
+    }
+    // And riding the mix down to zero must not step. The yardstick is the
+    // input's own steepest move: the discontinuity the early-out used to
+    // produce here measured twenty-odd times that.
+    {
+        const int block = 512, blocks = 40;
+        ModulationModule m;
+        m.prepare (module_test::config (48000.0, block));
+        EffectChannelParams p = modtests::basic();
+        p.mod.delayMs = 10.0f;  p.mod.throughZero = 1;  p.mod.mix = 50.0f;
+        m.applyParams (p, 0);
+
+        const std::vector<float> in = modtests::sine (block * blocks, 220.0f);
+        std::vector<float> out;
+        EffectChannelParams zero = p;
+        zero.mod.mix = 0.0f;
+
+        for (int b = 0; b < blocks; ++b)
+        {
+            if (b == 10)
+                m.applyParams (zero, 0);               // the fader arrives at 0
+
+            std::vector<float> buf (in.begin() + b * block, in.begin() + (b + 1) * block);
+            module_test::render (m, buf);
+            out.insert (out.end(), buf.begin(), buf.end());
+        }
+
+        // From the edit onwards: the glide, the settle and the long tail after
+        // it are all one continuous signal.
+        CHECK (modtests::worstStep (out, 11 * block) < 2.0f * modtests::worstStep (in, 1));
+    }
+}
+
+static void testModulationDelayLaw()
+{
+    using namespace spatcore::effects;
+    // 10 ms at 48 kHz is exactly 480 samples. The law is t = centre*(1 + depth*lfo)
+    // and the Sine shape is -cos, so it is -1 at phase 0 and +1 at half a cycle:
+    // 480*(1 - 0.5) = 240 at 0 degrees and 480*(1 + 0.5) = 720 at 180. The rate is
+    // the slowest the range allows, so the LFO moves less than a thousandth of a
+    // cycle inside the buffer. This pins the multiplicative law AND the sign
+    // convention: an ADDITIVE depth, or a cosine LFO, misses both numbers.
+    const int expected[2] = { 240, 720 };
+    const float phases[2] = { 0.0f, 180.0f };
+    for (int k = 0; k < 2; ++k)
+    {
+        ModulationModule m;
+        m.prepare (module_test::config());
+        EffectChannelParams p = modtests::basic();
+        p.mod.delayMs = 10.0f;  p.mod.depth = 50.0f;
+        p.mod.phaseDeg = phases[k];     p.mod.mix = 100.0f;
+        m.applyParams (p, 0);
+        std::vector<float> buf = modtests::impulse (2048);
+        module_test::render (m, buf);
+        CHECK (modtests::peakIndex (buf) == expected[k]);
+        CHECK (buf[(size_t) expected[k]] > 0.9f);      // the 20 Hz low cut costs ~0.2 %
+    }
+    // Phase 90 is where this module's LFO meets the prototype's. The shape id is
+    // a LFOWaveforms one, as the plan's table asks, and LFOWaveforms::Sine is
+    // -cos: the module starts at the SHORTEST delay where fx_flanger.gendsp's
+    // phasor -> sin starts at the CENTRE. A quarter cycle in, -cos is zero and
+    // the modulated time is the centre time - 2 ms, i.e. 96 samples at 48 kHz.
+    // The delay is kept short here on purpose: at phase 90 the LFO is at its
+    // steepest, and a 10 ms centre would have drifted three quarters of a sample
+    // while the impulse was in flight.
+    {
+        ModulationModule m;
+        m.prepare (module_test::config());
+        EffectChannelParams p = modtests::basic();
+        p.mod.delayMs = 2.0f;   p.mod.depth = 50.0f;
+        p.mod.phaseDeg = 90.0f; p.mod.mix = 100.0f;
+        m.applyParams (p, 0);
+        std::vector<float> buf = modtests::impulse (1024);
+        module_test::render (m, buf);
+        CHECK (modtests::peakIndex (buf) == 96);
+    }
+    // MILLISECONDS, not samples. The prototype's delaytime inlet is in samples
+    // (there is no mstosamps anywhere in fx_flanger.gendsp), so this conversion
+    // is a deliberate deviation and the rest of the suite runs at 48 kHz only -
+    // nothing else here would catch it regressing.
+    {
+        const double rates[3] = { 44100.0, 96000.0, 192000.0 };
+        const int expectedAt[3] = { 441, 960, 1920 };
+        for (int k = 0; k < 3; ++k)
+        {
+            ModulationModule m;
+            m.prepare (module_test::config (rates[k]));
+            EffectChannelParams p = modtests::basic();
+            p.mod.delayMs = 10.0f;  p.mod.mix = 100.0f;
+            m.applyParams (p, 0);
+            std::vector<float> buf = modtests::impulse (4096);
+            module_test::render (m, buf);
+            CHECK (modtests::peakIndex (buf) == expectedAt[k]);
+        }
+    }
+    // The comb. 0.25 ms at 48 kHz is exactly 12 samples, so at mix 50 the output
+    // is 0.5*x[n] + 0.5*x[n-12]; 12 samples is half a period of 2 kHz, where the
+    // legs cancel, and a whole period of 4 kHz, where they add. The null is about
+    // -40 dB rather than zero because the 20 Hz low cut turns the wet leg by
+    // roughly a degree at 2 kHz, so this is a tolerance, not bit-equality.
+    for (int k = 0; k < 2; ++k)
+    {
+        ModulationModule m;
+        m.prepare (module_test::config());
+        EffectChannelParams p = modtests::basic();
+        p.mod.delayMs = 0.25f;
+        m.applyParams (p, 0);
+        std::vector<float> buf = modtests::sine (4096, (k == 0) ? 2000.0f : 4000.0f);
+        const float inRms = modtests::rmsTail (buf, 2048);
+        module_test::render (m, buf);
+        const float outRms = modtests::rmsTail (buf, 2048);
+        CHECK ((k == 0) ? (outRms < 0.05f * inRms) : (outRms > 0.95f * inRms));
+    }
+}
+
+static void testModulationLoCutPlacement()
+{
+    using namespace spatcore::effects;
+    // The low cut sits in the FORWARD path only, as wetDry.gendsp wires it: the
+    // dry leg is the raw input. A 100 Hz sine under a 2 kHz low cut therefore
+    // comes back at full level at a mix of almost nothing - and collapses at
+    // mix 100, where only the filtered leg is left. A port that filtered the dry
+    // leg too would pass no test in this file except this one.
+    {
+        ModulationModule m;
+        m.prepare (module_test::config());
+        EffectChannelParams p = modtests::basic();
+        p.mod.loCutHz = 2000.0f;    p.mod.mix = 0.001f;    // not zero: the module must RUN
+        m.applyParams (p, 0);
+        std::vector<float> buf = modtests::sine (8192, 100.0f);
+        const float inRms = modtests::rmsTail (buf, 4096);
+        module_test::render (m, buf);
+        CHECK (std::fabs (modtests::rmsTail (buf, 4096) / inRms - 1.0f) < 0.01f);
+    }
+    {
+        ModulationModule m;
+        m.prepare (module_test::config());
+        EffectChannelParams p = modtests::basic();
+        p.mod.loCutHz = 2000.0f;    p.mod.mix = 100.0f;
+        m.applyParams (p, 0);
+        std::vector<float> buf = modtests::sine (8192, 100.0f);
+        const float inRms = modtests::rmsTail (buf, 4096);
+        module_test::render (m, buf);
+        CHECK (modtests::rmsTail (buf, 4096) < 0.05f * inRms);
+    }
+}
+
+static void testModulationVoiceLevelLaw()
+{
+    using namespace spatcore::effects;
+    // The voice sum is scaled by 1/sqrt(voices), not by the voice count, and
+    // this is the test that says why. Voices are decorrelated - that is what the
+    // 120 degree offsets are for - so they sum in POWER: on broadband material
+    // at the plan's default depth, three taps are sqrt(3) louder than one, and
+    // 1/sqrt(3) is what puts the channel back where it was. Under 1/voices the
+    // same measurement reads -3.0 dB and -4.8 dB, i.e. the module quietly drops
+    // the channel by most of a fader for the crime of adding a voice.
+    float rms[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    for (int voices = 1; voices <= 3; ++voices)
+    {
+        ModulationModule m;
+        m.prepare (module_test::config());
+        EffectChannelParams p = modtests::basic();
+        p.mod.voices = (std::uint8_t) voices;
+        p.mod.depth = 50.0f;    p.mod.rateHz = 1.0f;    p.mod.mix = 100.0f;
+        m.applyParams (p, 0);
+        std::vector<float> buf = module_test::awkwardBlock (48000, 5);
+        module_test::render (m, buf);
+        rms[voices] = modtests::rmsTail (buf, 4800);    // past the fill of the line
+    }
+    CHECK (std::fabs (modtests::dbRatio (rms[2], rms[1])) < 1.0f);
+    CHECK (std::fabs (modtests::dbRatio (rms[3], rms[1])) < 1.0f);
+
+    // The corner the law does NOT hold, pinned deliberately so that nobody
+    // "fixes" it by accident: at depth zero the voices read the same sample and
+    // really are +3 / +4.8 dB. No constant serves both cases - how far apart the
+    // taps sit is depth's business - and depth zero is the setting that asks
+    // three voices to be one.
+    float flat[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    for (int voices = 1; voices <= 3; ++voices)
+    {
+        ModulationModule m;
+        m.prepare (module_test::config());
+        EffectChannelParams p = modtests::basic();
+        p.mod.voices = (std::uint8_t) voices;
+        p.mod.depth = 0.0f;     p.mod.mix = 100.0f;
+        m.applyParams (p, 0);
+        std::vector<float> buf = module_test::awkwardBlock (24000, 6);
+        module_test::render (m, buf);
+        flat[voices] = modtests::rmsTail (buf, 4800);
+    }
+    CHECK (std::fabs (modtests::dbRatio (flat[2], flat[1]) - 3.0103f) < 0.05f);
+    CHECK (std::fabs (modtests::dbRatio (flat[3], flat[1]) - 4.7712f) < 0.05f);
+}
+
+static void testModulationFeedbackAndReset()
+{
+    using namespace spatcore::effects;
+    // 1 ms at 48 kHz = 48 samples. The impulse leaves at 48; what it feeds back
+    // re-enters the line on the next sample and comes round again near 98, and
+    // once more near 148, each generation scaled by the signed feedback. The
+    // loop's damping filter spreads every repeat over a few samples, hence
+    // windows rather than exact indices.
+    for (int k = 0; k < 2; ++k)
+    {
+        ModulationModule m;
+        m.prepare (module_test::config());
+        EffectChannelParams p = modtests::basic();
+        p.mod.delayMs = 1.0f;   p.mod.mix = 100.0f;
+        p.mod.feedback = (k == 0) ? 50.0f : -50.0f;
+        m.applyParams (p, 0);
+        std::vector<float> buf = modtests::impulse (512);
+        module_test::render (m, buf);
+        const float first  = modtests::signedPeak (buf, 44, 60);
+        const float second = modtests::signedPeak (buf, 92, 112);
+        const float third  = modtests::signedPeak (buf, 140, 164);
+        CHECK (first > 0.9f);
+        CHECK (std::fabs (second) > 0.1f && std::fabs (second) < first);
+        CHECK (std::fabs (third) < std::fabs (second));        // the loop loses, never gains
+        CHECK ((k == 0) ? (second > 0.0f) : (second < 0.0f));  // the feedback is signed
+    }
+    // reset() runs when a slot has faded to silence, so no tail may survive it -
+    // not a quiet one, not a denormal one.
+    {
+        ModulationModule m;
+        m.prepare (module_test::config());
+        EffectChannelParams p = modtests::basic();
+        p.mod.delayMs = 5.0f;   p.mod.depth = 40.0f;   p.mod.rateHz = 3.0f;
+        p.mod.feedback = 95.0f; p.mod.mix = 100.0f;
+        m.applyParams (p, 0);
+        std::vector<float> excite = module_test::awkwardBlock (2048, 7);
+        module_test::render (m, excite);
+        CHECK (modtests::rmsTail (excite, 1024) > 1.0e-3f);    // it really was ringing
+        m.reset();
+        std::vector<float> quiet (4096, 0.0f);
+        module_test::render (m, quiet);
+        bool silent = true;
+        for (float s : quiet) if (s != 0.0f) silent = false;
+        CHECK (silent);
+    }
+}
+
+static void testModulationDenormalFlush()
+{
+    using namespace spatcore::effects;
+    // The block-end flush that keeps a silent channel out of denormal land must
+    // not be able to cut a LIVE signal off. The case that gets it wrong is an
+    // offset input that stops: the 20 Hz low cut then emits a step response that
+    // decays for about a third of a second while the input is an exact zero and
+    // the tap - still a whole delay behind, in the settled DC region - is an
+    // exact zero too. Watching only those two, the flush fires and truncates the
+    // decay to 0.0 in one sample. The artefact lands at stepSample + delay +
+    // blockSize, so it gets LOUDER as the buffer gets shorter, which is why this
+    // runs at two block sizes.
+    const int blockSizes[2] = { 512, 64 };
+    for (int k = 0; k < 2; ++k)
+    {
+        const int block = blockSizes[k];
+        ModulationModule m;
+        m.prepare (module_test::config (48000.0, block));
+        EffectChannelParams p = modtests::basic();
+        p.mod.delayMs = 30.0f;  p.mod.mix = 100.0f;    // 1440 samples of tap lag
+        m.applyParams (p, 0);
+
+        std::vector<float> out;
+        for (int b = 0; b < 48000 / block; ++b)
+        {
+            std::vector<float> buf ((size_t) block, 0.5f);
+            module_test::render (m, buf);
+            out.insert (out.end(), buf.begin(), buf.end());
+        }
+        const int stepAt = (int) out.size();
+        for (int b = 0; b < 48000 / block; ++b)
+        {
+            std::vector<float> buf ((size_t) block, 0.0f);
+            module_test::render (m, buf);
+            out.insert (out.end(), buf.begin(), buf.end());
+        }
+
+        // The genuine edge arrives at stepAt + 1440; everything after it is the
+        // low cut's own decay, which moves by about 0.002 per sample.
+        CHECK (modtests::worstStep (out, stepAt + 1445) < 0.01f);
+        CHECK (std::fabs (out[(size_t) stepAt + 1600]) > 0.01f);   // and it is still running
+    }
+}
+
+static void testModulationVariants()
+{
+    using namespace spatcore::effects;
+    // A voice-count change waits for silence and the module keeps running the
+    // OLD count meanwhile, so an edit taken back before the fade completed was
+    // never heard. Depth is non-zero because three voices reading one static
+    // delay would sum to the same sample and hide the difference. Mode rides
+    // along to show it is neither a variant nor audible.
+    {
+        ModulationModule a, b;
+        a.prepare (module_test::config());
+        b.prepare (module_test::config());
+        EffectChannelParams p = modtests::basic();
+        p.mod.depth = 50.0f;  p.mod.rateHz = 2.0f;  p.mod.mix = 100.0f;
+        a.applyParams (p, 0);
+        b.applyParams (p, 0);
+        EffectChannelParams three = p;
+        three.mod.voices = 3;
+        three.mod.mode = 1;                                    // flanger
+        CHECK (b.applyParams (three, 0).variantPending);
+        EffectChannelParams modeOnly = p;
+        modeOnly.mod.mode = 1;
+        CHECK (! a.applyParams (modeOnly, 0).variantPending);
+        std::vector<float> held = module_test::awkwardBlock (1024, 3), heldB = held;
+        module_test::render (a, held);
+        module_test::render (b, heldB);
+        CHECK (eqtests::bitEqualBlock (held, heldB));          // one voice both, mode ignored
+        b.commitPendingVariant();
+        CHECK (! b.applyParams (three, 0).variantPending);     // a state, not an edge
+        std::vector<float> after = module_test::awkwardBlock (1024, 4), afterB = after;
+        module_test::render (a, after);
+        module_test::render (b, afterB);
+        CHECK (! eqtests::bitEqualBlock (after, afterB));
+    }
+    // Through-zero delays the dry leg by the centre delay, which is latency and
+    // has to be reported. At 10 ms / 48 kHz BOTH legs are delayed by 480, so an
+    // impulse appears there and nowhere earlier.
+    {
+        ModulationModule m;
+        m.prepare (module_test::config());
+        EffectChannelParams p = modtests::basic();
+        p.mod.delayMs = 10.0f;  p.mod.throughZero = 1;
+        m.applyParams (p, 0);                                  // the first apply snaps
+        CHECK (m.getLatencySamples() == 480);
+        std::vector<float> buf = modtests::impulse (2048);
+        module_test::render (m, buf);
+        CHECK (modtests::peakIndex (buf) == 480);
+        CHECK (buf[480] > 0.9f && std::fabs (buf[479]) < 0.05f);
+        EffectChannelParams off = p;
+        off.mod.throughZero = 0;
+        CHECK (m.applyParams (off, 0).variantPending);
+        CHECK (m.getLatencySamples() == 480);                  // still the running topology
+        m.commitPendingVariant();
+        CHECK (m.getLatencySamples() == 0);
+    }
+}
+
+static void testModulationExtremes()
+{
+    using namespace spatcore::effects;
+    // Every shape at the worst of everything else. A comb at 0.95 feedback tops
+    // out near 1/(1 - 0.95) = 20x its input at resonance and the input peaks at
+    // 0.7, so anything past the limit below is a runaway, not a loud day. The
+    // shapes are also kept apart from one another: "bounded" alone would pass a
+    // module that ignored the shape parameter, or emitted silence.
+    std::vector<std::vector<float>> perShape;
+    for (int shape = 0; shape <= 8; ++shape)
+    {
+        ModulationModule m;
+        m.prepare (module_test::config (96000.0));
+        EffectChannelParams p = modtests::basic();
+        p.mod.shape = (std::uint8_t) shape;
+        p.mod.rateHz = 10.0f;   p.mod.depth = 100.0f;   p.mod.delayMs = 30.0f;
+        p.mod.feedback = 95.0f; p.mod.voices = 3;       p.mod.throughZero = 1;
+        p.mod.loCutHz = 2000.0f;    p.mod.mix = 100.0f;
+        m.applyParams (p, 0);
+        std::vector<float> last;
+        for (int block = 0; block < 8; ++block)
+        {
+            std::vector<float> buf = module_test::awkwardBlock (512, 60 + block);
+            module_test::render (m, buf);
+            CHECK (modtests::bounded (buf, 100.0f));
+            last = buf;
+        }
+        perShape.push_back (last);
+    }
+    for (size_t i = 0; i < perShape.size(); ++i)
+        for (size_t j = i + 1; j < perShape.size(); ++j)
+            CHECK (! eqtests::bitEqualBlock (perShape[i], perShape[j]));
+
+    // Out-of-range and not-a-number parameters land on a bound instead of in the
+    // audio - the clamps are negated comparisons, so a NaN takes the low bound.
+    {
+        ModulationModule m;
+        m.prepare (module_test::config());
+        EffectChannelParams p = modtests::basic();
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+        p.mod.rateHz = nan;     p.mod.depth = nan;      p.mod.phaseDeg = nan;
+        p.mod.loCutHz = nan;    p.mod.delayMs = 1.0e9f; p.mod.feedback = 500.0f;
+        p.mod.voices = 200;     p.mod.shape = 200;      p.mod.mix = 100.0f;
+        m.applyParams (p, 0);
+        for (int block = 0; block < 8; ++block)
+        {
+            std::vector<float> buf = module_test::awkwardBlock (512, 90 + block);
+            module_test::render (m, buf);
+            CHECK (modtests::bounded (buf, 100.0f));
+        }
+    }
+    // Feedback is the one parameter whose LOW bound is the dangerous end, so it
+    // does not take the plain clamp: -95 % is maximum INVERTED regeneration, and
+    // a NaN arriving there would be the worst setting on the dial rather than
+    // the safest. It lands on zero instead, so the impulse leaves once and does
+    // not come round.
+    {
+        ModulationModule m;
+        m.prepare (module_test::config());
+        EffectChannelParams p = modtests::basic();
+        p.mod.delayMs = 1.0f;   p.mod.mix = 100.0f;
+        p.mod.feedback = std::numeric_limits<float>::quiet_NaN();
+        m.applyParams (p, 0);
+        std::vector<float> buf = modtests::impulse (512);
+        module_test::render (m, buf);
+        CHECK (modtests::signedPeak (buf, 44, 60) > 0.9f);             // the delay still works
+        CHECK (std::fabs (modtests::signedPeak (buf, 92, 112)) < 0.02f);
+    }
+    // mix = NaN is the safe direction of the same rule: it lands on 0 and the
+    // module goes bit-transparent rather than writing a NaN into the buffer.
+    {
+        ModulationModule m;
+        m.prepare (module_test::config (48000.0, 256));
+        EffectChannelParams p = modtests::basic();
+        p.mod.mix = std::numeric_limits<float>::quiet_NaN();
+        m.applyParams (p, 0);
+        std::vector<float> buf = eqtests::makeAwkwardSignal (256);
+        const std::vector<float> reference = buf;
+        module_test::render (m, buf);
+        CHECK (eqtests::bitEqualBlock (buf, reference));
+    }
+    // Determinism. The Random shape is the only place the channel's noise key is
+    // read, so it doubles as the test that the key reaches the delay trajectory.
+    {
+        EffectChannelParams p = modtests::basic();
+        p.mod.shape = 8;                                       // Random
+        p.mod.rateHz = 10.0f;   p.mod.depth = 100.0f;   p.mod.mix = 100.0f;
+        ModulationModule ma, mb, mc;
+        ma.prepare (module_test::config (48000.0, 512, 5));
+        mb.prepare (module_test::config (48000.0, 512, 5));
+        mc.prepare (module_test::config (48000.0, 512, 6));
+        ma.applyParams (p, 0);  mb.applyParams (p, 0);  mc.applyParams (p, 0);
+        std::vector<float> a = module_test::awkwardBlock (4096, 11);
+        std::vector<float> b = a, c = a;
+        module_test::render (ma, a);
+        module_test::render (mb, b);
+        module_test::render (mc, c);
+        CHECK (eqtests::bitEqualBlock (a, b));                 // same key, same audio
+        int differs = 0;
+        for (int i = 2048; i < 4096; ++i)
+            if (! bitEqualFloat (a[(size_t) i], c[(size_t) i])) ++differs;
+        CHECK (differs > 100);
+    }
+}
+
+//==============================================================================
+// effects/modules - Phaser (FxPhaser)
+//==============================================================================
+
+//==============================================================================
+// effects/modules/PhaserModule
+//==============================================================================
+
+namespace phaser_test
+{
+    using namespace spatcore::effects;
+
+    constexpr double kPi = 3.14159265358979323846;
+
+    /** A STATIC chain: depth 0 makes the sweep factor exp2(0), which
+        FastDecibels returns as exactly 1, so every stage sits on the centre
+        frequency and the coefficients never move. That is what lets the phase
+        laws below be pinned to a number.
+
+        The tests that exercise the SWEEP - testPhaserSweepLaw,
+        testPhaserSpreadLaw, testPhaserLfoRateAndShape - set depthOct and
+        spreadOct themselves on top of this. Anything that asserts a static
+        law must leave them at zero, or the notch it is looking for moves
+        while it looks. */
+    inline EffectChannelParams active (float centreHz, int stages, float mix)
+    {
+        EffectChannelParams p;
+        p.phaser.bypass = 0;
+        p.phaser.stages = static_cast<std::uint8_t> (stages);
+        p.phaser.centreHz = centreHz;
+        p.phaser.spreadOct = 0.0f;
+        p.phaser.depthOct = 0.0f;
+        p.phaser.rateHz = 0.3f;
+        p.phaser.shape = 1;
+        p.phaser.feedback = 0.0f;
+        p.phaser.mix = mix;
+        return p;
+    }
+
+    /** Where N first-order allpasses tuned to fc have turned the signal by half
+        a turn, which is where a 50 % mix cancels. One stage turns it by
+        -2*atan(tan(pi f / sr) / t) with t = tan(pi fc / sr), so N of them reach
+        -pi where tan(pi f / sr) = t * tan(pi / 2N). */
+    inline double notchHz (double fc, int stages, double sr)
+    {
+        const double t = std::tan (kPi * fc / sr);
+        return sr / kPi * std::atan (t * std::tan (kPi / (2.0 * stages)));
+    }
+
+    /** The turn one allpass tuned to fc gives f, in radians. */
+    inline double stagePhase (double f, double fc, double sr)
+    {
+        return -2.0 * std::atan (std::tan (kPi * f / sr) / std::tan (kPi * fc / sr));
+    }
+
+    /** The frequency where a whole chain - stages SPREAD over spreadOct
+        octaves around centre, exactly as the module places them - has turned
+        the signal by `turns` whole turns.
+
+        `turns` 0.5 is the notch a 50 % mix cancels; `turns` 1 is where the
+        chain hands the feedback path the signal back in phase, which is the
+        self-oscillation frequency. The total turn falls monotonically from 0
+        to -N*pi as f goes to Nyquist, so bisection finds either exactly.
+
+        This is the closed form of notchHz() generalised: the CHECK in
+        testPhaserSpreadLaw pins the two against each other at spread 0, so a
+        mistake in this helper cannot quietly excuse a mistake in the module. */
+    inline double chainPhaseHz (double centre, double spreadOct, int stages, double sr, double turns)
+    {
+        const double target = -2.0 * kPi * turns;
+
+        auto total = [=] (double f)
+        {
+            double sum = 0.0;
+            for (int k = 0; k < stages; ++k)
+            {
+                const double offset = 2.0 * static_cast<double> (k)
+                                        / (static_cast<double> (stages) - 1.0) - 1.0;
+                sum += stagePhase (f, centre * std::pow (2.0, spreadOct * offset), sr);
+            }
+            return sum;
+        };
+
+        double lo = 1.0, hi = 0.45 * sr;
+        for (int i = 0; i < 200; ++i)
+        {
+            const double mid = 0.5 * (lo + hi);
+            if (total (mid) > target) lo = mid; else hi = mid;
+        }
+        return 0.5 * (lo + hi);
+    }
+
+    inline std::vector<float> sine (int n, double hz, double sr, double amp)
+    {
+        std::vector<float> v ((size_t) n);
+        for (int i = 0; i < n; ++i)
+            v[(size_t) i] = (float) (amp * std::sin (2.0 * kPi * hz * (double) i / sr));
+        return v;
+    }
+
+    inline float peakFrom (const std::vector<float>& v, int from)
+    {
+        float peak = 0.0f;
+        for (int i = from; i < (int) v.size(); ++i)
+            peak = std::max (peak, std::fabs (v[(size_t) i]));
+        return peak;
+    }
+
+    /** The peak over one window, which is how a moving notch is caught: the
+        same tone is deeply cancelled in one window and not in another. */
+    inline float peakBetween (const std::vector<float>& v, int from, int to)
+    {
+        float peak = 0.0f;
+        for (int i = from; i < to && i < (int) v.size(); ++i)
+            peak = std::max (peak, std::fabs (v[(size_t) i]));
+        return peak;
+    }
+
+    inline double rmsFrom (const std::vector<float>& v, int from)
+    {
+        double sum = 0.0;
+        for (int i = from; i < (int) v.size(); ++i)
+            sum += (double) v[(size_t) i] * (double) v[(size_t) i];
+        return std::sqrt (sum / (double) ((int) v.size() - from));
+    }
+
+    /** How many times the level dips as the sweep carries the notch across a
+        parked tone: a block RMS with hysteresis, counted over `span` samples
+        from `from`. One dip per LFO cycle, so this counts LFO cycles from the
+        audio alone. */
+    inline int countDips (const std::vector<float>& v, int from, int span)
+    {
+        constexpr int blockSize = 256;
+        constexpr double enter = 0.02, leave = 0.05;
+
+        int dips = 0;
+        bool below = false;
+
+        for (int i = from; i + blockSize <= from + span; i += blockSize)
+        {
+            double sum = 0.0;
+            for (int j = 0; j < blockSize; ++j)
+            {
+                const double x = v[(size_t) (i + j)];
+                sum += x * x;
+            }
+
+            const double rms = std::sqrt (sum / (double) blockSize);
+
+            if (! below && rms < enter)     { below = true; ++dips; }
+            else if (below && rms > leave)  { below = false; }
+        }
+
+        return dips;
+    }
+
+    /** A fresh phaser over a sine, so each phase law costs one line. */
+    inline std::vector<float> renderSine (const EffectChannelParams& p, double hz, int n,
+                                          double sr = 48000.0)
+    {
+        PhaserModule m;
+        m.prepare (module_test::config (sr, 512));
+        m.applyParams (p, 0);
+
+        std::vector<float> v = sine (n, hz, sr, 0.5);
+        module_test::render (m, v);
+        return v;
+    }
+
+    /** One module over one awkward block, so two of them can be compared. */
+    inline std::vector<float> renderBlock (IEffectModule& m, int seed)
+    {
+        std::vector<float> v = module_test::awkwardBlock (256, seed);
+        module_test::render (m, v);
+        return v;
+    }
+
+    /** Peak over `blocks` of hot noise, or a NaN if anything non-finite came
+        out - so one upper-bound check covers both runaway and NaN. */
+    inline float hotPeak (const EffectChannelParams& p, int blocks)
+    {
+        PhaserModule m;
+        m.prepare (module_test::config (48000.0, 256));
+        m.applyParams (p, 0);
+
+        float peak = 0.0f;
+
+        for (int block = 0; block < blocks; ++block)
+        {
+            std::vector<float> buf = module_test::awkwardBlock (256, block + 1);
+            for (auto& s : buf)
+                s *= 1.4f;                          // hot, and past full scale
+
+            module_test::render (m, buf);
+
+            for (float s : buf)
+            {
+                if (! std::isfinite (s))
+                    return std::numeric_limits<float>::quiet_NaN();
+
+                peak = std::max (peak, std::fabs (s));
+            }
+        }
+
+        return peak;
+    }
+}
+
+static void testPhaserAllpassLaw()
+{
+    using namespace spatcore::effects;
+
+    const int n = 6000;             // 2400 to settle, then 3600 samples = 75
+                                    // whole periods of 1 kHz at 48 kHz
+    // Every tolerance here is loose because the coefficients come through
+    // std::tan, which differs by an ULP or two between platforms.
+
+    // Four allpasses tuned to 1 kHz each turn a 1 kHz sine by -90 degrees, so
+    // the chain hands it back a whole turn later, in phase: a 50 % mix of the
+    // two legs is then the input itself.
+    //
+    // On its own this block is weak - a module that did NOTHING would pass it,
+    // since in + 0.5*(in - in) is in. It is the notch check below that gives it
+    // teeth, by pinning where the chain does NOT hand the signal back. Neither
+    // half is worth keeping without the other.
+    {
+        const std::vector<float> in = phaser_test::sine (n, 1000.0, 48000.0, 0.5);
+        const std::vector<float> out = phaser_test::renderSine (phaser_test::active (1000.0f, 4, 50.0f),
+                                                                1000.0, n);
+        float worst = 0.0f;
+        for (int i = 2400; i < n; ++i)
+            worst = std::max (worst, std::fabs (out[(size_t) i] - in[(size_t) i]));
+        CHECK (worst < 2.0e-3f);
+    }
+
+    // Half a turn happens lower down, at
+    // (sr/pi)*atan(tan(pi*1000/sr)*tan(pi/8)) = 414.70 Hz, and there the same
+    // 50 % mix cancels instead. Cancelling everywhere would pass the check
+    // above and fail this one; cancelling nowhere fails this one alone.
+    {
+        const double f = phaser_test::notchHz (1000.0, 4, 48000.0);
+        CHECK (std::fabs (f - 414.70) < 0.05);
+
+        const std::vector<float> out = phaser_test::renderSine (phaser_test::active (1000.0f, 4, 50.0f),
+                                                                f, n);
+        CHECK (phaser_test::peakFrom (out, 2400) < 2.0e-3f);    // 0.5 in, -48 dB out
+
+        // The same notch at 96 kHz. The frequency barely moves (414.34 Hz), but
+        // the COEFFICIENT does, so a module that had 48 kHz baked into it would
+        // put its notch at 828 Hz and fail here.
+        const double f96 = phaser_test::notchHz (1000.0, 4, 96000.0);
+        CHECK (phaser_test::peakFrom (phaser_test::renderSine (phaser_test::active (1000.0f, 4, 50.0f),
+                                                               f96, 2 * n, 96000.0), 4800) < 2.0e-3f);
+    }
+
+    // The wet leg on its own is an ALLPASS: it turns the phase and changes
+    // nothing else, so a sine keeps its RMS through twelve of them. This is
+    // what a coefficient that is not (t-1)/(t+1) has to get past.
+    {
+        const std::vector<float> in = phaser_test::sine (n, 1000.0, 48000.0, 0.5);
+        const std::vector<float> out = phaser_test::renderSine (phaser_test::active (1000.0f, 12, 100.0f),
+                                                                1000.0, n);
+        CHECK (std::fabs (phaser_test::rmsFrom (out, 2400)
+                            - phaser_test::rmsFrom (in, 2400)) < 1.0e-3);
+    }
+}
+
+static void testPhaserSweepLaw()
+{
+    using namespace spatcore::effects;
+
+    // The characteristic law: f_k = centre * 2^(depth*lfo). The Sine shape is
+    // -cos, so the sweep STARTS at the bottom, 2^-depth, and reaches the top,
+    // 2^+depth, half an LFO cycle later. One octave of depth at 1 kHz is
+    // therefore 500 Hz at sample 0 and 2000 Hz at sample 240000 (rate 0.1 Hz),
+    // and the notch has to be found at each end and nowhere else.
+    //
+    // A phaser that did not modulate at all, one that ignored depth, and one
+    // that applied depth linearly rather than as a power of two all put the
+    // notch somewhere this test looks and finds silence (a linear law would
+    // reach 750 Hz at lfo = -1, notching at 311 Hz, not 207).
+
+    const double sr = 48000.0;
+    const double rate = 0.1;
+    const int half = (int) (0.5 / rate * sr);       // samples to lfo = +1
+    const int n = half + 8000;
+
+    const double fLow  = phaser_test::notchHz (1000.0 * std::pow (2.0, -1.0), 4, sr);   // 207.17
+    const double fHigh = phaser_test::notchHz (1000.0 * std::pow (2.0, +1.0), 4, sr);   // 832.37
+    const double fMid  = phaser_test::notchHz (1000.0, 4, sr);                          // 414.70
+
+    CHECK (std::fabs (fLow - 207.17) < 0.05);
+    CHECK (std::fabs (fHigh - 832.37) < 0.05);
+
+    EffectChannelParams p = phaser_test::active (1000.0f, 4, 50.0f);
+    p.phaser.depthOct = 1.0f;
+    p.phaser.rateHz = (float) rate;
+
+    // Early is samples 2400..6000, by which time the chain has settled and the
+    // sine LFO has moved 1.25 % of a cycle - it is still within 0.3 % of its
+    // bottom, which is what makes a notch this deep hold long enough to see.
+    // Late is the last 3600 samples before the top of the sweep.
+    const std::vector<float> low  = phaser_test::renderSine (p, fLow, n, sr);
+    const std::vector<float> high = phaser_test::renderSine (p, fHigh, n, sr);
+    const std::vector<float> mid  = phaser_test::renderSine (p, fMid, n, sr);
+
+    CHECK (phaser_test::peakBetween (low, 2400, 6000) < 0.01f);             // 0.0014 measured
+    CHECK (phaser_test::peakBetween (low, half - 3600, half) > 0.25f);      // 0.458  - gone
+    CHECK (phaser_test::peakBetween (high, 2400, 6000) > 0.10f);            // 0.280  - not yet
+    CHECK (phaser_test::peakBetween (high, half - 3600, half) < 0.01f);     // 0.0006 - arrived
+
+    // And the un-swept centre is notched at NEITHER end: the sweep really has
+    // moved the notch away from where depth 0 would leave it.
+    CHECK (phaser_test::peakBetween (mid, 2400, 6000) > 0.20f);             // 0.466
+    CHECK (phaser_test::peakBetween (mid, half - 3600, half) > 0.20f);      // 0.343
+
+    // Depth 0 is the identity of the sweep, exactly: exp2(0) is 1 to the bit,
+    // so the static law of testPhaserAllpassLaw must survive a moving LFO.
+    {
+        EffectChannelParams flat = phaser_test::active (1000.0f, 4, 50.0f);
+        flat.phaser.rateHz = 10.0f;             // as fast as it goes, and irrelevant
+        CHECK (phaser_test::peakFrom (phaser_test::renderSine (flat, fMid, 6000, sr), 2400) < 2.0e-3f);
+    }
+}
+
+static void testPhaserSpreadLaw()
+{
+    using namespace spatcore::effects;
+
+    const double sr = 48000.0;
+
+    // The bisection helper against the closed form, at spread 0 where they
+    // describe the same chain. If this fails, nothing below means anything.
+    CHECK (std::fabs (phaser_test::chainPhaseHz (1000.0, 0.0, 4, sr, 0.5)
+                        - phaser_test::notchHz (1000.0, 4, sr)) < 1.0e-6);
+
+    // Spread fans the stages over 2^(spread*(2k/(N-1) - 1)): at spread 2 and
+    // four stages they sit at 250, 630, 1587 and 4000 Hz rather than all on
+    // 1000. The chain still reaches half a turn exactly once, but 117 Hz lower
+    // than it would unspread - and the unspread notch frequency is now passed
+    // at a phase that does not cancel.
+    for (int stages : { 4, 8 })
+    {
+        EffectChannelParams p = phaser_test::active (1000.0f, stages, 50.0f);
+        p.phaser.spreadOct = 2.0f;
+
+        const double spreadNotch = phaser_test::chainPhaseHz (1000.0, 2.0, stages, sr, 0.5);
+        const double flatNotch   = phaser_test::notchHz (1000.0, stages, sr);
+
+        CHECK (spreadNotch < flatNotch - 50.0);     // it really has moved
+
+        // Cancelled where the spread chain says, 297.7 Hz at four stages and
+        // 140.6 at eight.
+        CHECK (phaser_test::peakBetween (phaser_test::renderSine (p, spreadNotch, 24000, sr),
+                                         6000, 24000) < 2.0e-3f);
+
+        // And NOT cancelled where a module that ignored spread would put it
+        // (414.70 / 199.19 Hz), which is the only thing that tells the two
+        // apart - both are "a notch somewhere below the centre".
+        CHECK (phaser_test::peakBetween (phaser_test::renderSine (p, flatNotch, 24000, sr),
+                                         6000, 24000) > 0.05f);             // 0.19 / 0.27 measured
+    }
+}
+
+static void testPhaserLfoRateAndShape()
+{
+    using namespace spatcore::effects;
+
+    const double sr = 48000.0;
+    const double fLow = phaser_test::notchHz (500.0, 4, sr);    // the depth-1 bottom notch
+
+    // RATE. Park a tone at the bottom of the sweep and the level dips once per
+    // LFO cycle, as the notch passes over it. Four seconds of audio hold four
+    // dips at 1 Hz and eight at 2 Hz: the rate parameter is read from the audio
+    // itself, so a module that ignored it (or halved it) cannot pass both.
+    for (double rate : { 1.0, 2.0 })
+    {
+        EffectChannelParams p = phaser_test::active (1000.0f, 4, 50.0f);
+        p.phaser.depthOct = 1.0f;
+        p.phaser.rateHz = (float) rate;
+
+        const std::vector<float> out = phaser_test::renderSine (p, fLow, (int) (5.0 * sr), sr);
+        CHECK (phaser_test::countDips (out, 4800, 4 * (int) sr) == (int) (4.0 * rate));
+    }
+
+    // SHAPE. A Square LFO is -1 for a whole half cycle, so the chain is STATIC
+    // for half a second at 1 Hz and the bottom notch holds all the way through
+    // it. A Sine leaves that notch within a few thousand samples. Same rate,
+    // same depth, same tone: only the shape parameter differs.
+    {
+        EffectChannelParams p = phaser_test::active (1000.0f, 4, 50.0f);
+        p.phaser.depthOct = 1.0f;
+        p.phaser.rateHz = 1.0f;
+
+        p.phaser.shape = 2;                     // LFOWaveforms::Square
+        CHECK (phaser_test::peakBetween (phaser_test::renderSine (p, fLow, (int) sr, sr),
+                                         2400, 20000) < 2.0e-3f);
+
+        p.phaser.shape = 1;                     // LFOWaveforms::Sine
+        CHECK (phaser_test::peakBetween (phaser_test::renderSine (p, fLow, (int) sr, sr),
+                                         2400, 20000) > 0.20f);
+    }
+}
+
+static void testPhaserTransparency()
+{
+    using namespace spatcore::effects;
+    const ChainConfig cfg = module_test::config (48000.0, 256);
+
+    // Bypassed at defaults through a slot: the buffer is not touched at all.
+    {
+        ModuleSlot slot;
+        slot.prepare (cfg, std::make_unique<PhaserModule>());
+        slot.applyParams (EffectChannelParams(), 0);
+        CHECK (slot.isBypassedSettled());
+
+        std::vector<float> buf = eqtests::makeAwkwardSignal (256);
+        const std::vector<float> reference = buf;
+        slot.process (buf.data(), 256);
+        CHECK (eqtests::bitEqualBlock (buf, reference));
+        CHECK (slot.getLatencySamples() == 0);
+        CHECK (slot.nanTrips.load() == 0);
+    }
+
+    // Mix 0 while ACTIVE is bit-transparent rather than merely inaudible: the
+    // module stops instead of crossfading, so the negative zeros and denormals
+    // in the awkward signal come back exactly as they went in. Feedback at 90 %
+    // and the widest sweep prove nothing is running underneath either.
+    {
+        PhaserModule m;
+        m.prepare (cfg);
+        EffectChannelParams p = phaser_test::active (800.0f, 8, 0.0f);
+        p.phaser.feedback = 90.0f;
+        p.phaser.depthOct = 4.0f;
+        CHECK (! m.applyParams (p, 0).bypass);
+        CHECK (m.getLatencySamples() == 0);
+
+        for (int block = 0; block < 3; ++block)
+        {
+            std::vector<float> buf = (block == 0) ? eqtests::makeAwkwardSignal (256)
+                                                  : module_test::awkwardBlock (256, block);
+            const std::vector<float> reference = buf;
+            module_test::render (m, buf);
+            CHECK (eqtests::bitEqualBlock (buf, reference));
+        }
+    }
+}
+
+static void testPhaserResetClearsTail()
+{
+    using namespace spatcore::effects;
+
+    PhaserModule m;
+    m.prepare (module_test::config (48000.0, 512));
+    EffectChannelParams p = phaser_test::active (300.0f, 12, 100.0f);
+    p.phaser.feedback = 95.0f;
+    p.phaser.depthOct = 2.0f;
+    m.applyParams (p, 0);
+
+    std::vector<float> buf = module_test::awkwardBlock (512, 5);
+    module_test::render (m, buf);
+
+    // Control: twelve allpasses at 95 % feedback are still ringing loudly after
+    // the input stops, so the assertion below has something to clear.
+    std::vector<float> tail (512, 0.0f);
+    module_test::render (m, tail);
+    CHECK (phaser_test::peakFrom (tail, 0) > 1.0e-4f);
+
+    m.reset();
+
+    bool silent = true;
+    for (int block = 0; block < 4; ++block)
+    {
+        std::vector<float> after (512, 0.0f);
+        module_test::render (m, after);
+
+        for (int i = 0; i < 512; ++i)
+            if (after[(size_t) i] != 0.0f)
+                silent = false;
+    }
+    CHECK (silent);
+
+    // prepare() again, at a different rate, on a module that has already run:
+    // the device can change under a live chain. Everything the sample rate
+    // reaches (the tan argument, the Nyquist clamp, the LFO and smoother
+    // reference) is recomputed, and nothing carries over.
+    m.prepare (module_test::config (96000.0, 512));
+    m.applyParams (p, 0);
+
+    std::vector<float> after96 = module_test::awkwardBlock (512, 6);
+    module_test::render (m, after96);
+
+    bool finite = true;
+    for (float s : after96)
+        finite = finite && std::isfinite (s);
+
+    CHECK (finite);
+    CHECK (phaser_test::peakFrom (after96, 0) > 0.0f);
+    CHECK (phaser_test::peakFrom (after96, 0) < 8.0f);
+}
+
+static void testPhaserStagesAreAVariant()
+{
+    using namespace spatcore::effects;
+    const ChainConfig cfg = module_test::config (48000.0, 256);
+
+    PhaserModule held, reference;
+    held.prepare (cfg);
+    reference.prepare (cfg);
+
+    EffectChannelParams six = phaser_test::active (800.0f, 6, 50.0f);
+    six.phaser.depthOct = 1.0f;             // a moving sweep: the two must stay in step
+    CHECK (! held.applyParams (six, 0).variantPending);
+    reference.applyParams (six, 0);
+
+    EffectChannelParams twelve = six;
+    twelve.phaser.stages = 12;
+
+    // Staged but not taken: the module keeps running six, sample for sample.
+    CHECK (held.applyParams (twelve, 0).variantPending);
+    CHECK (eqtests::bitEqualBlock (phaser_test::renderBlock (held, 7),
+                                   phaser_test::renderBlock (reference, 7)));
+
+    // Taken back before the fade completed: nothing pending, nothing reset.
+    CHECK (! held.applyParams (six, 0).variantPending);
+
+    // Asked again and committed at silence: twelve stages now, and twelve
+    // sound different from six.
+    CHECK (held.applyParams (twelve, 0).variantPending);
+    held.reset();
+    held.commitPendingVariant();
+    CHECK (! held.applyParams (twelve, 0).variantPending);
+    reference.reset();
+    CHECK (! eqtests::bitEqualBlock (phaser_test::renderBlock (held, 8),
+                                     phaser_test::renderBlock (reference, 8)));
+
+    // 5 is not one of the validated counts: it degrades to the lower one, 4.
+    EffectChannelParams five = six;
+    five.phaser.stages = 5;
+    CHECK (held.applyParams (five, 0).variantPending);
+    held.reset();
+    held.commitPendingVariant();
+
+    EffectChannelParams four = six;
+    four.phaser.stages = 4;
+    CHECK (! held.applyParams (four, 0).variantPending);     // 5 really did mean 4
+}
+
+static void testPhaserExtremesStayFinite()
+{
+    using namespace spatcore::effects;
+
+    const float centres[] = { 100.0f, 5000.0f };
+    const float feedbacks[] = { -95.0f, 95.0f, 400.0f };    // 400 is out of range on purpose
+    const int counts[] = { 4, 6, 8, 12 };                   // every validated count
+    const int shapes[] = { 1, 2, 8 };                       // Sine, the Square edge, keyed Random
+
+    for (float centreHz : centres)
+        for (float fb : feedbacks)
+            for (int stages : counts)
+                for (int shape : shapes)
+                {
+                    EffectChannelParams p = phaser_test::active (centreHz, stages, 100.0f);
+                    p.phaser.feedback = fb;
+                    p.phaser.depthOct = 4.0f;       // the whole sweep, as fast as it goes
+                    p.phaser.spreadOct = 3.0f;
+                    p.phaser.rateHz = 10.0f;
+                    p.phaser.shape = (std::uint8_t) shape;
+
+                    // Where this number comes from, since the honest answer
+                    // matters more than the number: the hot block peaks at
+                    // 0.98, an allpass chain has magnitude one, and feedback is
+                    // clamped to 0.95, so a loop that is merely resonating
+                    // settles at 0.98/(1 - 0.95) = 19.6. The worst this grid
+                    // reaches in 128 blocks is 14.7 (centre 100, feedback 95,
+                    // six stages, the Square LFO - a shape that steps the whole
+                    // sweep at once is what strains the coefficient
+                    // interpolation hardest).
+                    //
+                    // It is NOT a hard bound, and should not be read as one: a
+                    // modulated allpass can hand energy back to the loop, and
+                    // over 2048 blocks this same grid does creep to 21.4. Read
+                    // a failure here as "the sweep is pumping the loop sooner
+                    // or harder than it used to", which is worth a look. The
+                    // property that IS guaranteed - the ceiling - is asserted
+                    // on its own below, over a run long enough for that creep.
+                    // A NaN fails this too, because no comparison against a NaN
+                    // is true.
+                    CHECK (phaser_test::hotPeak (p, 128) < 20.0f);
+                }
+
+    // The classic self-oscillation case: maximum feedback and a tone parked on
+    // the frequency where the chain turns the loop right ROUND, into positive
+    // feedback. That frequency is the centre only when the stage count is a
+    // multiple of four (each stage turns -90 degrees there); six stages turn
+    // -540 and the resonance is elsewhere, which is why it is looked up rather
+    // than assumed - and why the six-stage chain, the plan's default, would
+    // otherwise be tested at the one frequency where it does NOT resonate.
+    for (int stages : { 4, 6, 8, 12 })
+    {
+        EffectChannelParams p = phaser_test::active (1000.0f, stages, 100.0f);
+        p.phaser.feedback = 95.0f;
+
+        const double f = phaser_test::chainPhaseHz (1000.0, 0.0, stages, 48000.0, 1.0);
+        const float settled = phaser_test::peakFrom (phaser_test::renderSine (p, f, 96000), 48000);
+
+        CHECK (settled > 1.0f);     // the resonance is real: 3.6 / 5.6 / 6.9 / 8.3
+        CHECK (settled < 10.5f);    // and bounded by 0.5/(1 - 0.95), the algebra's
+                                    // own answer for a half-scale input - the
+                                    // resonance rises steeply with stage count,
+                                    // so 12 stages is the case that matters
+    }
+
+    // The guarantee, on the grid's worst corner and over eleven seconds of hot
+    // audio - long enough for the modulation to pump the loop past the 19.6 the
+    // algebra alone would give it. However far it creeps, it is finite and it
+    // is inside the ceiling: that much is structural, not empirical. (hotPeak
+    // returns a NaN if anything non-finite came out, and no comparison against
+    // a NaN is true, so one bound covers both.)
+    {
+        EffectChannelParams p = phaser_test::active (100.0f, 6, 100.0f);
+        p.phaser.feedback = 95.0f;
+        p.phaser.depthOct = 4.0f;
+        p.phaser.spreadOct = 3.0f;
+        p.phaser.rateHz = 10.0f;
+        p.phaser.shape = 2;
+
+        CHECK (phaser_test::hotPeak (p, 2048) <= PhaserModule::kLoopCeiling);
+    }
+
+    // The ceiling itself, which nothing above reaches and which the module's
+    // own header used to claim could not engage at all. It does: the house
+    // awkward signal carries +-1e7 samples, and twelve stages at maximum
+    // feedback put the loop straight onto it. What the ceiling promises is not
+    // that it never fires but that when it does the output is bounded by it
+    // exactly - 140 dB of overload in, +30 dBFS out - so nothing downstream
+    // sees the loop's real excursion.
+    {
+        PhaserModule m;
+        m.prepare (module_test::config (48000.0, 256));
+        EffectChannelParams p = phaser_test::active (800.0f, 12, 100.0f);
+        p.phaser.feedback = 95.0f;
+        m.applyParams (p, 0);
+
+        std::vector<float> buf = eqtests::makeAwkwardSignal (256);
+        module_test::render (m, buf);
+
+        const float peak = phaser_test::peakFrom (buf, 0);
+        CHECK (peak > 16.0f);                               // it really did engage
+        CHECK (peak <= PhaserModule::kLoopCeiling);         // and it held, at 32.0
+    }
+
+    // A NaN parameter must land on a bound rather than in the audio.
+    {
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+        EffectChannelParams p = phaser_test::active (nan, 8, 100.0f);
+        p.phaser.depthOct = nan;
+        p.phaser.spreadOct = nan;
+        p.phaser.rateHz = nan;
+        p.phaser.feedback = 95.0f;
+        CHECK (phaser_test::hotPeak (p, 8) < 20.0f);
+    }
+}
+
+static void testPhaserSurvivesNonFiniteInput()
+{
+    using namespace spatcore::effects;
+    const ChainConfig cfg = module_test::config (48000.0, 256);
+
+    // A recursive module cannot lean on the slot's NaN guard the way a
+    // memoryless one can. One non-finite sample from upstream reaches the
+    // allpass history, and history is what the next sample is built from: if
+    // the module clamps its OUTPUT to the loop ceiling and leaves the history
+    // alone, it hands the slot a finite -32 for ever while staying internally
+    // poisoned - a permanent +30 dBFS DC latch that the guard, which looks for
+    // a non-finite sample, can never see. This is that regression, driven
+    // through a real slot so the guard is genuinely in the picture.
+    for (float poison : { std::numeric_limits<float>::quiet_NaN(),
+                          std::numeric_limits<float>::infinity(),
+                          -std::numeric_limits<float>::infinity() })
+    {
+        for (float mix : { 50.0f, 100.0f })
+        {
+            ModuleSlot slot;
+            slot.prepare (cfg, std::make_unique<PhaserModule>());
+
+            EffectChannelParams p = phaser_test::active (800.0f, 8, mix);
+            p.phaser.feedback = 30.0f;
+            p.phaser.depthOct = 2.0f;
+            slot.applyParams (p, 0);
+
+            // Fade fully in first. While the slot is still crossfading it
+            // holds its own copy of the DRY block and mixes the poisoned
+            // sample back in itself - a documented property of the slot (a
+            // single NaN can cross a fade untripped, EffectModule.h), and
+            // nothing to do with the module under test. Settled, the module's
+            // output IS the buffer, so what follows is the module's answer
+            // alone.
+            for (int block = 0; block < 64 && ! slot.isActiveSettled(); ++block)
+            {
+                std::vector<float> warm = module_test::awkwardBlock (256, block + 1);
+                slot.process (warm.data(), 256);
+            }
+
+            CHECK (slot.isActiveSettled());
+
+            std::vector<float> buf = module_test::awkwardBlock (256, 20);
+            buf[100] = poison;
+            slot.process (buf.data(), 256);
+
+            for (float s : buf)
+                CHECK (std::isfinite (s));
+
+            // The block AFTER is the one that matters: this is where the latch
+            // showed itself, every sample pinned at the ceiling for ever.
+            float worst = 0.0f;
+            for (int block = 0; block < 8; ++block)
+            {
+                std::vector<float> clean = module_test::awkwardBlock (256, 30 + block);
+                slot.process (clean.data(), 256);
+
+                for (float s : clean)
+                {
+                    CHECK (std::isfinite (s));
+                    worst = std::max (worst, std::fabs (s));
+                }
+            }
+
+            CHECK (worst < 4.0f);               // 1.4 measured: ordinary audio again
+
+            // Nothing non-finite ever left the module, so the slot never had to
+            // step in. That is the contract: a module with loop state cleans up
+            // after itself, and the guard stays the backstop it was meant to be.
+            CHECK (slot.nanTrips.load() == 0);
+        }
+    }
+}
+
+static void testPhaserDeterminism()
+{
+    using namespace spatcore::effects;
+    const ChainConfig cfg = module_test::config (48000.0, 256, 7);
+
+    PhaserModule a, b, other;
+    a.prepare (cfg);
+    b.prepare (cfg);
+    other.prepare (module_test::config (48000.0, 256, 99));     // a different channel
+
+    EffectChannelParams p = phaser_test::active (600.0f, 8, 50.0f);
+    p.phaser.shape = 8;                     // the keyed random shape: the only
+    p.phaser.depthOct = 3.0f;               // noise the module can reach
+    p.phaser.feedback = 60.0f;
+    a.applyParams (p, 0);
+    b.applyParams (p, 0);
+    other.applyParams (p, 0);
+
+    // Same key, same audio to the bit; different key, different audio. Without
+    // the second half, a module that dropped the per-channel key entirely - and
+    // so gave every effects channel the same sweep - would pass.
+    bool differs = false;
+
+    for (int block = 0; block < 6; ++block)
+    {
+        const std::vector<float> fromA = phaser_test::renderBlock (a, block + 3);
+        CHECK (eqtests::bitEqualBlock (fromA, phaser_test::renderBlock (b, block + 3)));
+        differs = differs || ! eqtests::bitEqualBlock (fromA, phaser_test::renderBlock (other, block + 3));
+    }
+
+    CHECK (differs);
+}
+
+//==============================================================================
+// effects/modules - Reverb (FxReverb)
+//==============================================================================
+
+//==============================================================================
+// effects/modules/EffectReverbModule - predelay, FDN tail, tone, mix.
+//==============================================================================
+
+namespace reverb_test
+{
+    using namespace spatcore::effects;
+
+    inline EffectChannelParams params (float mix, float predelayMs)
+    {
+        EffectChannelParams p;
+        p.reverb.bypass = 0;
+        p.reverb.mix = mix;
+        p.reverb.predelayMs = predelayMs;
+        return p;
+    }
+
+    /** Mean-square level of a window, in dB. */
+    inline double windowDb (const std::vector<float>& v, int from, int to)
+    {
+        double sum = 0.0;
+        for (int i = from; i < to; ++i)
+            sum += (double) v[(size_t) i] * (double) v[(size_t) i];
+
+        const double mean = sum / (double) (to - from);
+        return 10.0 * std::log10 (mean > 1e-30 ? mean : 1e-30);
+    }
+
+    /** Level of a BAND of a window, in dB.
+
+        Sixteen windowed single-frequency probes spread across the band, summed:
+        one DFT bin of a reverb tail is far too noisy to compare against another,
+        and a band average is what the ear hears anyway. The Hann window matters
+        - a tail is not periodic in the window, and the skirts of a rectangular
+        one would smear a 46 dB low band into a 112 dB high one. */
+    inline double bandDb (const std::vector<float>& v, int from, int to,
+                          double f0, double f1, double sampleRate)
+    {
+        const int n = to - from;
+        double total = 0.0;
+
+        for (int k = 0; k < 16; ++k)
+        {
+            const double f = f0 + (f1 - f0) * (double) k / 15.0;
+            const double w = 6.283185307179586 * f / sampleRate;
+            double re = 0.0, im = 0.0;
+
+            for (int i = 0; i < n; ++i)
+            {
+                const double h = 0.5 - 0.5 * std::cos (6.283185307179586 * (double) i / (double) n);
+                const double x = h * (double) v[(size_t) (from + i)];
+                re += x * std::cos (w * (double) i);
+                im -= x * std::sin (w * (double) i);
+            }
+
+            total += re * re + im * im;
+        }
+
+        const double mean = total / (16.0 * (double) n * (double) n);
+        return 10.0 * std::log10 (mean > 1e-30 ? mean : 1e-30);
+    }
+
+    inline std::vector<float> impulseResponse (EffectReverbModule& m, int n)
+    {
+        std::vector<float> buf ((size_t) n, 0.0f);
+        buf[0] = 1.0f;
+        module_test::render (m, buf);               // one call, longer than maxBlock: chunked
+        return buf;
+    }
+}
+
+static void testEffectReverbIdentity()
+{
+    using namespace spatcore::effects;
+
+    // Bypassed at the defaults: the slot skips the module, so the block comes
+    // back bit for bit - negative zeros and denormals included.
+    {
+        ModuleSlot slot;
+        slot.prepare (module_test::config (48000.0, 256), std::make_unique<EffectReverbModule>());
+
+        EffectChannelParams p;                      // reverb.bypass == 1
+        slot.applyParams (p, 0);
+        CHECK (slot.isBypassedSettled());
+
+        std::vector<float> buf = eqtests::makeAwkwardSignal (256);
+        const std::vector<float> in = buf;
+        slot.process (buf.data(), 256);
+        CHECK (eqtests::bitEqualBlock (buf, in));
+    }
+
+    // ACTIVE at mix 0: the reverb runs underneath (its tail has to be there
+    // when the mix comes back up) but the dry buffer is never written, so this
+    // is bit-exact rather than near.
+    {
+        EffectReverbModule m;
+        m.prepare (module_test::config (48000.0, 256));
+        EffectChannelParams p = reverb_test::params (0.0f, 10.0f);
+        CHECK (! m.applyParams (p, 0).bypass);
+
+        bool identical = true;
+        for (int block = 0; block < 6; ++block)
+        {
+            std::vector<float> buf = (block == 0) ? eqtests::makeAwkwardSignal (256)
+                                                  : module_test::awkwardBlock (256, block);
+            const std::vector<float> in = buf;
+            m.process (buf.data(), 256);
+            identical = identical && eqtests::bitEqualBlock (buf, in);
+        }
+        CHECK (identical);
+
+        // ...and it really was RUNNING, not frozen: the mix comes back up onto
+        // a tail that is already there. This is the whole reason mix 0 is an
+        // early-out on the WRITE rather than on the block - freezing would
+        // replay a stale tail the moment someone opened the control.
+        EffectChannelParams up = reverb_test::params (100.0f, 10.0f);
+        m.applyParams (up, 0);
+        std::vector<float> tail (4096, 0.0f);       // silence in
+        module_test::render (m, tail);
+        CHECK (reverb_test::windowDb (tail, 0, 4096) > -60.0);      // measures -16.5
+    }
+
+    // A reverb adds a tail, not a delay: the dry component is not moved, so
+    // there is nothing for the ledger to compensate.
+    EffectReverbModule fresh;
+    fresh.prepare (module_test::config());
+    CHECK (fresh.getLatencySamples() == 0);
+}
+
+static void testEffectReverbPredelay()
+{
+    using namespace spatcore::effects;
+
+    const int n = 4096;
+    const ChainConfig cfg = module_test::config (48000.0, 512);
+
+    EffectReverbModule a, b;
+    a.prepare (cfg);
+    b.prepare (cfg);
+
+    // 2 ms at 48 kHz is 96 samples exactly (2.0 * 48.0), so the delayed read
+    // lands ON a sample and the interpolator does nothing.
+    EffectChannelParams pa = reverb_test::params (100.0f, 0.0f);
+    EffectChannelParams pb = reverb_test::params (100.0f, 2.0f);
+    a.applyParams (pa, 0);
+    b.applyParams (pb, 0);
+
+    const std::vector<float> ra = reverb_test::impulseResponse (a, n);
+    const std::vector<float> rb = reverb_test::impulseResponse (b, n);
+
+    // Nothing comes out before the predelay elapses, and past it B is A shifted
+    // by 96 samples to the BIT: same key, so the same network doing the same
+    // arithmetic on the same values, later.
+    bool silentFirst = true, shifted = true;
+    for (int i = 0; i < 96; ++i)
+        silentFirst = silentFirst && (rb[(size_t) i] == 0.0f);
+    for (int i = 96; i < n; ++i)
+        shifted = shifted && bitEqualFloat (rb[(size_t) i], ra[(size_t) (i - 96)]);
+
+    CHECK (silentFirst);
+    CHECK (shifted);
+    CHECK (reverb_test::windowDb (ra, 1024, n) > -80.0);   // two silent buffers would pass the above
+
+    // The block size is a buffer size, not a parameter. Both the module and the
+    // model cut a call into maxBlock chunks, and the FDN ignores the block size
+    // it is prepared with, so the same signal through the same key must come out
+    // the same bits whatever the host's block happens to be.
+    auto renderChunked = [n] (int maxBlock)
+    {
+        EffectReverbModule m;
+        m.prepare (module_test::config (48000.0, maxBlock));
+        EffectChannelParams p = reverb_test::params (100.0f, 7.3f);   // a fractional predelay
+        m.applyParams (p, 0);
+
+        std::vector<float> buf ((size_t) n, 0.0f);
+        buf[0] = 1.0f;
+        for (int done = 0; done < n; )
+        {
+            const int chunk = (n - done) < maxBlock ? (n - done) : maxBlock;
+            m.process (buf.data() + done, chunk);
+            done += chunk;
+        }
+        return buf;
+    };
+
+    CHECK (eqtests::bitEqualBlock (renderChunked (1), renderChunked (4096)));
+    CHECK (eqtests::bitEqualBlock (renderChunked (64), renderChunked (256)));
+}
+
+static void testEffectReverbDecayLaw()
+{
+    using namespace spatcore::effects;
+
+    // Both multipliers at 1 collapses the three decay bands into one and every
+    // line then loses exactly 60 dB per rt60, so the tail is 10^(-3t/rt60)
+    // whatever path a sample took: 30 dB nominal over half a second at rt60 = 1,
+    // 7.5 dB at rt60 = 4. Measured comes in a little under both (28.7 and 7.2)
+    // because the feedback allpass lengthens every loop by 3-7 % without being
+    // counted in the decay gain.
+    auto dropDb = [] (float rt60, double sr)
+    {
+        EffectReverbModule m;
+        m.prepare (module_test::config (sr, 512));
+
+        EffectChannelParams p = reverb_test::params (100.0f, 0.0f);
+        p.reverb.rt60 = rt60;
+        p.reverb.rt60LowMult = 1.0f;
+        p.reverb.rt60HighMult = 1.0f;
+        m.applyParams (p, 0);
+
+        const int n = (int) sr;                             // one second
+        const int window = (int) (sr * 0.1);
+        const std::vector<float> ir = reverb_test::impulseResponse (m, n);
+        return reverb_test::windowDb (ir, (int) (sr * 0.20), (int) (sr * 0.20) + window)
+             - reverb_test::windowDb (ir, (int) (sr * 0.70), (int) (sr * 0.70) + window);
+    };
+
+    const double drop1 = dropDb (1.0f, 48000.0);
+    const double drop4 = dropDb (4.0f, 48000.0);
+
+    CHECK (drop1 > 24.0 && drop1 < 34.0);
+    CHECK (drop4 > 3.0 && drop4 < 12.0);
+    CHECK (drop1 > drop4 + 10.0);                   // a longer rt60 is a slower tail
+
+    // The same law at 96 kHz, which is also the only place the doubled delay
+    // ceiling and the rate-scaled line lengths get exercised.
+    CHECK (std::fabs (dropDb (1.0f, 96000.0) - drop1) < 4.0);
+}
+
+static void testEffectReverbTone()
+{
+    using namespace spatcore::effects;
+
+    // The one-pole low pass on the wet, which nothing else in this file touches:
+    // Identity runs at mix 0, Predelay and DecayLaw leave it at the default on
+    // both sides of their comparisons, and Extremes only asks for a finite peak.
+    // A build that dropped the filter, wired it as a high pass, or flipped the
+    // sign of the exponent behind the coefficient would pass all of those.
+    const double sr = 48000.0;
+    const int n = 32768;
+    const int from = 4800, to = from + 16384;       // past the first 100 ms, then 341 ms of tail
+
+    auto tail = [sr, n] (float toneHz)
+    {
+        EffectReverbModule m;
+        m.prepare (module_test::config (sr, 512));
+
+        EffectChannelParams p = reverb_test::params (100.0f, 0.0f);
+        p.reverb.rt60 = 2.0f;
+        p.reverb.rt60LowMult = 1.0f;                // one decay band, so the only
+        p.reverb.rt60HighMult = 1.0f;               // colour left is the tone filter
+        p.reverb.toneHz = toneHz;
+        m.applyParams (p, 0);
+        return reverb_test::impulseResponse (m, n);
+    };
+
+    const std::vector<float> dark = tail (1000.0f);         // the bottom of the range
+    const std::vector<float> bright = tail (20000.0f);      // the top
+    const std::vector<float> dflt = tail (12000.0f);        // the default
+
+    const double hiDark   = reverb_test::bandDb (dark,   from, to, 9000.0, 11000.0, sr);
+    const double hiBright = reverb_test::bandDb (bright, from, to, 9000.0, 11000.0, sr);
+    const double hiDflt   = reverb_test::bandDb (dflt,   from, to, 9000.0, 11000.0, sr);
+
+    const double loDark   = reverb_test::bandDb (dark,   from, to, 150.0, 300.0, sr);
+    const double loBright = reverb_test::bandDb (bright, from, to, 150.0, 300.0, sr);
+
+    // Measured on this build at 48 kHz: 10 kHz is -112.7 dB at tone 1000 and
+    // -94.0 at tone 20000, i.e. 18.7 dB apart (18.9 at 96 kHz). 14 leaves room
+    // for a platform's exp/pow to drift and still fails a missing filter (0 dB)
+    // or a high pass (negative).
+    CHECK (hiBright - hiDark > 14.0);
+
+    // It is a LOW pass: moving the cutoff by more than four octaves must not
+    // move the bottom of the tail. Measured 0.26 dB apart.
+    CHECK (std::fabs (loBright - loDark) < 2.0);
+
+    // ...and the cutoff maps monotonically, so the default sits between the two.
+    CHECK (hiDflt > hiDark + 10.0 && hiDflt < hiBright);
+}
+
+static void testEffectReverbWetLevel()
+{
+    using namespace spatcore::effects;
+
+    // The wet make-up. It is one constant (EffectReverbModule::kWetGain) chosen
+    // by ear against the FDN's own +12 dB, and every other test in this file is
+    // blind to it: Identity is mix 0, Predelay and SizeVariant compare two
+    // instances that would both scale, DecayLaw is a DIFFERENCE of two dB
+    // windows so a constant gain cancels exactly, and Reset is a silence check.
+    // So it is pinned here, on an absolute level, or it is pinned nowhere.
+    const int n = 120000;                           // 2.5 s at 48 kHz
+    const std::vector<float> in = module_test::awkwardBlock (n, 3);
+
+    EffectReverbModule m;
+    m.prepare (module_test::config (48000.0, 512));
+
+    EffectChannelParams p = reverb_test::params (100.0f, 0.0f);
+    p.reverb.rt60 = 1.5f;                           // everything else at its default
+    m.applyParams (p, 0);
+
+    std::vector<float> buf = in;
+    module_test::render (m, buf);
+
+    // The last second, by which time a 1.5 s tail is fully built.
+    const double ratio = reverb_test::windowDb (buf, 72000, n)
+                       - reverb_test::windowDb (in, 72000, n);
+
+    // Measured -4.88 dB: a fully wet reverb sits just under the dry it replaced,
+    // which is the point - a mix control has to be able to work either side of
+    // the balance. The two values this constant has actually been given during
+    // development land outside the window: 1.0 gives -10.90 and 0.25 gives
+    // -22.94, and doubling it again to 4.0 would give +1.14.
+    CHECK (ratio > -8.0 && ratio < -2.0);
+
+    // The rate is pinned deliberately. The FDN's own tone filter is at a fixed
+    // 8 kHz while its line lengths scale with the rate, so the same settings
+    // measure -4.3 dB at 44.1 kHz and -8.3 at 96 - a real property of the
+    // model, not something a make-up constant should be chasing.
+}
+
+static void testEffectReverbResetClearsTail()
+{
+    using namespace spatcore::effects;
+
+    EffectReverbModule m;
+    m.prepare (module_test::config (48000.0, 256));
+
+    EffectChannelParams p = reverb_test::params (100.0f, 20.0f);
+    p.reverb.rt60 = 8.0f;                           // the longest tail on the surface
+    m.applyParams (p, 0);
+
+    std::vector<float> excite = module_test::awkwardBlock (2048, 7);
+    module_test::render (m, excite);
+    CHECK (reverb_test::windowDb (excite, 1024, 2048) > -80.0);
+    CHECK (m.getMeterDb() > -40.0);                 // the wet meter followed it up
+
+    // A slot that faded out resets us before fading back in; anything left in
+    // the network, the predelay ring or the tone filter would be replayed.
+    m.reset();
+    CHECK (m.getMeterDb() <= spatcore::dsp::FastDecibels::kMinDb);
+
+    std::vector<float> silence (2048, 0.0f);
+    module_test::render (m, silence);
+
+    bool silent = true;
+    for (int i = 0; i < 2048; ++i)
+        silent = silent && (silence[(size_t) i] == 0.0f);
+    CHECK (silent);
+}
+
+static void testEffectReverbSizeVariant()
+{
+    using namespace spatcore::effects;
+
+    const ChainConfig cfg = module_test::config (48000.0, 256);
+
+    // The FIRST applyParams after prepare() is a deliberate exception to the
+    // pending/fade contract, and it needs a size that prepare() did NOT build
+    // to say anything at all. prepare() carries no parameters, so it builds at
+    // the default; the first set IS the project's settings, and it commits them
+    // there and then rather than making a freshly loaded show fade once before
+    // it is right.
+    {
+        EffectReverbModule loaded, atDefault;
+        loaded.prepare (cfg);
+        atDefault.prepare (cfg);
+
+        EffectChannelParams saved = reverb_test::params (100.0f, 0.0f);
+        saved.reverb.size = 1.6f;                   // NOT the 1.0 prepare() guessed
+        CHECK (! loaded.applyParams (saved, 0).variantPending);
+
+        EffectChannelParams guessed = reverb_test::params (100.0f, 0.0f);
+        guessed.reverb.size = 1.0f;
+        CHECK (! atDefault.applyParams (guessed, 0).variantPending);
+
+        // Committed, not quietly dropped: 1.6 is a different network from 1.0.
+        CHECK (! eqtests::bitEqualBlock (reverb_test::impulseResponse (loaded, 2048),
+                                         reverb_test::impulseResponse (atDefault, 2048)));
+
+        // The exception is for the first set only - the next one fades.
+        saved.reverb.size = 1.2f;
+        CHECK (loaded.applyParams (saved, 0).variantPending);
+    }
+
+    EffectReverbModule running, reference;
+    running.prepare (cfg);
+    reference.prepare (cfg);
+
+    EffectChannelParams p = reverb_test::params (100.0f, 0.0f);
+    p.reverb.size = 1.0f;
+    CHECK (! running.applyParams (p, 0).variantPending);   // the first set, snapped
+    CHECK (! reference.applyParams (p, 0).variantPending);
+    CHECK (! running.applyParams (p, 0).variantPending);   // handed it again: still nothing
+
+    // Asking for another size does not change what is RUNNING - the old network
+    // carries on until the slot has faded out and committed.
+    p.reverb.size = 1.6f;
+    CHECK (running.applyParams (p, 0).variantPending);
+    CHECK (eqtests::bitEqualBlock (reverb_test::impulseResponse (running, 2048),
+                                   reverb_test::impulseResponse (reference, 2048)));
+
+    // Taken back before the fade completes, the change cancels itself.
+    p.reverb.size = 1.0f;
+    CHECK (! running.applyParams (p, 0).variantPending);
+
+    // Committed at silence, it is a different network.
+    p.reverb.size = 1.6f;
+    CHECK (running.applyParams (p, 0).variantPending);
+    running.reset();
+    running.commitPendingVariant();
+    CHECK (! running.applyParams (p, 0).variantPending);
+    reference.reset();
+    CHECK (! eqtests::bitEqualBlock (reverb_test::impulseResponse (running, 2048),
+                                     reverb_test::impulseResponse (reference, 2048)));
+
+    // Built at the capacity size and then at the size asked for, so what runs
+    // is what was requested - before and after a commit.
+    FdnReverbModel direct;
+    ReverbParams rp;
+    rp.size = 1.3f;
+    direct.prepare (cfg, rp);
+    CHECK (std::fabs (direct.getBuiltSize() - 1.3f) < 1.0e-5f);
+    rp.size = 0.5f;
+    CHECK (direct.setParams (rp));                  // pending, and not yet applied
+    CHECK (std::fabs (direct.getBuiltSize() - 1.3f) < 1.0e-5f);
+    direct.commitPendingVariant();
+    CHECK (std::fabs (direct.getBuiltSize() - 0.5f) < 1.0e-5f);
+}
+
+static void testEffectReverbExtremesAndDeterminism()
+{
+    using namespace spatcore::effects;
+
+    // Every corner of the surface, then values that are not on it at all: the
+    // clamp has to catch a NaN before it reaches the pow() behind the decay
+    // gains and turns all 48 of them into NaN.
+    //
+    // Every row is FULLY WET on purpose. A row at mix 0 measures the dry buffer
+    // the module deliberately does not touch, so its peak is the input's and
+    // its "finite" is the input's too - an earlier version of this sweep had
+    // two such rows and they asserted nothing whatsoever about the reverb.
+    // Mix 0 is pinned where it belongs, in testEffectReverbIdentity.
+    const float qnan = std::numeric_limits<float>::quiet_NaN();
+    struct Corner { float rt60, lowMult, highMult, xLow, xHigh, diffusion, size, tone, predelay, mix, minPeak; };
+    const Corner corners[] =
+    {
+        {  0.2f,  0.1f,  0.1f,    50.0f,  1000.0f, 0.0f,  0.5f,  1000.0f,    0.0f,  100.0f, 0.05f },
+        {  8.0f,  9.0f,  9.0f,   500.0f, 10000.0f, 1.0f,  2.0f, 20000.0f,  250.0f,  100.0f, 0.30f },
+        {  8.0f,  9.0f,  0.1f,    50.0f, 10000.0f, 1.0f,  2.0f, 20000.0f,  250.0f,  100.0f, 0.30f },
+        { -1.0f,  1e9f, -5.0f, -100.0f,     1e6f,  5.0f, 99.0f,   -20.0f,    1e6f,  500.0f, 0.05f },
+        {  qnan,  qnan,  qnan,    qnan,     qnan,  qnan,  qnan,    qnan,     qnan,  100.0f, 0.05f }
+    };
+
+    const int numCorners = (int) (sizeof (corners) / sizeof (corners[0]));
+    const int n = 32768;                            // outlasts the longest predelay
+    std::vector<std::vector<float>> rendered ((size_t) numCorners);
+
+    for (int ci = 0; ci < numCorners; ++ci)
+    {
+        const Corner& c = corners[(size_t) ci];
+
+        EffectReverbModule m;
+        m.prepare (module_test::config (48000.0, 256));
+
+        EffectChannelParams p = reverb_test::params (c.mix, c.predelay);
+        p.reverb.rt60 = c.rt60;
+        p.reverb.rt60LowMult = c.lowMult;
+        p.reverb.rt60HighMult = c.highMult;
+        p.reverb.crossoverLow = c.xLow;
+        p.reverb.crossoverHigh = c.xHigh;
+        p.reverb.diffusion = c.diffusion;
+        p.reverb.size = c.size;
+        p.reverb.toneHz = c.tone;
+
+        if (m.applyParams (p, 0).variantPending)
+        {
+            m.reset();
+            m.commitPendingVariant();               // build the extreme size for real
+        }
+
+        std::vector<float> buf = module_test::awkwardBlock (4096, 11);
+        const std::vector<float> in = buf;
+        buf.resize ((size_t) n, 0.0f);              // excite, then let it ring out
+        module_test::render (m, buf);
+
+        // An almost lossless network fed 85 ms of noise settles well under
+        // unity: the loudest corner peaks at 0.65, the quietest at 0.17.
+        float peak = 0.0f;
+        bool clean = true;
+        for (int i = 0; i < n; ++i)
+        {
+            const float x = buf[(size_t) i];
+            if (! std::isfinite (x))
+            {
+                clean = false;
+                break;
+            }
+            if (std::fabs (x) > peak)
+                peak = std::fabs (x);
+        }
+        CHECK (clean && peak > c.minPeak && peak < 2.0f);
+
+        // ...and the wet path really was written, rather than the dry buffer
+        // coming back untouched because a clamp sent the mix to zero.
+        CHECK (! eqtests::bitEqualBlock (std::vector<float> (buf.begin(), buf.begin() + 4096), in));
+
+        rendered[(size_t) ci] = std::move (buf);
+    }
+
+    // The strongest thing the NaN row can say. Every clamp in both classes is
+    // written `if (! (v > lo)) return lo;`, so a NaN lands on the LOW bound of
+    // all nine ranges it is fed to - which is exactly the all-minimum corner,
+    // bit for bit. (Its mix is a real 100 rather than a tenth NaN: a NaN mix
+    // leaves the buffer untouched whether the clamp is there or not, because
+    // every comparison against a NaN is false, so it would prove nothing.)
+    // Anything weaker than this - finite, inside a peak band - passes happily
+    // on a module with no clamps at all.
+    CHECK (eqtests::bitEqualBlock (rendered[(size_t) (numCorners - 1)], rendered[0]));
+
+    // Same key, same network, same bits. A DIFFERENT key must not be the same
+    // network: 32 channels sharing node 0 would comb rather than spread.
+    EffectReverbModule a, b, c;
+    a.prepare (module_test::config (48000.0, 512, 5));
+    b.prepare (module_test::config (48000.0, 512, 5));
+    c.prepare (module_test::config (48000.0, 512, 6));
+
+    EffectChannelParams p = reverb_test::params (100.0f, 3.0f);
+    a.applyParams (p, 0);
+    b.applyParams (p, 0);
+    c.applyParams (p, 0);
+
+    const std::vector<float> ra = reverb_test::impulseResponse (a, 4096);
+    const std::vector<float> rb = reverb_test::impulseResponse (b, 4096);
+    const std::vector<float> rc = reverb_test::impulseResponse (c, 4096);
+
+    CHECK (eqtests::bitEqualBlock (ra, rb));
+    CHECK (! eqtests::bitEqualBlock (ra, rc));
+}
+
+static void testEffectReverbPresets()
+{
+    using namespace spatcore::effects;
+
+    // The factory table is DATA, and data is what rots quietly: nothing else in
+    // this suite reads EffectPresets.h at all. Two things are pinned here - that
+    // the rows are inside the surface the module clamps to (a factory room must
+    // never arrive at the FDN having been trimmed on the way), and that
+    // expanding a type writes the room without touching the taste.
+    CHECK (findReverbPreset (0, (int) ReverbType::Custom) == nullptr);
+    CHECK (findReverbPreset (0, -1) == nullptr);
+    CHECK (findReverbPreset (0, kNumReverbPresets) == nullptr);
+    CHECK (findReverbPreset (1, 0) == nullptr);     // no table for a model v1 has not got
+
+    for (int t = 0; t < kNumReverbPresets; ++t)
+    {
+        const ReverbPreset* row = findReverbPreset (0, t);
+        CHECK (row != nullptr);
+
+        if (row == nullptr)
+            continue;
+
+        CHECK (row->name != nullptr);
+        CHECK (row->rt60 >= 0.2f && row->rt60 <= 8.0f);
+        CHECK (row->rt60LowMult >= 0.1f && row->rt60LowMult <= 9.0f);
+        CHECK (row->rt60HighMult >= 0.1f && row->rt60HighMult <= 9.0f);
+        CHECK (row->crossoverLow >= 50.0f && row->crossoverLow <= 500.0f);
+        CHECK (row->crossoverHigh >= 1000.0f && row->crossoverHigh <= 10000.0f);
+        CHECK (row->crossoverLow < row->crossoverHigh);
+        CHECK (row->diffusion >= 0.0f && row->diffusion <= 1.0f);
+        CHECK (row->size >= FdnReverbModel::kMinSize && row->size <= FdnReverbModel::kMaxSize);
+        CHECK (row->predelayMs >= 0.0f && row->predelayMs <= EffectReverbModule::kMaxPredelayMs);
+    }
+
+    // Expanding a type writes the room and leaves tone, mix, bypass and model
+    // exactly as the player left them.
+    ReverbParams p;
+    p.toneHz = 6543.0f;
+    p.mix = 42.0f;
+    p.bypass = 0;
+    p.model = 0;
+    CHECK (applyReverbPreset (p, 0, (int) ReverbType::Hall));
+    CHECK (p.type == (std::uint8_t) ReverbType::Hall);
+    CHECK (p.rt60 == 2.4f && p.size == 1.3f && p.predelayMs == 20.0f);   // the plan's Hall row
+    CHECK (p.toneHz == 6543.0f && p.mix == 42.0f && p.bypass == 0 && p.model == 0);
+
+    // A type with no row is an answer, not a failure: the caller keeps what it
+    // has, which is what makes Custom a state rather than a special case.
+    const ReverbParams before = p;
+    CHECK (! applyReverbPreset (p, 0, (int) ReverbType::Custom));
+    CHECK (p.type == before.type && p.rt60 == before.rt60 && p.size == before.size);
+
+    // ...and every shipped row is a reverb that actually makes a sound.
+    for (int t = 0; t < kNumReverbPresets; ++t)
+    {
+        EffectReverbModule m;
+        m.prepare (module_test::config (48000.0, 256));
+
+        EffectChannelParams cp = reverb_test::params (100.0f, 0.0f);
+        CHECK (applyReverbPreset (cp.reverb, 0, t));            // predelay comes from the row
+        if (m.applyParams (cp, 0).variantPending)
+        {
+            m.reset();
+            m.commitPendingVariant();                           // four of the five resize
+        }
+
+        const std::vector<float> ir = reverb_test::impulseResponse (m, 16384);
+
+        bool finite = true;
+        for (int i = 0; i < 16384; ++i)
+            finite = finite && std::isfinite (ir[(size_t) i]);
+
+        CHECK (finite);
+        CHECK (reverb_test::windowDb (ir, 4096, 16384) > -70.0);    // measures -53.5 to -45.2
+    }
+}
+
+//==============================================================================
+// effects/modules - Multitap delay (FxDelay)
+//==============================================================================
+
+//==============================================================================
+// Multitap delay. The properties pinned here are the ones a rewrite would break
+// without making a noise about it: where a tap lands in each pattern mode, that
+// the delay time actually MOVES when the LFO runs (and by how much), that the
+// FIRST repeat ignores the feedback control and the shelves while the second one
+// obeys both, that a boosting shelf inside the loop cannot push it past unity,
+// that switching a shelf back on does not fire its frozen history into the loop,
+// and that mix 0 hands back the input rather than a crossfade evaluated at g = 1.
+//
+// Every number asserted below was produced by running this module, not derived
+// on paper: the arrival indices, the meter reading, the shelf ratios and the
+// decay bounds all come from an actual render.
+//==============================================================================
+
+namespace delay_test
+{
+    using namespace spatcore::effects;
+
+    /** One clean tap: pattern mode with a single tap, no feedback, no
+        modulation, no diffusion, fully wet. The input low cut is parked at
+        2 kHz deliberately - its impulse response dies within a handful of
+        samples, well before the first repeat, so every amplitude asserted below
+        is the delay line's arithmetic and not the filter's tail. */
+    inline void singleTap (EffectChannelParams& p, float timeMs)
+    {
+        MultitapParams& d = p.delay;
+        d.bypass = 0;         d.taps = 1;           d.tapMode = 1;     d.pattern = 0;
+        d.timeMs = timeMs;    d.feedback = 0.0f;    d.feedbackTap = 0;
+        d.inLoCutHz = 2000.0f;
+        d.fbLoShelfDb = 0.0f; d.fbHiShelfDb = 0.0f;
+        d.modRateHz = 0.1f;   d.modDepthPct = 0.0f;
+        d.diffusion = 0.0f;   d.glideMs = 0.0f;     d.mix = 100.0f;
+
+        for (int k = 0; k < 8; ++k)
+            d.tapLevelDb[k] = 0.0f;
+    }
+
+    /** The input low cut's b0. An impulse meets that filter with an empty
+        history, so what reaches the line at sample 0 is exactly b0 * 1, and
+        every first-arrival amplitude asserted below is a multiple of it. */
+    inline float lowCutB0()
+    {
+        return spatcore::dsp::OutputEQBiquadFilter::calculateCoefficients (1, 2000.0f, 0.0f, 0.6f, 0.7f, 48000.0).b0;
+    }
+
+    /** Renders in maxBlock-sized chunks, the way ModuleSlot::process does.
+        Handing the module a 40000-sample call instead would drive its
+        block-rate filter glides at 1 Hz and hide anything that depends on the
+        block length - which is exactly the class of bug a delay with a
+        per-sample LFO can have. */
+    inline void render (IEffectModule& m, std::vector<float>& buf, int chunk = 256)
+    {
+        const int n = (int) buf.size();
+        int offset = 0;
+
+        while (offset < n)
+        {
+            const int take = (n - offset) < chunk ? (n - offset) : chunk;
+            m.process (buf.data() + offset, take);
+            offset += take;
+        }
+    }
+
+    inline std::vector<float> impulse (IEffectModule& m, int n)
+    {
+        std::vector<float> buf ((size_t) n, 0.0f);
+        buf[0] = 1.0f;
+        render (m, buf);
+        return buf;
+    }
+
+    inline int argMaxAbs (const std::vector<float>& v, int from, int to)
+    {
+        int best = from;
+        for (int i = from; i < to; ++i)
+            if (std::fabs (v[(size_t) i]) > std::fabs (v[(size_t) best]))
+                best = i;
+        return best;
+    }
+
+    inline int argMaxAbs (const std::vector<float>& v) { return argMaxAbs (v, 0, (int) v.size()); }
+
+    inline float peakAbs (const std::vector<float>& v, int from, int to)
+    {
+        float peak = 0.0f;
+        for (int i = from; i < to; ++i)
+            peak = std::fabs (v[(size_t) i]) > peak ? std::fabs (v[(size_t) i]) : peak;
+        return peak;
+    }
+}
+
+static void testMultitapDelayNeutral()
+{
+    using namespace spatcore::effects;
+
+    ChainConfig cfg = module_test::config (48000.0, 256);
+
+    // Bypassed in a slot at defaults: the buffer is not touched at all.
+    {
+        ModuleSlot slot;
+        slot.prepare (cfg, std::make_unique<MultitapDelayModule>());
+        slot.applyParams (EffectChannelParams(), 0);
+        CHECK (slot.isBypassedSettled());
+
+        for (int block = 0; block < 4; ++block)
+        {
+            std::vector<float> buf = (block == 0) ? eqtests::makeAwkwardSignal (256)
+                                                  : module_test::awkwardBlock (256, block);
+            const std::vector<float> reference = buf;
+            slot.process (buf.data(), 256);
+            CHECK (eqtests::bitEqualBlock (buf, reference));
+        }
+        CHECK (slot.nanTrips.load() == 0);
+        CHECK (slot.getLatencySamples() == 0);
+    }
+
+    // ACTIVE at mix 0, with a loud feedback setting and the time modulation
+    // running underneath, and again with a NaN mix (which must clamp to the low
+    // bound, not reach the audio). Bit-identical rather than close: the wet
+    // sample is never mixed in, so the negative zeros and denormals come back as
+    // they went in.
+    for (int variant = 0; variant < 2; ++variant)
+    {
+        MultitapDelayModule m;
+        m.prepare (cfg);
+
+        EffectChannelParams p;
+        delay_test::singleTap (p, 10.0f);
+        p.delay.feedback = 90.0f;
+        p.delay.modRateHz = 5.0f;
+        p.delay.modDepthPct = 50.0f;
+        p.delay.mix = (variant == 0) ? 0.0f : std::numeric_limits<float>::quiet_NaN();
+
+        const ParamApplyInfo info = m.applyParams (p, 0);
+        CHECK (! info.bypass);
+        CHECK (! info.variantPending);          // nothing in this module needs silence
+        CHECK (m.getLatencySamples() == 0);     // the dry path is not delayed
+
+        for (int block = 0; block < 4; ++block)
+        {
+            std::vector<float> buf = (block == 0) ? eqtests::makeAwkwardSignal (256)
+                                                  : module_test::awkwardBlock (256, block);
+            const std::vector<float> reference = buf;
+            module_test::render (m, buf);
+            CHECK (eqtests::bitEqualBlock (buf, reference));
+        }
+    }
+}
+
+static void testMultitapDelayTapPlacement()
+{
+    using namespace spatcore::effects;
+    namespace fd = spatcore::dsp::FastDecibels;
+
+    const float b0 = delay_test::lowCutB0();
+    ChainConfig cfg = module_test::config (48000.0, 256);
+
+    // 10 ms at 48 kHz is 480 samples exactly, and an integer delay reads with
+    // an interpolation weight of 0, so the arrival is b0 and it lands on
+    // sample 480 and on no other.
+    {
+        MultitapDelayModule m;
+        m.prepare (cfg);
+        EffectChannelParams p;
+        delay_test::singleTap (p, 10.0f);
+        m.applyParams (p, 0);
+
+        const std::vector<float> out = delay_test::impulse (m, 2000);
+        CHECK (out[479] == 0.0f);                          // nothing arrives early
+        CHECK (std::fabs (out[480] - b0) < 1.0e-6f);
+        CHECK (delay_test::argMaxAbs (out) == 480);
+    }
+
+    // Pattern Equal is base*k, so three taps land on 480 / 960 / 1440, each
+    // scaled by its own level (-2 and -4 dB are the plan's tap defaults).
+    {
+        MultitapDelayModule m;
+        m.prepare (cfg);
+        EffectChannelParams p;
+        delay_test::singleTap (p, 10.0f);
+        p.delay.taps = 3;
+        p.delay.tapLevelDb[1] = -2.0f;
+        p.delay.tapLevelDb[2] = -4.0f;
+        m.applyParams (p, 0);
+
+        const std::vector<float> out = delay_test::impulse (m, 2000);
+        CHECK (std::fabs (out[480]  - b0) < 1.0e-6f);
+        CHECK (std::fabs (out[960]  - b0 * fd::dbToGain (-2.0f)) < 1.0e-6f);
+        CHECK (std::fabs (out[1440] - b0 * fd::dbToGain (-4.0f)) < 1.0e-6f);
+    }
+
+    // Dotted is 1.5*base*k: the same base puts the single tap on 720.
+    {
+        MultitapDelayModule m;
+        m.prepare (cfg);
+        EffectChannelParams p;
+        delay_test::singleTap (p, 10.0f);
+        p.delay.pattern = 1;
+        m.applyParams (p, 0);
+        CHECK (delay_test::argMaxAbs (delay_test::impulse (m, 2000)) == 720);
+    }
+
+    // Triplet is (2/3)*base*k: 320 samples, and it is the one pattern whose
+    // tap lands EARLIER than Equal - a swapped case label would show here.
+    {
+        MultitapDelayModule m;
+        m.prepare (cfg);
+        EffectChannelParams p;
+        delay_test::singleTap (p, 10.0f);
+        p.delay.pattern = 2;
+        m.applyParams (p, 0);
+        CHECK (delay_test::argMaxAbs (delay_test::impulse (m, 2000)) == 320);
+    }
+
+    // Golden is base*phi^(k-1): 480, 776.7, 1256.7. The fractional arrivals
+    // straddle two samples, so the peak lands on the nearer one.
+    {
+        MultitapDelayModule m;
+        m.prepare (cfg);
+        EffectChannelParams p;
+        delay_test::singleTap (p, 10.0f);
+        p.delay.pattern = 3;
+        p.delay.taps = 3;
+        m.applyParams (p, 0);
+
+        const std::vector<float> out = delay_test::impulse (m, 3000);
+        CHECK (delay_test::argMaxAbs (out,  700,  900) == 777);
+        CHECK (delay_test::argMaxAbs (out, 1150, 1400) == 1257);
+    }
+
+    // Manual mode reads the per-tap time array and IGNORES the pattern, which
+    // is set to Dotted here so that obeying it would be visible at 720.
+    {
+        MultitapDelayModule m;
+        m.prepare (cfg);
+        EffectChannelParams p;
+        delay_test::singleTap (p, 10.0f);
+        p.delay.tapMode = 0;
+        p.delay.taps = 2;
+        p.delay.tapTimeMs[0] = 5.0f;
+        p.delay.tapTimeMs[1] = 12.5f;
+        p.delay.pattern = 1;
+        m.applyParams (p, 0);
+
+        const std::vector<float> out = delay_test::impulse (m, 2000);
+        CHECK (std::fabs (out[240] - b0) < 1.0e-6f);
+        CHECK (std::fabs (out[600] - b0) < 1.0e-6f);
+        CHECK (std::fabs (out[720]) < 1.0e-9f);
+    }
+}
+
+static void testMultitapDelayTimeModulation()
+{
+    using namespace spatcore::effects;
+
+    ChainConfig cfg = module_test::config (48000.0, 256);
+
+    // The module's second characteristic law after tap placement, and the one
+    // an inert LFO would pass every other test with: t * (1 + depth*sin), so at
+    // a quarter cycle a 480-sample tap reads 720 and at three quarters it reads
+    // 240. The impulses are placed where a correctly modulated read head would
+    // have to have come from - 12000-720 and 36000-240 - and the echo must land
+    // on the LFO extreme itself, where the delay is stationary and the arrival
+    // is a single unsmeared sample.
+    //
+    // Run at BOTH ends of the glide range. Glide must not damp the wobble (a
+    // smoother fed the modulated target is a box filter that nulls 5 and 10 Hz
+    // outright at the plan's 200 ms default) and must not teleport on it either
+    // (at glide 0 the smoother's teleport threshold is six samples).
+    for (int variant = 0; variant < 2; ++variant)
+    {
+        MultitapDelayModule m;
+        m.prepare (cfg);
+
+        EffectChannelParams p;
+        delay_test::singleTap (p, 10.0f);
+        p.delay.modRateHz = 1.0f;               // one cycle per 48000 samples
+        p.delay.modDepthPct = 50.0f;
+        p.delay.glideMs = (variant == 0) ? 0.0f : 200.0f;
+        m.applyParams (p, 0);
+
+        std::vector<float> buf (40000, 0.0f);
+        buf[(size_t) 11280] = 1.0f;
+        buf[(size_t) 35760] = 1.0f;
+        delay_test::render (m, buf);
+
+        CHECK (delay_test::argMaxAbs (buf, 11500, 12500) - 11280 == 720);   // +50 %
+        CHECK (delay_test::argMaxAbs (buf, 35500, 36500) - 35760 == 240);   // -50 %
+    }
+
+    // Depth 0 is inert to the bit at every rate: the phase still advances every
+    // sample, but the multiply is left out rather than applied as 1.0.
+    {
+        MultitapDelayModule fast, slow;
+        fast.prepare (cfg);
+        slow.prepare (cfg);
+
+        EffectChannelParams p;
+        delay_test::singleTap (p, 10.0f);
+        p.delay.modDepthPct = 0.0f;
+        p.delay.modRateHz = 7.0f;
+        fast.applyParams (p, 0);
+        p.delay.modRateHz = 0.02f;
+        slow.applyParams (p, 0);
+
+        bool identical = true;
+        for (int block = 0; block < 8; ++block)
+        {
+            std::vector<float> a = module_test::awkwardBlock (256, block + 3);
+            std::vector<float> b = a;
+            module_test::render (fast, a);
+            module_test::render (slow, b);
+            if (! eqtests::bitEqualBlock (a, b))
+                identical = false;
+        }
+        CHECK (identical);
+    }
+}
+
+static void testMultitapDelayBlockSizeInvariance()
+{
+    using namespace spatcore::effects;
+
+    // Replaces a determinism check between two instances started in the same
+    // process on the same block, which cannot fail. This one can: the module is
+    // driven with everything moving - three taps, feedback, a 6 Hz time
+    // modulation, a shelf in the loop - once in 256-sample chunks and once in
+    // 64-sample chunks, and the two renders must agree TO THE BIT.
+    //
+    // ModuleSlot chunks at maxBlock, so a host that changes its buffer size must
+    // not change the sound. It also catches the specific trap in the LFO: a
+    // phase advanced once per block instead of once per sample runs numSamples
+    // times too slow, which is invisible against a single reference render and
+    // glaring here.
+    ChainConfig cfg = module_test::config (48000.0, 256);
+
+    MultitapDelayModule a, b;
+    a.prepare (cfg);
+    b.prepare (cfg);
+
+    EffectChannelParams p;
+    delay_test::singleTap (p, 13.0f);
+    p.delay.taps = 3;
+    p.delay.feedback = 55.0f;
+    p.delay.modRateHz = 6.0f;
+    p.delay.modDepthPct = 35.0f;
+    p.delay.fbHiShelfDb = -6.0f;
+    a.applyParams (p, 0);
+    b.applyParams (p, 0);
+
+    std::vector<float> x = module_test::awkwardBlock (4096, 3);
+    std::vector<float> y = x;
+    delay_test::render (a, x, 256);
+    delay_test::render (b, y, 64);
+    CHECK (eqtests::bitEqualBlock (x, y));
+}
+
+static void testMultitapDelayFeedbackLadder()
+{
+    using namespace spatcore::effects;
+
+    const float b0 = delay_test::lowCutB0();
+
+    const auto run = [] (float feedbackPercent, float loShelfDb, float hiShelfDb, int n)
+    {
+        MultitapDelayModule m;
+        m.prepare (module_test::config (48000.0, 256));
+        EffectChannelParams p;
+        delay_test::singleTap (p, 10.0f);
+        p.delay.feedback = feedbackPercent;
+        p.delay.fbLoShelfDb = loShelfDb;
+        p.delay.fbHiShelfDb = hiShelfDb;
+        m.applyParams (p, 0);
+        return delay_test::impulse (m, n);
+    };
+
+    // The line holds L[0] = b0, L[480] = f*b0, L[960] = f^2*b0, and a tap reads
+    // L 480 samples after it was written. At f = 0.5 that is b0, b0/2, b0/4 on
+    // samples 480, 960 and 1440.
+    const std::vector<float> half = run (50.0f, 0.0f, 0.0f, 2000);
+    CHECK (std::fabs (half[480]  - b0)         < 1.0e-6f);
+    CHECK (std::fabs (half[960]  - 0.5f * b0)  < 1.0e-5f);
+    CHECK (std::fabs (half[1440] - 0.25f * b0) < 1.0e-5f);
+
+    // The first repeat does not move with the control, and with no feedback
+    // there is no second one. A port that took the wet from after the feedback
+    // multiply would fail exactly these two and nothing else.
+    const std::vector<float> none = run (0.0f,  0.0f, 0.0f, 2000);
+    const std::vector<float> lots = run (95.0f, 0.0f, 0.0f, 2000);
+    CHECK (std::fabs (none[480] - lots[480]) < 1.0e-6f);
+    CHECK (std::fabs (none[960]) < 1.0e-9f);
+
+    // WHERE THE SHELVES SIT, which the ladder above does not pin: they are
+    // strictly inside the loop, so a 24 dB high-shelf cut must leave repeat 1
+    // bit-for-bit alone and take repeat 2 down. A port that moved them ahead of
+    // the wet tap, or outside the loop, passes every other test in this file.
+    {
+        const std::vector<float> flat = run (60.0f,  0.0f,   0.0f, 2000);
+        const std::vector<float> cut  = run (60.0f,  0.0f, -24.0f, 2000);
+        CHECK (std::fabs (delay_test::peakAbs (flat, 470, 700)
+                        - delay_test::peakAbs (cut,  470, 700)) < 1.0e-6f);
+        CHECK (delay_test::peakAbs (cut, 950, 1200) < 0.5f * delay_test::peakAbs (flat, 950, 1200));
+    }
+
+    // 95 % feedback with +24 dB on both shelves is a loop gain of 15 unless the
+    // ceiling divides it back down. Without the ceiling this reaches ~5e11 by
+    // sample 4800; with it the loop still decays, which is the property that
+    // matters rather than any hand-guessed magnitude bound.
+    {
+        const std::vector<float> hot = run (95.0f, 24.0f, 24.0f, 4800);
+        bool finite = true;
+        for (int i = 0; i < 4800; ++i)
+            if (! std::isfinite (hot[(size_t) i]))
+                finite = false;
+        CHECK (finite);
+        CHECK (delay_test::peakAbs (hot, 3800, 4800) < 0.1f * delay_test::peakAbs (hot, 0, 1000));
+    }
+}
+
+static void testMultitapDelayShelfReactivation()
+{
+    using namespace spatcore::effects;
+
+    // A shelf at its detent is switched OFF (shape 0), and OutputEQBiquadFilter
+    // returns early in that state WITHOUT shifting its delay line - so x1/x2/
+    // y1/y2 freeze holding whatever the loop was doing. Switching the shelf back
+    // on therefore replays that frozen state as the filter's first output,
+    // INSIDE a feedback loop.
+    //
+    // Measured on this module with the reset removed: the loop is at 1e-7 when
+    // the shelf comes back and the stale history fires 2.1e-2 into it - five
+    // orders of magnitude, recirculated at up to 0.95 a repeat. With the reset
+    // the re-enable is inaudible (ratio 0.9). The bound below sits between the
+    // two with a factor of 25000 of margin.
+    MultitapDelayModule m;
+    m.prepare (module_test::config (48000.0, 256));
+
+    EffectChannelParams p;
+    delay_test::singleTap (p, 10.0f);
+    p.delay.feedback = 90.0f;
+    p.delay.inLoCutHz = 20.0f;
+    p.delay.fbLoShelfHz = 2000.0f;
+    p.delay.fbLoShelfDb = -24.0f;
+    m.applyParams (p, 0);
+
+    for (int block = 0; block < 24; ++block)
+    {
+        std::vector<float> buf = module_test::awkwardBlock (256, block + 1);
+        module_test::render (m, buf);
+    }
+
+    p.delay.fbLoShelfDb = 0.0f;                     // detent: the biquad freezes
+    m.applyParams (p, 0);
+
+    float tail = 0.0f;
+    for (int block = 0; block < 300; ++block)
+    {
+        std::vector<float> buf (256, 0.0f);
+        module_test::render (m, buf);
+        tail = delay_test::peakAbs (buf, 0, 256);
+    }
+
+    p.delay.fbLoShelfDb = -24.0f;                   // back on, into a quiet loop
+    m.applyParams (p, 0);
+
+    float after = 0.0f;
+    for (int block = 0; block < 8; ++block)
+    {
+        std::vector<float> buf (256, 0.0f);
+        module_test::render (m, buf);
+        const float pk = delay_test::peakAbs (buf, 0, 256);
+        after = pk > after ? pk : after;
+    }
+
+    CHECK (after <= tail * 8.0f);
+}
+
+static void testMultitapDelayDiffusionAndMeter()
+{
+    using namespace spatcore::effects;
+    namespace fd = spatcore::dsp::FastDecibels;
+
+    // Diffusion is two Schroeder allpasses, so it must SMEAR the repeat without
+    // changing how much of it there is: same energy to a fifth of a percent,
+    // peak down by more than a third. A pair of plain delays or a mis-signed
+    // allpass fails one of the two.
+    {
+        const auto run = [] (float diffusion)
+        {
+            MultitapDelayModule m;
+            m.prepare (module_test::config (48000.0, 256));
+            EffectChannelParams p;
+            delay_test::singleTap (p, 10.0f);
+            p.delay.diffusion = diffusion;
+            m.applyParams (p, 0);
+            return delay_test::impulse (m, 8192);
+        };
+
+        const std::vector<float> dry = run (0.0f);
+        const std::vector<float> wet = run (1.0f);
+
+        double dryEnergy = 0.0, wetEnergy = 0.0;
+        for (size_t i = 0; i < dry.size(); ++i)
+        {
+            dryEnergy += (double) dry[i] * (double) dry[i];
+            wetEnergy += (double) wet[i] * (double) wet[i];
+        }
+        CHECK (wetEnergy > dryEnergy * 0.98 && wetEnergy < dryEnergy * 1.02);
+        CHECK (delay_test::peakAbs (wet, 0, 8192) < 0.6f * delay_test::peakAbs (dry, 0, 8192));
+    }
+
+    // getMeterDb reports the WET peak of the block just processed - before the
+    // mix, which is the author's declared choice and the thing to notice if the
+    // GUI ever disagrees. It is kMinDb before the repeat arrives, the low cut's
+    // b0 on the block that carries it, and back to kMinDb once the line empties.
+    {
+        MultitapDelayModule m;
+        m.prepare (module_test::config (48000.0, 256));
+        CHECK (m.getMeterDb() <= fd::kMinDb + 1.0f);
+
+        EffectChannelParams p;
+        delay_test::singleTap (p, 10.0f);
+        m.applyParams (p, 0);
+
+        std::vector<float> first (256, 0.0f);
+        first[0] = 1.0f;
+        module_test::render (m, first);
+        CHECK (m.getMeterDb() <= fd::kMinDb + 1.0f);
+
+        std::vector<float> second (256, 0.0f);       // samples 256..511: the tap is on 480
+        module_test::render (m, second);
+        CHECK (std::fabs (m.getMeterDb() - fd::gainToDb (delay_test::lowCutB0())) < 0.1f);
+
+        std::vector<float> silence (48000, 0.0f);
+        delay_test::render (m, silence);
+        CHECK (m.getMeterDb() <= fd::kMinDb + 1.0f);
+    }
+}
+
+static void testMultitapDelayResetClearsTail()
+{
+    using namespace spatcore::effects;
+
+    MultitapDelayModule m;
+    m.prepare (module_test::config (48000.0, 256));
+    EffectChannelParams p;
+    delay_test::singleTap (p, 10.0f);
+    p.delay.feedback = 90.0f;
+    p.delay.diffusion = 1.0f;
+    m.applyParams (p, 0);
+
+    const std::vector<float> excited = delay_test::impulse (m, 2048);
+    CHECK (delay_test::peakAbs (excited, 1024, 2048) > 1.0e-3f);   // a tail to lose
+
+    m.reset();
+
+    std::vector<float> silence (2048, 0.0f);
+    delay_test::render (m, silence);
+
+    bool silent = true;
+    for (int i = 0; i < 2048; ++i)
+        if (silence[(size_t) i] != 0.0f)
+            silent = false;
+    CHECK (silent);
+
+    // Silence is the weak half of the claim. The strong half: a reset instance
+    // and a fresh one must be indistinguishable to the audio. Anything reset()
+    // forgets - a biquad history, an allpass write position, the LFO phase, a
+    // tap smoother part way along a ramp, the block counter the smoothers are
+    // indexed by - survives into the impulse response and shows up here, and
+    // nowhere else in this file.
+    {
+        MultitapDelayModule used, fresh;
+        used.prepare (module_test::config (48000.0, 256));
+        fresh.prepare (module_test::config (48000.0, 256));
+
+        EffectChannelParams q;
+        delay_test::singleTap (q, 7.0f);
+        q.delay.taps = 3;          q.delay.feedback = 85.0f;
+        q.delay.diffusion = 0.9f;  q.delay.glideMs = 150.0f;
+        q.delay.modRateHz = 3.0f;  q.delay.modDepthPct = 45.0f;
+        q.delay.fbLoShelfDb = 9.0f;
+        q.delay.fbHiShelfDb = -15.0f;
+        used.applyParams (q, 0);
+        fresh.applyParams (q, 0);
+
+        for (int block = 0; block < 30; ++block)
+        {
+            std::vector<float> dirt = module_test::awkwardBlock (256, block + 61);
+            module_test::render (used, dirt);
+        }
+        used.reset();
+
+        std::vector<float> a (4096, 0.0f), b (4096, 0.0f);
+        a[0] = 1.0f;
+        b[0] = 1.0f;
+        delay_test::render (used, a);
+        delay_test::render (fresh, b);
+        CHECK (eqtests::bitEqualBlock (a, b));
+    }
+}
+
+static void testMultitapDelayInSlot()
+{
+    using namespace spatcore::effects;
+
+    // The module driven the way the chain drives it: faded in, run active,
+    // faded out, and reset on the audio thread when the slot settles silent.
+    // Nothing else in this file exercises ModuleSlot's crossfade, its
+    // silent-reset path or its NaN trip against THIS module.
+    ChainConfig cfg = module_test::config (48000.0, 256);
+
+    ModuleSlot slot;
+    slot.prepare (cfg, std::make_unique<MultitapDelayModule>());
+
+    EffectChannelParams p;
+    delay_test::singleTap (p, 10.0f);
+    p.delay.feedback = 70.0f;
+    p.delay.diffusion = 0.6f;
+    p.delay.modRateHz = 4.0f;
+    p.delay.modDepthPct = 40.0f;
+    p.delay.mix = 60.0f;
+    slot.applyParams (p, 0);
+
+    bool finite = true;
+    for (int block = 0; block < 40; ++block)
+    {
+        std::vector<float> buf = module_test::awkwardBlock (256, block + 11);
+        slot.process (buf.data(), 256);
+        for (int i = 0; i < 256; ++i)
+            if (! std::isfinite (buf[(size_t) i]))
+                finite = false;
+    }
+    CHECK (finite);
+    CHECK (slot.isActiveSettled());
+    CHECK (slot.nanTrips.load() == 0);
+
+    p.delay.bypass = 1;
+    slot.applyParams (p, 0);
+    for (int block = 0; block < 40; ++block)
+    {
+        std::vector<float> buf = module_test::awkwardBlock (256, block + 51);
+        slot.process (buf.data(), 256);
+    }
+    CHECK (slot.isBypassedSettled());
+    CHECK (slot.silentResets.load() > 0);          // the 1 MB reset really ran
+    CHECK (slot.nanTrips.load() == 0);
+
+    // Settled bypassed again: transparent to the bit, tail and all.
+    {
+        std::vector<float> buf = eqtests::makeAwkwardSignal (256);
+        const std::vector<float> reference = buf;
+        slot.process (buf.data(), 256);
+        CHECK (eqtests::bitEqualBlock (buf, reference));
+    }
+}
+
+static void testMultitapDelayExtremesAndRates()
+{
+    using namespace spatcore::effects;
+
+    ChainConfig cfg = module_test::config (48000.0, 256);
+
+    // Every control at an end stop, then the same with a NaN on the four a
+    // broken publisher is most likely to send. The negated clamps must land
+    // each of them on its low bound instead of letting it into the audio.
+    //
+    // The bound is that the loop DECAYS - the peak of the last block is under a
+    // twentieth of the loudest block seen. An absolute magnitude bound here is
+    // either vacuous or flaky; this is the property the feedback ceiling exists
+    // to guarantee, and the measured margin is a factor of 200 or better.
+    {
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+
+        for (int variant = 0; variant < 3; ++variant)
+        {
+            MultitapDelayModule m;
+            m.prepare (cfg);
+
+            EffectChannelParams p;
+            MultitapParams& d = p.delay;
+            d.bypass = 0;   d.taps = 8;   d.pattern = 3;      // golden: the widest spread
+            d.tapMode = (variant == 1) ? 0 : 1;
+            d.feedbackTap = (variant == 1) ? 4 : 0;
+            d.timeMs      = (variant == 2) ? nan : 20.0f;
+            d.feedback    = (variant == 2) ? nan : 95.0f;
+            d.modDepthPct = (variant == 2) ? nan : 50.0f;
+            d.diffusion   = (variant == 2) ? nan : 1.0f;
+            d.glideMs     = (variant == 0) ? 0.0f : 2000.0f;
+            d.modRateHz = 10.0f;
+            d.fbLoShelfDb = 24.0f;  d.fbHiShelfDb = -24.0f;  d.mix = 100.0f;
+
+            for (int k = 0; k < 8; ++k)
+                d.tapTimeMs[k] = 3.0f * (float) (k + 1);
+
+            m.applyParams (p, 0);
+
+            bool finite = true;
+            float worst = 0.0f, last = 0.0f;
+
+            for (int block = 0; block < 200; ++block)
+            {
+                std::vector<float> buf = (block < 8) ? module_test::awkwardBlock (256, block + 1)
+                                                     : std::vector<float> (256, 0.0f);
+                module_test::render (m, buf);
+
+                for (int i = 0; i < 256; ++i)
+                    if (! std::isfinite (buf[(size_t) i]))
+                        finite = false;
+
+                const float peak = delay_test::peakAbs (buf, 0, 256);
+                worst = peak > worst ? peak : worst;
+                last = peak;
+            }
+
+            CHECK (finite);
+            CHECK (last < worst * 0.05f);
+        }
+    }
+
+    // prepare() at a new rate with no applyParams behind it: the tap times, the
+    // buffer cap and the glide window are all recomputed against the new rate,
+    // so 10 ms is still 10 ms - 960 samples at 96 kHz, not the 480 the previous
+    // rate's numbers would give.
+    {
+        MultitapDelayModule m;
+        m.prepare (module_test::config (48000.0, 256));
+
+        EffectChannelParams p;
+        delay_test::singleTap (p, 10.0f);
+        p.delay.glideMs = 200.0f;
+        m.applyParams (p, 0);
+
+        m.prepare (module_test::config (96000.0, 256));
+        std::vector<float> buf (4000, 0.0f);
+        buf[0] = 1.0f;
+        delay_test::render (m, buf);
+        CHECK (delay_test::argMaxAbs (buf) == 960);
+    }
+}
+
 static void testStereoPassThroughIdentity()
 {
     using namespace spatcore::dsp;
@@ -5605,6 +9866,61 @@ int main()
         testChainLatencySum();
         testChainBypassAndMute();
         testChainNeutralAndGuarded();
+        testDistortionBypassAndIdentity();
+        testDistortionShaperLaw();
+        testDistortionShelves();
+        testDistortionMixAlignment();
+        testDistortionDcBlocker();
+        testDistortionOversampling();
+        testDistortionResetAndRange();
+        testDynamicsBypassAndIdentity();
+        testDynamicsCompressorLaw();
+        testDynamicsPeakDetectorLaw();
+        testDynamicsExpanderLawAndRange();
+        testDynamicsKneeAndAutoMakeup();
+        testDynamicsLookaheadAndDetectorDelay();
+        testDynamicsHoldAndReset();
+        testDynamicsVariantAndLatency();
+        testDynamicsSampleRates();
+        testDynamicsExtremesAndDeterminism();
+        testModulationTransparency();
+        testModulationThroughZeroAtMixZero();
+        testModulationDelayLaw();
+        testModulationLoCutPlacement();
+        testModulationVoiceLevelLaw();
+        testModulationFeedbackAndReset();
+        testModulationDenormalFlush();
+        testModulationVariants();
+        testModulationExtremes();
+        testPhaserAllpassLaw();
+        testPhaserSweepLaw();
+        testPhaserSpreadLaw();
+        testPhaserLfoRateAndShape();
+        testPhaserTransparency();
+        testPhaserResetClearsTail();
+        testPhaserStagesAreAVariant();
+        testPhaserExtremesStayFinite();
+        testPhaserSurvivesNonFiniteInput();
+        testPhaserDeterminism();
+        testEffectReverbIdentity();
+        testEffectReverbPredelay();
+        testEffectReverbDecayLaw();
+        testEffectReverbTone();
+        testEffectReverbWetLevel();
+        testEffectReverbResetClearsTail();
+        testEffectReverbSizeVariant();
+        testEffectReverbExtremesAndDeterminism();
+        testEffectReverbPresets();
+        testMultitapDelayNeutral();
+        testMultitapDelayTapPlacement();
+        testMultitapDelayTimeModulation();
+        testMultitapDelayBlockSizeInvariance();
+        testMultitapDelayFeedbackLadder();
+        testMultitapDelayShelfReactivation();
+        testMultitapDelayDiffusionAndMeter();
+        testMultitapDelayResetClearsTail();
+        testMultitapDelayInSlot();
+        testMultitapDelayExtremesAndRates();
         testOscRoundtrip();
         testRtThreadPriority();
         testGpuHostWorkPoolDeterminism();

@@ -4,6 +4,12 @@
 #include "modules/TremoloModule.h"
 #include "modules/BitcrusherModule.h"
 #include "modules/EffectEQModule.h"
+#include "modules/DistortionModule.h"
+#include "modules/DynamicsModule.h"
+#include "modules/ModulationModule.h"
+#include "modules/PhaserModule.h"
+#include "modules/EffectReverbModule.h"
+#include "modules/MultitapDelayModule.h"
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -18,10 +24,10 @@ namespace spatcore::effects
     instrumented stand-ins, and so a consumer can supply its own module set. */
 using ModuleFactory = std::unique_ptr<IEffectModule> (*) (ModuleId type, int instance, const ChainConfig& config);
 
-/** The module set shipped so far. Types that are not implemented yet return
-    null, which the chain treats as a pass-through slot - so the slot layout,
-    the chain order and the whole parameter surface are already final while the
-    remaining modules are still being written. */
+/** Every module type, live. A null return is still honoured by the chain as a
+    pass-through slot, which is what kept the slot layout and the parameter
+    surface final while the module set was being filled in; nothing returns null
+    now except the Count sentinel. */
 inline std::unique_ptr<IEffectModule> createModule (ModuleId type, int instance, const ChainConfig& config)
 {
     (void) instance;        // the shipped modules are all single-instance so far
@@ -32,15 +38,15 @@ inline std::unique_ptr<IEffectModule> createModule (ModuleId type, int instance,
         case ModuleId::Trem:   return std::make_unique<TremoloModule>();
         case ModuleId::Crush:  return std::make_unique<BitcrusherModule>();
         case ModuleId::EQ:     return std::make_unique<EffectEQModule>();
+        case ModuleId::Dist:   return std::make_unique<DistortionModule>();
+        case ModuleId::Dyn:    return std::make_unique<DynamicsModule>();
+        case ModuleId::Mod:    return std::make_unique<ModulationModule>();
+        case ModuleId::Phaser: return std::make_unique<PhaserModule>();
+        case ModuleId::Reverb: return std::make_unique<EffectReverbModule>();
+        case ModuleId::Delay:  return std::make_unique<MultitapDelayModule>();
 
-        case ModuleId::Dist:
-        case ModuleId::Dyn:
-        case ModuleId::Mod:
-        case ModuleId::Phaser:
-        case ModuleId::Reverb:
-        case ModuleId::Delay:
         case ModuleId::Count:
-        default:               return nullptr;
+        default:               return nullptr;   // not a real slot
     }
 }
 
