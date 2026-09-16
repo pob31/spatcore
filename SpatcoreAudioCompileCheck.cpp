@@ -40,17 +40,25 @@
 #include "rt/RtThreadPriority.h"
 #include "rt/ReverbDiagnostics.h"
 #include "rt/RtSnapshot.h"
+#include "rt/RtTripleBuffer.h"
 #include "rt/SharedInputRingBuffer.h"
 
 // dsp/ - smoothers, filters, detectors
+#include "dsp/AcousticSendMatrix.h"
 #include "dsp/BiquadResponse.h"
 #include "dsp/DelayTargetSmoother.h"
+#include "dsp/DcBlocker.h"
+#include "dsp/FastDecibels.h"
+#include "dsp/FractionalDelayLine.h"
 #include "dsp/FrDiffusionModel.h"
+#include "dsp/EnvelopeFollower.h"
 #include "dsp/InputSpeedLimiter.h"
 #include "dsp/LFOWaveforms.h"
+#include "dsp/LfoPhasor.h"
 #include "dsp/LiveSourceLevelDetector.h"
 #include "dsp/MultiChannelEQBank.h"
 #include "dsp/NumericGuards.h"
+#include "dsp/OnePoleSmoother.h"
 #include "dsp/OutputEQBiquadFilter.h"
 #include "dsp/OutputEQProcessor.h"
 #include "dsp/OutputLevelDetector.h"
@@ -59,6 +67,7 @@
 #include "dsp/TrackingPositionFilter.h"
 #include "dsp/WFSBiquadFilter.h"
 #include "dsp/WFSHighShelfFilter.h"
+#include "dsp/Waveshaper.h"
 
 // wfs/ - CPU delay-sum processors + native-GPU renderer wrappers
 #include "wfs/InputBufferAlgorithm.h"
@@ -75,6 +84,22 @@
 #include "reverb/ReverbSendMatrix.h"
 #include "reverb/ReverbFeedThread.h"
 #include "reverb/ReverbReturnProcessor.h"
+
+// effects/ - the per-channel effects chain: contract first, then the modules
+#include "effects/EffectsTypes.h"
+#include "effects/EffectParams.h"
+#include "effects/EffectModule.h"
+#include "effects/modules/TremoloModule.h"
+#include "effects/modules/BitcrusherModule.h"
+#include "effects/modules/EffectEQModule.h"
+#include "effects/modules/DistortionModule.h"
+#include "effects/modules/DynamicsModule.h"
+#include "effects/modules/ModulationModule.h"
+#include "effects/modules/PhaserModule.h"
+#include "effects/modules/EffectReverbModule.h"
+#include "effects/modules/MultitapDelayModule.h"
+#include "effects/EffectPresets.h"
+#include "effects/EffectChain.h"
 
 // gpu/ - host-facing surface (interfaces, device manager, plugin factory,
 // pipeline, host state/configs, compile-time backend selectors)
@@ -110,6 +135,11 @@
 // compensation bank matches). It also gives the archive real, non-inline
 // symbols on top of the anchor below.
 template class spatcore::dsp::MultiChannelEQBank<6>;
+
+// Same reasoning for the parameter hand-off: instantiating it here compiles
+// every member against the payload it will actually carry, and proves the
+// POD static_assert against the real EffectChannelParams rather than a stub.
+template class spatcore::rt::RtTripleBuffer<spatcore::effects::EffectChannelParams>;
 
 namespace spatcore
 {

@@ -3,7 +3,7 @@
 #include <juce_audio_basics/juce_audio_basics.h>
 #include "../rt/SharedInputRingBuffer.h"
 #include "../rt/AudioParallelFor.h"
-#include "ReverbSendMatrix.h"
+#include "../dsp/AcousticSendMatrix.h"
 #include "ReverbEngine.h"
 #include <atomic>
 #include <chrono>
@@ -24,7 +24,7 @@ namespace spatcore::reverb {
     derived from the geometry, filtered by an air-absorption high shelf, then
     scaled by the send level. That mirrors the direct WFS path
     (spatcore/wfs/InputBufferProcessor.h), which has always done all three.
-    The computation itself lives in ReverbSendMatrix so it can be tested
+    The computation itself lives in dsp/AcousticSendMatrix so it can be tested
     without a thread; this class is the plumbing around it.
 
     Runs one block behind the audio callback (2.67ms at 256/96kHz — imperceptible for reverb).
@@ -315,7 +315,7 @@ private:
     std::vector<float*> feedRowPtrs;           // resolved per batch, feed thread only
     juce::AudioBuffer<float> downsampleBuffer;
 
-    ReverbSendMatrix sendMatrix;               // the actual send computation
+    spatcore::dsp::AcousticSendMatrix sendMatrix;   // the actual send computation
     AudioParallelFor feedPool;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(ReverbFeedThread)
