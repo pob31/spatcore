@@ -29,6 +29,27 @@ public:
     static constexpr int NUM_DIFFUSER_STAGES = 4;
     static constexpr float REFERENCE_SAMPLE_RATE = 48000.0f;
 
+    /** @param maxDelaySamplesIn  per-line delay ceiling in samples. The default is the shipped
+                                  network, bit for bit; raise it only for a deliberately larger one.
+
+        The ceiling used to be fixed, which quietly degenerates the network at high sample rates:
+        it binds once fdnSize * (sr/48000) exceeds about 5.2, and at 192 kHz with fdnSize 2 the
+        four longest lines all clamp to the SAME length, collapsing the modal density into a ring.
+        Making it a construction-time choice lets a caller that knows its rate avoid that. */
+    explicit FDNAlgorithm (int maxDelaySamplesIn = MAX_DELAY_SAMPLES)
+        : maxDelaySamples (juce::jmax (1, maxDelaySamplesIn)) {}
+
+    /** Shifts which "node" this instance's networks are derived from. Call BEFORE prepare().
+
+        Every per-node quantity - the delay-length jitter, the diffuser and allpass jitter, and the
+        output tap signs - comes from nodeHash(nodeIndex, ...), so a bank of INDEPENDENT one-node
+        instances would otherwise all be node 0: identical delay lengths, identical modal structure,
+        identical tap signs. Their tails would be copies of each other and would sum into a
+        comb-filtered centre image instead of spreading. An offset gives each instance its own
+        network. Note the tap-sign rotation is modulo 16, so offsets 16 apart share a rotation and
+        differ only by the hash sign flip. The default of 0 reproduces the shipped behaviour. */
+    void setNodeIndexOffset (int offset) noexcept { nodeIndexOffset = juce::jmax (0, offset); }
+
     //==========================================================================
     void prepare (double newSampleRate, int /*maxBlockSize*/, int numNodes) override
     {
@@ -262,8 +283,11 @@ private:
     // Node preparation and reset
     //==========================================================================
 
-    void prepareNode (FDNNode& node, int nodeIndex)
+    void prepareNode (FDNNode& node, int rawNodeIndex)
     {
+        // Everything below is derived from this, so the offset lands on all of it at once.
+        const int nodeIndex = rawNodeIndex + nodeIndexOffset;
+
         float sizeScale = currentParams.fdnSize * rateScale;
 
         // Per-node delay line variation: ±6% of base delay using deterministic hash
@@ -273,7 +297,7 @@ private:
             int baseDelay = static_cast<int> (baseDelays[si] * sizeScale);
             int range = juce::jmax (1, baseDelay / 16);  // ±6.25% variation
             int offset = static_cast<int> (nodeHash (nodeIndex, i) % static_cast<uint32_t> (range * 2 + 1)) - range;
-            int delay = juce::jlimit (1, MAX_DELAY_SAMPLES, baseDelay + offset);
+            int delay = juce::jlimit (1, maxDelaySamples, baseDelay + offset);
 
             node.delayLengths[si] = delay;
             node.delayLines[si].assign (static_cast<size_t> (delay), 0.0f);
@@ -481,6 +505,8 @@ private:
 
     double sr = 48000.0;
     float rateScale = 1.0f;
+    int maxDelaySamples = MAX_DELAY_SAMPLES;   // non-const: keeps the class assignable
+    int nodeIndexOffset = 0;
     int numActiveNodes = 0;
     float diffusionCoeff = 0.35f;
     float toneCoeff = 0.65f;  // one-pole LPF coefficient for output tone filter
