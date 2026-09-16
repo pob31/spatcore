@@ -360,6 +360,19 @@ The CPU DSP path is **hand-rolled per-sample**, not `juce::dsp`.
   `reverb/ReverbFDNAlgorithm.h` per channel, which is why that class gained a delay-ceiling
   constructor argument and a node-index offset: without the offset every per-channel reverb would be
   node 0 and 32 of them would share one modal structure. **[V]**
+- **The effects engine** (2026-09, spatcore-only so far). A realtime driver thread, shaped like
+  `reverb/ReverbFeedThread.h`, drains the same shared input rings, renders a per-channel feed through
+  `dsp/AcousticSendMatrix.h` with effects channels as its nodes, runs each channel's `EffectChain` on
+  an `AudioParallelFor` pool, and pushes the result into a per-channel SPSC ring the audio callback
+  pops. It is split into `effects/EffectsEngineCore.h` (thread-free, so the block ledger can be
+  tested synchronously) and `effects/EffectsEngine.h` (the `juce::Thread` around it). Three
+  differences from the reverb feed are structural rather than incidental: it DRAINS in a loop instead
+  of taking one batch per wake; effect returns are themselves sources of its feed matrix, so a
+  channel can feed another channel; and its output is consumed by the audio callback rather than
+  pushed to a second engine, which is why `pullReturn` is gated by a ready flag and a try-lock and
+  degrades to silence rather than ever blocking. `effects/LoopGuard.h` watches the effect-to-effect
+  part of each feed - rendered as its own pass, which is what the send matrix's source range is for -
+  and ramps it away when it builds. Inputs are never touched: they cannot run away. **[V]**
 - **Prefilter — the headline divergence.** There is **no √(jω) / +3 dB-per-octave WFS
   field-correction filter (FIR or IIR) anywhere in `Source/`** (independently re-grepped: all
   "pre-filter" hits are the Floor-Reflection chain). The only per-tap spectral shaping is a
