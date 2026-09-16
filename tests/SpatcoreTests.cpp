@@ -58,6 +58,12 @@
                                  reader keeps its slot until something new is
                                  published, and a value read while a writer
                                  thread hammers publish() is never torn
+     14. dsp/ effects primitives OnePoleSmoother (coefficient law, and the snap
+                                 that stops a float one-pole freezing short of
+                                 its target), FastDecibels (libm-free dB <-> gain:
+                                 accuracy, saturation and the values that must be
+                                 EXACT), LfoPhasor (phase wrap, shape values,
+                                 keyed-noise determinism)
 */
 
 // OSCParser.h / OSCSerializer.h use juce::OSC* types but (verbatim-moved,
@@ -77,6 +83,9 @@
 #include "spatcore/rt/RtThreadPriority.h"
 #include "spatcore/gpu/GpuHostWorkPool.h"
 #include "spatcore/dsp/DelayTargetSmoother.h"
+#include "spatcore/dsp/OnePoleSmoother.h"
+#include "spatcore/dsp/FastDecibels.h"
+#include "spatcore/dsp/LfoPhasor.h"
 #include "spatcore/dsp/AcousticTap.h"
 #include "spatcore/reverb/ReverbReturnProcessor.h"
 #include "spatcore/reverb/ReverbSendMatrix.h"
@@ -379,6 +388,245 @@ static void testRtTripleBuffer()
         CHECK (highest == kLast);          // the last publish is always observable
         CHECK (acquired >= 1);
         CHECK (acquired <= iterations);    // the reader never spun waiting for a value
+    }
+}
+
+//==============================================================================
+// dsp/ - the shared primitives the effects modules are built from.
+//==============================================================================
+
+static void testOnePoleSmoother()
+{
+    using namespace spatcore::dsp;
+
+    const double sr = 48000.0;
+
+    // The coefficient is the law the reverb pre/post processors already use.
+    {
+        OnePoleSmoother s;
+        s.setTimeConstant (sr, 0.010f);
+        const float expected = 1.0f - std::exp (-1.0f / (48000.0f * 0.010f));
+        CHECK (std::fabs (s.getCoefficient() - expected) < 1.0e-9f);
+    }
+
+    // tau is a TIME CONSTANT: 63 % of the way after tau, monotonic throughout,
+    // and bit-exactly arrived well before 10 tau.
+    {
+        OnePoleSmoother s;
+        s.setTimeConstant (sr, 0.010f);
+        s.snap (0.0f);
+        s.setTarget (1.0f);
+
+        float previous = 0.0f;
+        bool monotonic = true;
+        for (int i = 0; i < 480; ++i)                 // one tau
+        {
+            const float v = s.next();
+            if (v < previous)
+                monotonic = false;
+            previous = v;
+        }
+        CHECK (monotonic);
+        CHECK (std::fabs (previous - 0.6321f) < 1.0e-3f);
+        CHECK (! s.isSettled());
+
+        for (int i = 0; i < 4800 - 480; ++i)
+            s.next();
+        CHECK (s.isSettled());
+        CHECK (s.getCurrent() == 1.0f);               // bit-exact, not "close"
+    }
+
+    // tau = 0 means no smoothing at all.
+    {
+        OnePoleSmoother s;
+        s.setTimeConstant (sr, 0.0f);
+        s.snap (0.0f);
+        s.setTarget (0.25f);
+        CHECK (s.next() == 0.25f);
+        CHECK (s.isSettled());
+    }
+
+    // snap() arrives without gliding.
+    {
+        OnePoleSmoother s;
+        s.setTimeConstant (sr, 0.010f);
+        s.setTarget (3.0f);
+        s.snap (3.0f);
+        CHECK (s.isSettled());
+        CHECK (s.next() == 3.0f);
+    }
+
+    // The stall guard. Without it this glide parks a few hertz short of 96000
+    // FOREVER: at that magnitude coef*(target-current) falls under an ULP long
+    // before the two are equal.
+    {
+        OnePoleSmoother s;
+        s.setTimeConstant (sr, 0.010f);
+        s.setSnapEpsilon (1.0e-4f);
+        s.snap (12000.0f);
+        s.setTarget (96000.0f);
+
+        for (int i = 0; i < 480 * 20; ++i)            // 20 tau is ample
+            s.next();
+
+        CHECK (s.isSettled());
+        CHECK (s.getCurrent() == 96000.0f);
+    }
+}
+
+static void testFastDecibels()
+{
+    using namespace spatcore::dsp;
+    namespace fd = spatcore::dsp::FastDecibels;
+
+    // --- the values that must be EXACT, not merely accurate -----------------
+    CHECK (fd::dbToGain (0.0f) == 1.0f);
+    CHECK (fd::dbToGain (-0.0f) == 1.0f);
+    CHECK (fd::gainToDb (1.0f) == 0.0f);
+
+    for (int k = -100; k <= 100; ++k)
+    {
+        CHECK (fd::exp2 ((float) k) == std::ldexp (1.0f, k));
+        CHECK (fd::log2 (std::ldexp (1.0f, k)) == (float) k);
+    }
+
+    // --- accuracy across the range the modules actually use -----------------
+    {
+        double worstGainRel = 0.0, worstDb = 0.0, worstRoundTrip = 0.0;
+
+        for (int step = -12000; step <= 2400; ++step)          // -120 .. +24 dB
+        {
+            const float dB = (float) step * 0.01f;
+            const double reference = std::pow (10.0, (double) dB / 20.0);
+
+            const float gain = fd::dbToGain (dB);
+            const double rel = std::fabs ((double) gain - reference) / reference;
+            if (rel > worstGainRel)
+                worstGainRel = rel;
+
+            const double back = (double) fd::gainToDb ((float) reference);
+            if (std::fabs (back - (double) dB) > worstDb)
+                worstDb = std::fabs (back - (double) dB);
+
+            const double round = std::fabs ((double) fd::gainToDb (gain) - (double) dB);
+            if (round > worstRoundTrip)
+                worstRoundTrip = round;
+        }
+
+        CHECK (worstGainRel <= 1.0e-6);
+        CHECK (worstDb <= 1.0e-4);
+        CHECK (worstRoundTrip <= 1.0e-4);
+    }
+
+    // --- saturation instead of misbehaviour ---------------------------------
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    CHECK (fd::gainToDb (0.0f) == fd::kMinDb);
+    CHECK (fd::gainToDb (-1.0f) == fd::kMinDb);
+    CHECK (fd::gainToDb (nan) == fd::kMinDb);
+    CHECK (fd::dbToGain (-900.0f) == 0.0f);
+    CHECK (fd::exp2 (nan) == 0.0f);
+    CHECK (fd::exp2 (200.0f) == fd::exp2 (127.0f));
+    CHECK (fd::log2 (0.0f) == -126.0f);
+    CHECK (fd::log2 (-2.0f) == -126.0f);
+    CHECK (fd::log2 (nan) == -126.0f);
+
+    // A gain of 0.5 is -6.0206 dB, and -6 dB is 0.50119 - the two numbers the
+    // tremolo test leans on.
+    CHECK (std::fabs (fd::gainToDb (0.5f) + 6.0205999f) < 1.0e-4f);
+    CHECK (std::fabs (fd::dbToGain (-6.0f) - 0.5011872f) < 1.0e-6f);
+    CHECK (std::fabs (fd::dbToGain (-12.0f) - 0.2511886f) < 1.0e-6f);
+}
+
+static void testLfoPhasor()
+{
+    using namespace spatcore::dsp;
+
+    // --- the ramp ------------------------------------------------------------
+    {
+        LfoPhasor p;
+        p.prepare (1000.0);
+        p.setRateHz (125.0f);            // exactly 8 samples per cycle
+
+        const float expected[8] = { 0.0f, 0.125f, 0.25f, 0.375f, 0.5f, 0.625f, 0.75f, 0.875f };
+        for (int cycle = 0; cycle < 3; ++cycle)
+            for (int i = 0; i < 8; ++i)
+                CHECK (p.nextPhase() == expected[i]);
+
+        // Rate 0 parks the phase; a rate above the sample rate is clamped
+        // rather than aliasing the wrap.
+        p.reset();
+        p.setRateHz (0.0f);
+        CHECK (p.nextPhase() == 0.0f);
+        CHECK (p.nextPhase() == 0.0f);
+        p.setRateHz (100000.0f);
+        p.nextPhase();
+        CHECK (p.getPhase() >= 0.0f && p.getPhase() < 1.0f);
+    }
+
+    // --- the shapes, at the phases the tremolo blend depends on -------------
+    {
+        CHECK (LfoPhasor::shapeValue (LFOWaveforms::Sine, 0.0f) == -1.0f);
+        CHECK (std::fabs (LfoPhasor::shapeValue (LFOWaveforms::Sine, 0.5f) - 1.0f) < 1.0e-6f);
+        CHECK (std::fabs (LfoPhasor::shapeValue (LFOWaveforms::Sine, 0.25f)) < 1.0e-6f);
+
+        CHECK (LfoPhasor::shapeValue (LFOWaveforms::Triangle, 0.0f) == -1.0f);
+        CHECK (LfoPhasor::shapeValue (LFOWaveforms::Triangle, 0.25f) == 0.0f);
+        CHECK (LfoPhasor::shapeValue (LFOWaveforms::Triangle, 0.5f) == 1.0f);
+        CHECK (LfoPhasor::shapeValue (LFOWaveforms::Triangle, 0.125f) == -0.5f);
+
+        CHECK (LfoPhasor::shapeValue (LFOWaveforms::Sawtooth, 0.0f) == -1.0f);
+        CHECK (LfoPhasor::shapeValue (LFOWaveforms::Square, 0.25f) == -1.0f);
+        CHECK (LfoPhasor::shapeValue (LFOWaveforms::Square, 0.75f) == 1.0f);
+        CHECK (LfoPhasor::shapeValue (LFOWaveforms::Off, 0.3f) == 0.0f);
+    }
+
+    // --- Random is deterministic per key, and piecewise linear --------------
+    {
+        LfoPhasor a, b, c;
+        a.prepare (48000.0);  a.setNoiseKey (12345);  a.reset();  a.setRateHz (50.0f);
+        b.prepare (48000.0);  b.setNoiseKey (12345);  b.reset();  b.setRateHz (50.0f);
+        c.prepare (48000.0);  c.setNoiseKey (999);    c.reset();  c.setRateHz (50.0f);
+
+        bool sameKeyIdentical = true, differentKeyDiffers = false, inRange = true;
+        for (int i = 0; i < 1000; ++i)
+        {
+            const float va = a.nextValue (LFOWaveforms::Random);
+            const float vb = b.nextValue (LFOWaveforms::Random);
+            const float vc = c.nextValue (LFOWaveforms::Random);
+
+            if (! bitEqualFloat (va, vb))
+                sameKeyIdentical = false;
+            if (! bitEqualFloat (va, vc))
+                differentKeyDiffers = true;
+            if (va < -1.0f || va > 1.0f)
+                inRange = false;
+        }
+        CHECK (sameKeyIdentical);
+        CHECK (differentKeyDiffers);
+        CHECK (inRange);
+    }
+
+    // Inside one period the Random shape is a straight line: the second
+    // difference is zero except where a wrap picks a new target.
+    {
+        LfoPhasor p;
+        p.prepare (48000.0);
+        p.setNoiseKey (7);
+        p.reset();
+        p.setRateHz (48.0f);                  // 1000 samples per period
+
+        float v0 = p.nextValue (LFOWaveforms::Random);
+        float v1 = p.nextValue (LFOWaveforms::Random);
+        bool linear = true;
+        for (int i = 2; i < 900; ++i)         // stay well inside the first period
+        {
+            const float v2 = p.nextValue (LFOWaveforms::Random);
+            if (std::fabs ((v2 - v1) - (v1 - v0)) > 1.0e-6f)
+                linear = false;
+            v0 = v1;
+            v1 = v2;
+        }
+        CHECK (linear);
     }
 }
 
@@ -3786,6 +4034,9 @@ int main()
         testDelayTargetSmootherDeterminism();
         testRtSnapshot();
         testRtTripleBuffer();
+        testOnePoleSmoother();
+        testFastDecibels();
+        testLfoPhasor();
         testOscRoundtrip();
         testRtThreadPriority();
         testGpuHostWorkPoolDeterminism();
