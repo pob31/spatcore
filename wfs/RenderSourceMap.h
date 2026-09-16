@@ -22,8 +22,11 @@ namespace spatcore::wfs {
 
         s in [0, numInputChannels)   : channel-primary source of input s
                                        (mono: the channel; stereo: slice 0)
-        s in [numInputChannels, ...) : derived slices 1..5 of stereo ordinal k,
+        s in [numInputChannels, F)  : derived slices 1..5 of stereo ordinal k,
                                        at numInputChannels + 5*k + (slice - 1)
+        s in [F, count)             : effect return fx, where F is
+                                       firstEffectSlot = numInputChannels
+                                       + 5 * numStereo
 
     A stereo channel always claims all 6 slots regardless of how many slices
     the decomposition backend actually drives; unused slots are
@@ -31,10 +34,27 @@ namespace spatcore::wfs {
     channel-type vector — never on the active slice count or width — so slots
     never move under a live parameter edit. Rebuilding the map is a
     config-change operation (it resizes the renderer), never 50 Hz work.
+
+    Effect returns are appended AFTER the derived region, which is what keeps
+    that promise when a show gains or loses an effects channel: no input or
+    derived slot ever moves, so a matrix row an engine is already using cannot
+    change meaning underneath it.
 */
+/** What a render source IS. An effect return is spatialised exactly like an
+    input - it has a position, it feeds the reverbs, it is rendered by all four
+    renderers - but it is fed by an effects chain rather than by a hardware
+    input, and several consumers need to tell the two apart: a return has no
+    owning input channel, no solo bit in the per-input mask, and no floor
+    reflections. Before this existed those consumers keyed on
+    owningInputChannel < 0, which is true of an unused slot as well, so a
+    return would have rendered at full level at the world origin rather than
+    failing in any visible way. */
+enum class SourceKind : uint8_t { Input = 0, EffectReturn = 1 };
+
 struct RenderSourceDesc
 {
-    /** Input channel that owns this source, or -1 for an unused slot. */
+    /** Input channel that owns this source, or -1 for an unused slot and for
+        every effect return. */
     int16_t owningInputChannel = -1;
 
     /** 0 for a mono channel or a stereo channel's primary slot; 1..5 for the
@@ -48,6 +68,12 @@ struct RenderSourceDesc
         Inactive sources still occupy their matrix row; the audio stage clears
         their buffer every block. */
     bool active = true;
+
+    /** Input or effect return. See SourceKind. */
+    SourceKind kind = SourceKind::Input;
+
+    /** Effects channel that owns this source, or -1 for an input source. */
+    int16_t owningEffectChannel = -1;
 
     /** Slice position offset from the owning channel's anchor, in metres.
         Always zero for mono sources. Refreshed at control rate from the
@@ -69,15 +95,42 @@ struct RenderSourceMap
     static constexpr int kDerivedPerStereo  = 5;
     static constexpr int kSlicesPerStereo   = kDerivedPerStereo + 1;   // 6
     static constexpr int kMaxStereoChannels = 8;
-    static constexpr int kMaxRenderSources  =
+
+    /** Every render source an INPUT can produce: one per channel plus five
+        derived slices per stereo pair. */
+    static constexpr int kMaxInputRenderSources =
         kMaxInputChannels + kMaxStereoChannels * kDerivedPerStereo;    // 104
+
+    /** Capability bound on effects channels. Tied by static_assert to
+        spatcore::effects::kMaxEffectChannels in the compile-check TU: wfs/ may
+        not include effects/, so nothing else can tie them, and an untied pair
+        would let one side grow and overrun `desc` with no compile error. */
+    static constexpr int kMaxEffectChannels = 32;
+
+    /** How many slots `desc` actually holds. */
+    static constexpr int kMaxRenderSourceSlots =
+        kMaxInputRenderSources + kMaxEffectChannels;                   // 136
+
+    /** The app mirrors this in WFSParameterDefaults and asserts equality, so it
+        still means "input render sources" until the app learns about effect
+        returns. Phase 4 of the effects work raises it to kMaxRenderSourceSlots
+        in the same commit as the app-side mirror; until then the two must not
+        disagree, and there is no ordering of two separate commits that would
+        keep the app building if this moved first. */
+    static constexpr int kMaxRenderSources = kMaxInputRenderSources;   // 104
 
     /** Channel type values, matching the app's inputChannelType parameter. */
     enum ChannelType : uint8_t { Mono = 0, Stereo = 1 };
 
     int numInputChannels = 0;
+    int numEffectChannels = 0;
     int count = 0;                                    // total render sources
-    std::array<RenderSourceDesc, kMaxRenderSources> desc {};
+
+    /** First effect-return slot, or -1 when there are no effects channels
+        (the same convention as firstDerivedSlot). */
+    int firstEffectSlot = -1;
+
+    std::array<RenderSourceDesc, kMaxRenderSourceSlots> desc {};
 
     /** Bar-position table: derived base slot per input channel, or -1 for a
         channel with no derived slots (mono). */
@@ -93,18 +146,25 @@ struct RenderSourceMap
           - stereo channel i maps to source i (slice 0) plus 5 contiguous
             derived slots; derived slots are ordered by stereo ordinal, so the
             layout is independent of anything but the type vector;
-          - count == numInputChannels + 5 * (number of stereo channels). */
+          - effect return fx maps to the slot at firstEffectSlot + fx, after
+            every input and derived slot, so adding or removing an effects
+            channel moves no existing source;
+          - count == numInputChannels + 5 * (number of stereo channels)
+            + numEffectChannels. */
     static bool build (const uint8_t* channelTypes, int numInputChannels,
-                       RenderSourceMap& out) noexcept
+                       int numEffectChannels, RenderSourceMap& out) noexcept
     {
         out = RenderSourceMap {};
 
         if (channelTypes == nullptr
             || numInputChannels < 0
-            || numInputChannels > kMaxInputChannels)
+            || numInputChannels > kMaxInputChannels
+            || numEffectChannels < 0
+            || numEffectChannels > kMaxEffectChannels)
             return false;
 
         out.numInputChannels = numInputChannels;
+        out.numEffectChannels = numEffectChannels;
         out.firstDerivedSlot.fill (-1);
 
         // Channel-primary slots.
@@ -142,15 +202,39 @@ struct RenderSourceMap
             }
         }
 
+        // Effect returns, after everything an input can claim.
+        out.firstEffectSlot = (numEffectChannels > 0) ? next : -1;
+
+        for (int fx = 0; fx < numEffectChannels; ++fx)
+        {
+            auto& d = out.desc[static_cast<size_t> (next++)];
+            d.owningInputChannel = -1;
+            d.owningEffectChannel = static_cast<int16_t> (fx);
+            d.sliceIndex = 0;
+            d.isStereoSlice = false;
+            d.kind = SourceKind::EffectReturn;
+            d.active = true;
+            d.gainLinear = 1.0f;
+        }
+
         out.count = next;
         return true;
     }
 
-    /** The identity map: every channel mono. Never fails for a valid count. */
+    /** The input-only map: what every caller wanted before effects channels
+        existed, and still what the app asks for until it learns about them. */
+    static bool build (const uint8_t* channelTypes, int numInputChannels,
+                       RenderSourceMap& out) noexcept
+    {
+        return build (channelTypes, numInputChannels, 0, out);
+    }
+
+    /** The identity map: every channel mono, no effects. Never fails for a
+        valid count. */
     static bool buildIdentity (int numInputChannels, RenderSourceMap& out) noexcept
     {
         std::array<uint8_t, kMaxInputChannels> mono {};
-        return build (mono.data(), numInputChannels, out);
+        return build (mono.data(), numInputChannels, 0, out);
     }
 };
 
