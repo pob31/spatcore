@@ -49,6 +49,11 @@
                                  stride trap, per-(source, node) delay, and a
                                  node with no active source is silence rather
                                  than stale data
+     12. dsp/AcousticSendMatrix  the promoted send matrix: spatcore::reverb::
+                                 ReverbSendMatrix is the SAME type (std::is_same),
+                                 so the three tests of item 11 are its tests and
+                                 run unmodified; a dsp-qualified instance behaves
+                                 identically
 */
 
 // OSCParser.h / OSCSerializer.h use juce::OSC* types but (verbatim-moved,
@@ -70,6 +75,7 @@
 #include "spatcore/dsp/AcousticTap.h"
 #include "spatcore/reverb/ReverbReturnProcessor.h"
 #include "spatcore/reverb/ReverbSendMatrix.h"
+#include "spatcore/dsp/AcousticSendMatrix.h"
 #include "spatcore/dsp/BiquadResponse.h"
 #include "spatcore/dsp/OutputEQBiquadFilter.h"
 #include "spatcore/dsp/ReverbBiquadFilter.h"
@@ -100,6 +106,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <type_traits>
 #include <vector>
 
 static int failures = 0;
@@ -3482,6 +3489,46 @@ static void testReverbSendMatrixSilentNodeIsSilent()
         CHECK (stale[(size_t) i] == 0.0f);
 }
 
+//==============================================================================
+// dsp/AcousticSendMatrix - the send matrix promoted out of reverb/ so the
+// effects channels can reuse it. reverb/ReverbSendMatrix.h is an alias header:
+// the type is the same, so the three tests above ARE its tests; this one pins
+// the identity and drives it under its new name once.
+//==============================================================================
+
+static void testAcousticSendMatrixAlias()
+{
+    static_assert (std::is_same_v<spatcore::reverb::ReverbSendMatrix,
+                                  spatcore::dsp::AcousticSendMatrix>,
+                   "reverb/ReverbSendMatrix.h must alias the promoted type, never wrap it");
+
+    const double sr = 48000.0;
+    const int numSamples = 64;
+    const int stride = 4;
+
+    spatcore::dsp::AcousticSendMatrix m;
+    m.prepare (sr, 2, 1);
+    CHECK (m.isPrepared());
+
+    std::vector<float> levels ((size_t) (2 * stride), 0.0f);
+    levels[(size_t) (0 * stride + 0)] = 0.5f;        // source 0 -> node 0; source 1 silent
+
+    juce::AudioBuffer<float> in (2, numSamples);
+    for (int i = 0; i < numSamples; ++i)
+    {
+        in.setSample (0, i, 0.37f * std::sin (0.07f * (float) i));
+        in.setSample (1, i, 0.9f);
+    }
+
+    std::vector<float> feed ((size_t) numSamples, -1.0f);
+    m.writeInputs (in, numSamples);
+    m.computeNodeFeed (feed.data(), numSamples, 0, levels.data(), nullptr, nullptr, stride);
+    m.advance (numSamples);
+
+    for (int i = 0; i < numSamples; ++i)
+        CHECK (bitEqualFloat (feed[(size_t) i], in.getSample (0, i) * 0.5f));
+}
+
 static void testStereoPassThroughIdentity()
 {
     using namespace spatcore::dsp;
@@ -3598,6 +3645,7 @@ int main()
         testReverbSendMatrixStride();
         testReverbSendMatrixPerNodeDelay();
         testReverbSendMatrixSilentNodeIsSilent();
+        testAcousticSendMatrixAlias();
         testLockFreeRingBuffer();
         testDelayTargetSmootherDeterminism();
         testRtSnapshot();

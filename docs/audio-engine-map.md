@@ -186,7 +186,7 @@ flowchart TD
     GOB --> WOUT
 
     %% ---- asynchronous reverb branch ----
-    SHW -. lock-free rings .-> RFT["ReverbFeedThread<br/>1 block behind :4273<br/>Σ input·sendMatrix, downsample"]
+    SHW -. lock-free rings .-> RFT["ReverbFeedThread<br/>1 block behind :4273<br/>Σ input·sendMatrix (`dsp/AcousticSendMatrix`), downsample"]
     RFT -->|pushNodeInput| RENG["ReverbEngine thread<br/>fat internal block 256..1024<br/>SDN / FDN / IR"]
     RENG -.->|optional| GPUMP["GPU reverb pump<br/>GpuAsyncPipelineT (~20 ms cushion)"]
     GPUMP -.-> RENG
@@ -369,8 +369,9 @@ The CPU DSP path is **hand-rolled per-sample**, not `juce::dsp`.
   fixedAttenLinear·peakGR·slowGR`, `LiveSourceTamerEngine.h:174-178`) — **not** a sample-accurate
   limiter. **There is no master brickwall limiter or soft-clip**; the output stage is only
   smoothed per-output attenuation + master gain before the HW patch (`MainComponent.cpp:4933-4957`). **[V]**
-- **Denormals.** **No protection at all** — zero `ScopedNoDenormals`, no FTZ/DAZ, no
-  `_controlfp`, no DC/noise injection (independently re-grepped = 0). `NumericGuards.h` only
+- **Denormals.** Almost no protection: the only `ScopedNoDenormals` in the tree guards the
+  binaural render block (`binaural/BinauralEngine.h:108`); the WFS, reverb and feed threads have
+  none, and there is no FTZ/DAZ, no `_controlfp` and no DC/noise injection. `NumericGuards.h` only
   provides a NaN/Inf-tolerant `safeClamp` (`:22-27`). A real robustness gap given the many
   recursive biquads and feedback reverb. **[V]**
 - **SIMD.** Essentially none in the hot path — delay/interp/biquad loops are scalar and rely on

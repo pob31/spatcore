@@ -43,6 +43,7 @@
 #include "rt/SharedInputRingBuffer.h"
 
 // dsp/ - smoothers, filters, detectors
+#include "dsp/AcousticSendMatrix.h"
 #include "dsp/BiquadResponse.h"
 #include "dsp/DelayTargetSmoother.h"
 #include "dsp/FrDiffusionModel.h"

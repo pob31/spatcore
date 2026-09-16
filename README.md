@@ -10,7 +10,7 @@ submodule by multiple apps (WFS-DIY, and the planned XOA and Tight-WFS).
 | Directory | Contents |
 |---|---|
 | `rt/` | Realtime primitives: lock-free rings, fork-join pool, RT thread priority (MMCSS/mach/SCHED_FIFO), `RtSnapshot<T>` message→RT hand-off |
-| `dsp/` | Biquads + their shared magnitude-response math, multi-channel EQ bank and the 6-band per-output EQ processor, smoothers, speed limiter, tracking filter, FR diffusion model, LFO waveforms, level detectors |
+| `dsp/` | Biquads + their shared magnitude-response math, multi-channel EQ bank and the 6-band per-output EQ processor, smoothers, speed limiter, tracking filter, FR diffusion model, LFO waveforms, level detectors, the acoustic send matrix (per source→node delay + air absorption + level; promoted from `reverb/`, which keeps an alias) |
 | `wfs/` | WFS renderers: CPU gather/scatter processors + the GPU-pipeline renderer wrappers |
 | `reverb/` | Reverb engine + FDN / SDN / IR algorithms (CPU and GPU variants), pre/post processing, feed thread |
 | `gpu/` | Multi-vendor GPU compute: CUDA / HIP / Metal backends for 5 kernel families, runtime kernel compilation (NVRTC/hipRTC), async pipeline, device manager, vendor-plugin factory, JUCE-free host work pool |
