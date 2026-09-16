@@ -79,6 +79,11 @@
                                  keyed dither) and the EQ (bit-identical to the
                                  output EQ bank it wraps); plus every module
                                  bit-transparent when bypassed and at identity
+     17. effects/EffectChain     eleven slots in a user-chosen order: a reorder
+                                 out and back returns to the reference bit for
+                                 bit (module state survives it), latency is the
+                                 sum over live slots, and chain bypass and mute
+                                 land on exactly dry and exactly silence
 */
 
 // OSCParser.h / OSCSerializer.h use juce::OSC* types but (verbatim-moved,
@@ -111,6 +116,7 @@
 #include "spatcore/effects/modules/TremoloModule.h"
 #include "spatcore/effects/modules/BitcrusherModule.h"
 #include "spatcore/effects/modules/EffectEQModule.h"
+#include "spatcore/effects/EffectChain.h"
 #include "spatcore/dsp/AcousticTap.h"
 #include "spatcore/reverb/ReverbReturnProcessor.h"
 #include "spatcore/reverb/ReverbSendMatrix.h"
@@ -5107,6 +5113,354 @@ static void testEffectModulesIdentityWhenActive()
     }
 }
 
+//==============================================================================
+// effects/EffectChain
+//==============================================================================
+
+namespace chain_test
+{
+    using namespace spatcore::effects;
+
+    inline int slotIndexFor (ModuleId type, int instance) noexcept
+    {
+        for (int i = 0; i < kNumModuleSlots; ++i)
+            if (kSlots[i].type == type && (int) kSlots[i].instance == instance)
+                return i;
+        return 0;
+    }
+
+    inline bool bypassFor (const EffectChannelParams& p, ModuleId type, int instance) noexcept
+    {
+        switch (type)
+        {
+            case ModuleId::Dist:   return p.dist.bypass != 0;
+            case ModuleId::EQ:     return p.eq[instance & 1].bypass != 0;
+            case ModuleId::Dyn:    return p.dyn[instance & 1].bypass != 0;
+            case ModuleId::Mod:    return p.mod.bypass != 0;
+            case ModuleId::Phaser: return p.phaser.bypass != 0;
+            case ModuleId::Trem:   return p.trem.bypass != 0;
+            case ModuleId::Reverb: return p.reverb.bypass != 0;
+            case ModuleId::Delay:  return p.delay.bypass != 0;
+            case ModuleId::Crush:  return p.crush.bypass != 0;
+            case ModuleId::Count:
+            default:               return true;
+        }
+    }
+
+    // The factory is a plain function pointer, so the per-slot settings the
+    // tests want live here rather than in a capture.
+    inline float slotGain[kNumModuleSlots] =
+        { 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1 };
+    inline int slotLatency[kNumModuleSlots] =
+        { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    inline int slotResets[kNumModuleSlots] =
+        { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+
+    inline void resetSlotSettings() noexcept
+    {
+        for (int i = 0; i < kNumModuleSlots; ++i)
+        {
+            slotGain[i] = 1.0f;
+            slotLatency[i] = 0;
+            slotResets[i] = 0;
+        }
+    }
+
+    class TypedModule : public IEffectModule
+    {
+    public:
+        TypedModule (ModuleId t, int inst) : assigned (t), slot (slotIndexFor (t, inst)) {}
+
+        ModuleId type() const noexcept override { return assigned; }
+        void prepare (const ChainConfig&) override {}
+        void reset() noexcept override { ++slotResets[slot]; }
+
+        ParamApplyInfo applyParams (const EffectChannelParams& p, int instance) noexcept override
+        {
+            return { bypassFor (p, assigned, instance), false };
+        }
+
+        void process (float* inout, int n) noexcept override
+        {
+            const float g = slotGain[slot];
+            for (int i = 0; i < n; ++i)
+                inout[i] *= g;
+        }
+
+        int getLatencySamples() const noexcept override { return slotLatency[slot]; }
+
+    private:
+        ModuleId assigned;
+        int slot;
+    };
+
+    inline std::unique_ptr<IEffectModule> typedFactory (ModuleId type, int instance, const ChainConfig&)
+    {
+        return std::make_unique<TypedModule> (type, instance);
+    }
+
+    /** Bumps the revision so the chain actually re-reads the parameters. */
+    inline void publish (EffectChannelParams& p) noexcept { ++p.revision; }
+
+    inline ChainConfig config (int maxBlock = 64)
+    {
+        ChainConfig cfg;
+        cfg.sampleRate = 48000.0;
+        cfg.maxBlock = maxBlock;
+        cfg.noiseKey = 7;
+        return cfg;
+    }
+}
+
+static void testChainReorderDeterminism()
+{
+    using namespace spatcore::effects;
+
+    // Two chains of REAL modules, one kept on the default order throughout and
+    // one taken to a different order and back. Tremolo before crusher is not
+    // the same sound as crusher before tremolo, so the middle section must
+    // differ - and once the order is restored and the envelope has settled, the
+    // two must agree bit for bit again. That is the property that says a
+    // reorder moves audio and not module state.
+    const int blockSize = 64;
+
+    EffectChannelParams p;
+    p.trem.bypass = 0;
+    p.trem.rateHz = 3.0f;
+    p.trem.depthDb = 9.0f;
+    p.trem.mix = 100.0f;
+    p.crush.bypass = 0;
+    p.crush.bits = 4.0f;
+    p.crush.rateHz = 4800.0f;
+    p.crush.mix = 100.0f;
+
+    ChainOrder swapped = kDefaultOrder;
+    const int tremSlot = chain_test::slotIndexFor (ModuleId::Trem, 0);
+    const int crushSlot = chain_test::slotIndexFor (ModuleId::Crush, 0);
+    std::swap (swapped[(size_t) tremSlot], swapped[(size_t) crushSlot]);
+    CHECK (isValidChainOrder (swapped));
+
+    EffectChain reference, tested;
+    reference.prepare (chain_test::config (blockSize));
+    tested.prepare (chain_test::config (blockSize));
+
+    EffectChannelParams refParams = p, testParams = p;
+
+    std::vector<std::vector<float>> referenceOut, testedOut;
+    referenceOut.reserve (400);
+    testedOut.reserve (400);
+
+    for (int block = 0; block < 400; ++block)
+    {
+        if (block == 100)
+        {
+            testParams.order = swapped;
+            chain_test::publish (testParams);
+        }
+        else if (block == 200)
+        {
+            testParams.order = kDefaultOrder;
+            chain_test::publish (testParams);
+        }
+
+        std::vector<float> a ((size_t) blockSize), b ((size_t) blockSize);
+        for (int i = 0; i < blockSize; ++i)
+        {
+            const float x = 0.6f * std::sin (0.031f * (float) (block * blockSize + i))
+                          + 0.2f * FrDiffusion::hashNoiseBipolar ((std::uint32_t) (block * blockSize + i), 91u);
+            a[(size_t) i] = x;
+            b[(size_t) i] = x;
+        }
+
+        reference.process (a.data(), blockSize, refParams);
+        tested.process (b.data(), blockSize, testParams);
+
+        referenceOut.push_back (a);
+        testedOut.push_back (b);
+    }
+
+    // The other order really is a different sound.
+    int differingBlocks = 0;
+    for (int block = 150; block < 200; ++block)
+        if (! eqtests::bitEqualBlock (referenceOut[(size_t) block], testedOut[(size_t) block]))
+            ++differingBlocks;
+    CHECK (differingBlocks > 40);
+
+    // ...and coming back is exact.
+    bool converged = true;
+    for (int block = 300; block < 400; ++block)
+        if (! eqtests::bitEqualBlock (referenceOut[(size_t) block], testedOut[(size_t) block]))
+            converged = false;
+    CHECK (converged);
+
+    CHECK (! tested.isReorderPending());
+    CHECK (tested.getCurrentOrder() == kDefaultOrder);
+    CHECK (tested.nanTrips.load() == 0);
+
+    // An order that is not a permutation is ignored, not obeyed.
+    EffectChannelParams broken = testParams;
+    broken.order[3] = broken.order[4];
+    chain_test::publish (broken);
+    std::vector<float> buf ((size_t) blockSize, 0.25f);
+    tested.process (buf.data(), blockSize, broken);
+    CHECK (tested.getCurrentOrder() == kDefaultOrder);
+    CHECK (! tested.isReorderPending());
+}
+
+static void testChainLatencySum()
+{
+    using namespace spatcore::effects;
+    chain_test::resetSlotSettings();
+
+    for (int i = 0; i < kNumModuleSlots; ++i)
+        chain_test::slotLatency[i] = 10 * (i + 1);
+
+    EffectChain chain;
+    chain.prepare (chain_test::config(), &chain_test::typedFactory);
+
+    EffectChannelParams p;
+    std::vector<float> buf (64, 0.0f);
+
+    // Everything bypassed: a chain that is doing nothing reports no latency,
+    // whatever the modules would cost if they were switched on.
+    chain.process (buf.data(), 64, p);
+    CHECK (chain.getLatencySamples() == 0);
+
+    // Only live slots count, and they add up.
+    p.dist.bypass = 0;                                    // slot 0 -> 10
+    p.eq[1].bypass = 0;                                   // slot 2 -> 30
+    chain_test::publish (p);
+    chain.process (buf.data(), 64, p);
+    CHECK (chain.getLatencySamples() == 40);
+
+    // A bypassed chain reports nothing at all.
+    p.chainBypass = 1;
+    chain_test::publish (p);
+    chain.process (buf.data(), 64, p);
+    CHECK (chain.getLatencySamples() == 0);
+
+    chain_test::resetSlotSettings();
+}
+
+static void testChainBypassAndMute()
+{
+    using namespace spatcore::effects;
+    chain_test::resetSlotSettings();
+
+    // Two live slots at half gain each: a chain output of 0.25 for a DC of 1.
+    chain_test::slotGain[chain_test::slotIndexFor (ModuleId::Dist, 0)] = 0.5f;
+    chain_test::slotGain[chain_test::slotIndexFor (ModuleId::Trem, 0)] = 0.5f;
+
+    EffectChain chain;
+    chain.prepare (chain_test::config(), &chain_test::typedFactory);
+
+    EffectChannelParams p;
+    p.dist.bypass = 0;
+    p.trem.bypass = 0;
+
+    auto run = [&chain, &p] (int blocks) -> float
+    {
+        std::vector<float> buf (64);
+        float last = 0.0f;
+        for (int b = 0; b < blocks; ++b)
+        {
+            std::fill (buf.begin(), buf.end(), 1.0f);
+            chain.process (buf.data(), 64, p);
+            last = buf[63];
+        }
+        return last;
+    };
+
+    run (60);                                             // let the slot fades settle
+    CHECK (run (1) == 0.25f);
+
+    // Chain bypass reaches EXACTLY the dry signal, monotonically, and resets the
+    // slots once it is there.
+    p.chainBypass = 1;
+    chain_test::publish (p);
+
+    float previous = 0.25f;
+    bool monotonic = true;
+    std::vector<float> buf (64);
+    for (int b = 0; b < 40; ++b)
+    {
+        std::fill (buf.begin(), buf.end(), 1.0f);
+        chain.process (buf.data(), 64, p);
+        for (int i = 0; i < 64; ++i)
+        {
+            if (buf[(size_t) i] < previous - 1.0e-7f)
+                monotonic = false;
+            previous = buf[(size_t) i];
+        }
+    }
+    CHECK (monotonic);
+    CHECK (run (1) == 1.0f);
+
+    const int distSlot = chain_test::slotIndexFor (ModuleId::Dist, 0);
+    const int resetsWhileBypassed = chain_test::slotResets[distSlot];
+    run (10);
+    CHECK (chain_test::slotResets[distSlot] == resetsWhileBypassed);   // reset once, not every block
+
+    // Back again.
+    p.chainBypass = 0;
+    chain_test::publish (p);
+    run (60);
+    CHECK (run (1) == 0.25f);
+
+    // Mute reaches exactly silence, and unmuting comes straight back.
+    p.mute = 1;
+    chain_test::publish (p);
+    run (60);
+    CHECK (run (1) == 0.0f);
+
+    p.mute = 0;
+    chain_test::publish (p);
+    run (60);
+    CHECK (run (1) == 0.25f);
+
+    // Mute and chain bypass compose: dry, then silenced.
+    p.mute = 1;
+    p.chainBypass = 1;
+    chain_test::publish (p);
+    run (60);
+    CHECK (run (1) == 0.0f);
+
+    chain_test::resetSlotSettings();
+}
+
+static void testChainNeutralAndGuarded()
+{
+    using namespace spatcore::effects;
+
+    // A chain of real modules at defaults is bit-transparent - the state a
+    // freshly created effects channel is in.
+    EffectChain chain;
+    chain.prepare (chain_test::config (256));
+
+    const EffectChannelParams defaults;
+
+    for (int block = 0; block < 8; ++block)
+    {
+        std::vector<float> buf = (block == 0) ? eqtests::makeAwkwardSignal (256)
+                                              : module_test::awkwardBlock (256, 40 + block);
+        const std::vector<float> reference = buf;
+        chain.process (buf.data(), 256, defaults);
+        CHECK (eqtests::bitEqualBlock (buf, reference));
+    }
+
+    CHECK (chain.getLatencySamples() == 0);
+    CHECK (chain.nanTrips.load() == 0);
+
+    // A non-finite sample arriving from outside is caught by the chain's own
+    // guard even with every slot bypassed, so nothing reaches the return ring.
+    std::vector<float> poisoned (256, 0.5f);
+    poisoned[255] = std::numeric_limits<float>::quiet_NaN();
+    chain.process (poisoned.data(), 256, defaults);
+    for (int i = 0; i < 256; ++i)
+        CHECK (poisoned[(size_t) i] == 0.0f);
+    CHECK (chain.nanTrips.load() == 1);
+}
+
 static void testStereoPassThroughIdentity()
 {
     using namespace spatcore::dsp;
@@ -5247,6 +5601,10 @@ int main()
         testResetOnFullBypass();
         testEffectModulesNeutralAtDefaults();
         testEffectModulesIdentityWhenActive();
+        testChainReorderDeterminism();
+        testChainLatencySum();
+        testChainBypassAndMute();
+        testChainNeutralAndGuarded();
         testOscRoundtrip();
         testRtThreadPriority();
         testGpuHostWorkPoolDeterminism();
