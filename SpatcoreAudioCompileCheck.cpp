@@ -100,6 +100,9 @@
 #include "effects/modules/MultitapDelayModule.h"
 #include "effects/EffectPresets.h"
 #include "effects/EffectChain.h"
+#include "effects/LoopGuard.h"
+#include "effects/EffectsEngineCore.h"
+#include "effects/EffectsEngine.h"
 
 // gpu/ - host-facing surface (interfaces, device manager, plugin factory,
 // pipeline, host state/configs, compile-time backend selectors)

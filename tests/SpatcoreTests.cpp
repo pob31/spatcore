@@ -79,6 +79,16 @@
                                  keyed dither) and the EQ (bit-identical to the
                                  output EQ bank it wraps); plus every module
                                  bit-transparent when bypassed and at identity
+     20. effects/LoopGuard      a runaway on the effect-to-effect feed is
+                                 caught in a fixed TIME rather than a fixed
+                                 number of blocks, ramped away and released only
+                                 once the feed itself is quiet
+     21. effects/EffectsEngine  the driver: a block written at n returns at n+1
+                                 and an effect-to-effect route at n+2, the same
+                                 audio with 0 workers and with N, a lapped ring
+                                 detected and resynced, and a pull that yields
+                                 silence rather than blocking before prepare or
+                                 after release
      19. the effects ENGINE's foundations  the shared input ring's wrap
                                  counter, and effect returns appearing in the
                                  render-source map as their own kind of source
@@ -132,6 +142,9 @@
 #include "spatcore/effects/modules/EffectReverbModule.h"
 #include "spatcore/effects/modules/MultitapDelayModule.h"
 #include "spatcore/effects/EffectChain.h"
+#include "spatcore/effects/LoopGuard.h"
+#include "spatcore/effects/EffectsEngineCore.h"
+#include "spatcore/effects/EffectsEngine.h"
 #include "spatcore/dsp/AcousticTap.h"
 #include "spatcore/reverb/ReverbReturnProcessor.h"
 #include "spatcore/reverb/ReverbSendMatrix.h"
@@ -10082,6 +10095,1842 @@ static void testAcousticSendMatrixHistoryLength()
     }
 }
 
+//==============================================================================
+// effects/LoopGuard
+//==============================================================================
+
+//==============================================================================
+// effects/LoopGuard.h - the per-channel effect-to-effect runaway guard.
+//
+// What is worth testing here is not the arithmetic, it is the promises the
+// engine makes to the operator: a trip happens at a wall-clock time rather than
+// after a buffer-dependent number of blocks, the feed goes away smoothly and
+// completely, a signal that never sustains never trips, a guard with nothing to
+// do is bit-transparent, and nothing the guard does can hold a channel down for
+// ever. The release criteria are tested on the signal the guard actually
+// decides on (the pre-gain feed peak) with the return peak exercised in its two
+// roles: a veto that delays a release, and a veto that runs out.
+//
+// Requires, in SpatcoreTests.cpp:
+//   #include "spatcore/effects/LoopGuard.h"
+// and juce_audio_basics for juce::ScopedNoDenormals (already reached through
+// spatcore/dsp/AcousticSendMatrix.h). The transparency test needs the real
+// FTZ/DAZ state, because "not written" and "multiplied by 1.0f" are the same
+// thing without it and different with it - and every worker item in the engine
+// arms it (EffectsEngineCore::renderChannel).
+
+namespace loopguard_test {
+
+using spatcore::effects::LoopGuard;
+
+static constexpr double kSr = 48000.0;
+
+/** +12 dBFS: comfortably over the +6 dBFS ceiling. */
+static constexpr float kLoudPeak = 4.0f;
+
+/** -40 dBFS: comfortably under the ceiling less the 12 dB hysteresis. */
+static constexpr float kCalmPeak = 0.01f;
+
+/** One batch exactly as the engine runs it: measure the raw effect-to-effect
+    row, observe, then attenuate in place. The row is all ones, so what comes
+    back IS the gain curve the guard applied, sample by sample. */
+static void runBlock (LoopGuard& g, float feedPeak, float returnPeak, int blockSize,
+                      std::vector<float>& appliedOut)
+{
+    std::vector<float> bus (static_cast<size_t> (blockSize), 1.0f);
+
+    g.observeBlock (feedPeak, returnPeak, blockSize);
+    g.applyGain (bus.data(), blockSize);
+
+    appliedOut.insert (appliedOut.end(), bus.begin(), bus.end());
+}
+
+static void runBlocks (LoopGuard& g, float feedPeak, float returnPeak, int blockSize,
+                       int numBlocks, std::vector<float>& appliedOut)
+{
+    for (int i = 0; i < numBlocks; ++i)
+        runBlock (g, feedPeak, returnPeak, blockSize, appliedOut);
+}
+
+/** Index of the first sample that is not exactly `value`, or -1. */
+static int firstNotExactly (const std::vector<float>& applied, float value, int from = 0)
+{
+    for (size_t i = static_cast<size_t> (from); i < applied.size(); ++i)
+        if (applied[i] != value)
+            return static_cast<int> (i);
+
+    return -1;
+}
+
+/** Index of the first sample that is exactly `value`, or -1. */
+static int firstExactly (const std::vector<float>& applied, float value, int from = 0)
+{
+    for (size_t i = static_cast<size_t> (from); i < applied.size(); ++i)
+        if (applied[i] == value)
+            return static_cast<int> (i);
+
+    return -1;
+}
+
+/** Feed the guard identical batches until the predicate holds, and return how
+    many it took. Bounded by maxBlocks so a broken state machine fails the test
+    instead of hanging it; -1 means the budget ran out. */
+template <typename Pred>
+static int blocksUntil (LoopGuard& g, float feedPeak, float returnPeak, int blockSize,
+                        int maxBlocks, Pred pred)
+{
+    std::vector<float> bus (static_cast<size_t> (blockSize), 1.0f);
+
+    for (int i = 0; i < maxBlocks; ++i)
+    {
+        std::fill (bus.begin(), bus.end(), 1.0f);
+        g.observeBlock (feedPeak, returnPeak, blockSize);
+        g.applyGain (bus.data(), blockSize);
+
+        if (pred (g))
+            return i + 1;
+    }
+
+    return -1;
+}
+
+/** Held down means the ramp to silence has finished, not merely started: the
+    guard is mid-ramp for the first few blocks of a trip and its gain is already
+    below unity there, so a predicate on "attenuating" would return the block
+    the trip happened and time nothing. */
+static bool isHeldDown   (const LoopGuard& g) noexcept { return g.getGain() == 0.0f; }
+static bool isComingBack (const LoopGuard& g) noexcept { return g.getGain() > 0.0f; }
+static bool isRestored   (const LoopGuard& g) noexcept { return ! g.isTripped(); }
+
+/** The trip has been DECLARED - the ramp down has only just started. */
+static bool hasTripped   (const LoopGuard& g) noexcept { return g.isTripped(); }
+
+/** Blocks in `seconds`, rounded down, for the timing bounds below. */
+static int blocksIn (double seconds, int blockSize) noexcept
+{
+    return static_cast<int> (seconds * kSr) / blockSize;
+}
+
+} // namespace loopguard_test
+
+//==============================================================================
+/** The reason the thresholds are seconds and not the plan's block count: the
+    same runaway must trip at the same moment whatever the audio buffer is set
+    to. At 64, 256 and 512 samples the trip lands within one block of the trip
+    time, so the spread across the three is one large block. The "20 consecutive
+    blocks" rule would have spread the same event over 20 x (512 - 64) samples,
+    a factor of eight in how much of the runaway reaches the speakers. */
+static void testLoopGuardTripTimeIsBlockSizeIndependent()
+{
+    using namespace loopguard_test;
+
+    const double tripSeconds = 0.060;
+    const int nominal = static_cast<int> (tripSeconds * kSr);   // 2880 samples
+    const int blockSizes[3] = { 64, 256, 512 };
+    int tripSample[3] = { -1, -1, -1 };
+
+    for (int b = 0; b < 3; ++b)
+    {
+        LoopGuard g;
+        g.prepare (kSr, true, 6.0f, tripSeconds);
+
+        std::vector<float> applied;
+        const int blocks = static_cast<int> (0.5 * kSr) / blockSizes[b];   // half a second
+        runBlocks (g, kLoudPeak, kCalmPeak, blockSizes[b], blocks, applied);
+
+        tripSample[b] = firstNotExactly (applied, 1.0f);
+
+        CHECK (tripSample[b] >= 0);
+        CHECK (g.isTripped());
+        CHECK (g.getTripCount() == 1u);          // one event, not one per block
+
+        // The trip is declared at the first batch boundary at or past the trip
+        // time, so the attenuation starts within one batch either side of it.
+        // The upper bound is STRICTLY one batch, and that is exactly the right
+        // width: the accumulated dt can land a hair under the trip time on the
+        // block that would otherwise have fired, which at 64 samples (where the
+        // trip time is a whole number of blocks) puts the first attenuated
+        // sample exactly on the nominal one - while a guard that genuinely
+        // declared a block late would put it a full block past, and fail. An
+        // assertion written `<= nominal` would pass by zero margin here and go
+        // red for a rounding change rather than for a behaviour change.
+        CHECK (tripSample[b] < nominal + blockSizes[b]);
+        CHECK (tripSample[b] >= nominal - blockSizes[b]);
+    }
+
+    int lo = tripSample[0];
+    int hi = tripSample[0];
+
+    for (int b = 1; b < 3; ++b)
+    {
+        lo = tripSample[b] < lo ? tripSample[b] : lo;
+        hi = tripSample[b] > hi ? tripSample[b] : hi;
+    }
+
+    CHECK (hi - lo <= 512);                      // one large block, at worst
+    CHECK (hi - lo < 20 * (512 - 64));           // what the block-count rule cost
+}
+
+//==============================================================================
+/** The feed has to leave smoothly and arrive at silence: a cliff clicks, and a
+    one-pole that stalls a hair above zero would leave the loop running at a
+    gain the operator cannot see. */
+static void testLoopGuardRampToZeroIsMonotonic()
+{
+    using namespace loopguard_test;
+
+    const double rampDownSeconds = 0.005;
+
+    LoopGuard g;
+    g.prepare (kSr, true, 6.0f, 0.060, 0.500, rampDownSeconds, 0.050);
+
+    std::vector<float> applied;
+    runBlocks (g, kLoudPeak, kCalmPeak, 64, 200, applied);      // 267 ms
+
+    const int trip = firstNotExactly (applied, 1.0f);
+    CHECK (trip > 0);
+    CHECK (g.isTripped());
+
+    // A ramp, not a cliff: the first attenuated sample is neither 1 nor 0.
+    CHECK (applied[static_cast<size_t> (trip)] < 1.0f);
+    CHECK (applied[static_cast<size_t> (trip)] > 0.0f);
+
+    bool monotonic = true;
+
+    for (size_t i = static_cast<size_t> (trip) + 1; i < applied.size(); ++i)
+        if (applied[i] > applied[i - 1])
+            monotonic = false;
+
+    CHECK (monotonic);
+
+    // Exactly zero, by the smoother's snap, and it stays there.
+    const int zeroAt = firstExactly (applied, 0.0f, trip);
+    CHECK (zeroAt > trip);
+    CHECK (firstNotExactly (applied, 0.0f, zeroAt) == -1);
+    CHECK (bitEqualFloat (g.getGain(), 0.0f));
+
+    // And it takes about the time it was asked for. The ramp is quoted as a
+    // completion time, so the class divides by the number of time constants a
+    // one-pole needs to land on its endpoint; getting that conversion wrong is
+    // the mistake this bound catches.
+    const int rampSamples = zeroAt - trip;
+    const int expected = static_cast<int> (rampDownSeconds * kSr);   // 240 samples
+    CHECK (rampSamples >= expected / 2);
+    CHECK (rampSamples <= expected * 2);
+}
+
+//==============================================================================
+/** Consecutive means consecutive. A feed that peaks over the ceiling but keeps
+    falling back under it is doing what loud programme material does; only a
+    build-up that sustains is a runaway. */
+static void testLoopGuardDipBelowCeilingNeverTrips()
+{
+    using namespace loopguard_test;
+
+    LoopGuard g;
+    g.prepare (kSr, true, 6.0f, 0.060);
+
+    std::vector<float> applied;
+    const int loudBlocks = static_cast<int> (0.040 * kSr) / 64;   // 40 ms, then a dip
+
+    for (int cycle = 0; cycle < 20; ++cycle)                      // ~0.9 s in all
+    {
+        runBlocks (g, kLoudPeak, kCalmPeak, 64, loudBlocks, applied);
+        runBlock (g, 1.0f, kCalmPeak, 64, applied);               // 0 dBFS: under +6
+    }
+
+    CHECK (firstNotExactly (applied, 1.0f) == -1);
+    CHECK (! g.isTripped());
+    CHECK (g.getState() == LoopGuard::State::Armed);
+    CHECK (g.getTripCount() == 0u);
+    CHECK (bitEqualFloat (g.getGain(), 1.0f));
+}
+
+//==============================================================================
+/** The operator removes the send: the feed goes calm, and after the release
+    time the guard gives the bus back, smoothly and completely. Nothing may come
+    back early, or a loop that is still live would be re-armed at full level. */
+static void testLoopGuardReleasesAndRampsBack()
+{
+    using namespace loopguard_test;
+
+    const double releaseSeconds = 0.500;
+    const double rampUpSeconds = 0.050;
+
+    LoopGuard g;
+    g.prepare (kSr, true, 6.0f, 0.060, releaseSeconds, 0.005, rampUpSeconds);
+
+    std::vector<float> down;
+    runBlocks (g, kLoudPeak, kLoudPeak, 256, 60, down);           // 320 ms of runaway
+    CHECK (g.getState() == LoopGuard::State::Tripped);
+    CHECK (bitEqualFloat (g.getGain(), 0.0f));
+
+    // 400 ms of calm is not 500 ms of calm.
+    std::vector<float> held;
+    runBlocks (g, kCalmPeak, kCalmPeak, 256, blocksIn (0.400, 256), held);
+    CHECK (firstNotExactly (held, 0.0f) == -1);
+    CHECK (g.isTripped());
+
+    std::vector<float> back;
+    runBlocks (g, kCalmPeak, kCalmPeak, 256, 60, back);           // 320 ms more
+
+    const int start = firstNotExactly (back, 0.0f);
+    CHECK (start >= 0);
+
+    bool monotonic = true;
+
+    for (size_t i = static_cast<size_t> (start) + 1; i < back.size(); ++i)
+        if (back[i] < back[i - 1])
+            monotonic = false;
+
+    CHECK (monotonic);
+
+    const int unityAt = firstExactly (back, 1.0f, start);
+    CHECK (unityAt > start);
+    CHECK (firstNotExactly (back, 1.0f, unityAt) == -1);
+
+    const int rampSamples = unityAt - start;
+    const int expected = static_cast<int> (rampUpSeconds * kSr);  // 2400 samples
+    CHECK (rampSamples >= expected / 2);
+    CHECK (rampSamples <= expected * 2);
+
+    CHECK (! g.isTripped());
+    CHECK (g.getState() == LoopGuard::State::Armed);
+    CHECK (bitEqualFloat (g.getGain(), 1.0f));
+    CHECK (g.getTripCount() == 1u);
+}
+
+//==============================================================================
+/** A release time shorter than the ramp down is not a reason to hand the bus
+    back at half gain. The calm clock only starts once the feed has actually
+    reached exactly zero, so the guard always gets the loop off the bus before
+    it starts thinking about putting it back - and the operator sees a complete
+    ramp down, a hold and a ramp up whatever the two times are set to. */
+static void testLoopGuardReleaseWaitsForSilence()
+{
+    using namespace loopguard_test;
+
+    LoopGuard g;
+    g.prepare (kSr, true, 6.0f, 0.060, /*release*/ 0.002, /*down*/ 0.050, /*up*/ 0.050);
+
+    // Stop the loud feed the moment the trip is declared, so the ramp down
+    // happens entirely inside the calm phase below.
+    CHECK (blocksUntil (g, kLoudPeak, kCalmPeak, 64, 400, hasTripped) > 0);
+
+    std::vector<float> applied;
+    runBlocks (g, kCalmPeak, kCalmPeak, 64, 200, applied);        // 267 ms
+
+    const int silent = firstExactly (applied, 0.0f);
+    CHECK (silent >= 0);                                          // it got there at all
+
+    bool roseBeforeSilence = false;
+
+    for (size_t i = 1; i < static_cast<size_t> (silent); ++i)
+        if (applied[i] > applied[i - 1])
+            roseBeforeSilence = true;
+
+    CHECK (! roseBeforeSilence);                                  // no turning back early
+
+    // And the short release time is still honoured once silence is reached.
+    const int backAt = firstExactly (applied, 1.0f, silent);
+    CHECK (backAt > silent);
+    CHECK (! g.isTripped());
+    CHECK (g.getTripCount() == 1u);
+}
+
+//==============================================================================
+/** The return peak's first job. It cannot cause a release - that decision is
+    taken on the feed - but it can hold one off: restoring a loop feed into a
+    channel whose own output is still over the ceiling would re-pump the loop
+    the same batch. */
+static void testLoopGuardHotReturnDelaysRelease()
+{
+    using namespace loopguard_test;
+
+    const double releaseSeconds = 0.200;
+
+    LoopGuard g;
+    g.prepare (kSr, true, 6.0f, 0.060, releaseSeconds, 0.005, 0.050);
+
+    std::vector<float> applied;
+    runBlocks (g, kLoudPeak, kLoudPeak, 128, 60, applied);        // 160 ms
+    CHECK (g.isTripped());
+    CHECK (bitEqualFloat (g.getGain(), 0.0f));
+
+    // The feed is calm but the chain is still ringing over the ceiling: three
+    // release times pass - well inside the veto's budget, which the next test
+    // measures - and the bus stays down.
+    const int heldBlocks = blocksIn (3.0 * releaseSeconds, 128);
+    const int cameBack = blocksUntil (g, kCalmPeak, kLoudPeak, 128, heldBlocks, isComingBack);
+    CHECK (cameBack == -1);
+    CHECK (g.isTripped());
+    CHECK (bitEqualFloat (g.getGain(), 0.0f));
+
+    // The ringing dies away and the release proceeds on the feed's terms.
+    const int released = blocksUntil (g, kCalmPeak, kCalmPeak, 128, 400, isComingBack);
+    CHECK (released > 0);
+    CHECK (released <= blocksIn (releaseSeconds + 0.100, 128));   // release + a batch
+
+    const int restored = blocksUntil (g, kCalmPeak, kCalmPeak, 128, 400, isRestored);
+    CHECK (restored > 0);
+    CHECK (bitEqualFloat (g.getGain(), 1.0f));
+    CHECK (g.getTripCount() == 1u);
+}
+
+//==============================================================================
+/** The return peak's second job, which is to stop being able to do the first
+    one. The guard never touches input-to-effect feeds, so a channel can sit
+    over the ceiling for ever with no loop at all - a hot mix, a compressor's
+    makeup gain, a long tail. An unbounded veto would take that channel's
+    effect-to-effect sends away until someone hit Clear, which is the same
+    latch the release criteria were rewritten to avoid. After the budget the
+    feed decides alone: if there really is a loop it re-pumps, re-trips, and the
+    backoff ladder holds it down longer each time. */
+static void testLoopGuardHotReturnVetoIsBounded()
+{
+    using namespace loopguard_test;
+
+    const double releaseSeconds = 0.100;
+
+    LoopGuard g;
+    g.prepare (kSr, true, 6.0f, 0.060, releaseSeconds, 0.005, 0.050);
+
+    CHECK (blocksUntil (g, kLoudPeak, kLoudPeak, 64, 400, isHeldDown) > 0);
+
+    // Feed dead calm, return pinned over the ceiling for as long as it likes.
+    const int cameBack = blocksUntil (g, kCalmPeak, kLoudPeak, 64, 4000, isComingBack);
+
+    CHECK (cameBack > 0);                                         // not latched for ever
+
+    // The veto really did delay it: without one the release would have fired
+    // after a single release time.
+    CHECK (cameBack >= blocksIn (2.0 * releaseSeconds, 64));
+
+    // And the budget really is bounded: veto budget + one release time, plus a
+    // batch or two of slack.
+    const double budget = LoopGuard::kVetoReleaseTimes * releaseSeconds;
+    CHECK (cameBack <= blocksIn (budget + 2.0 * releaseSeconds, 64));
+
+    // Coming back over a hot return is a release, not a re-trip.
+    CHECK (g.getTripCount() == 1u);
+}
+
+//==============================================================================
+/** A loop that comes back while the feed is being restored has to be caught on
+    the way up, not after the ramp has finished: the whole point of the ladder
+    below is that a re-pumping loop never rides back to unity. */
+static void testLoopGuardRetripsOnTheWayBack()
+{
+    using namespace loopguard_test;
+
+    const double rampUpSeconds = 0.400;        // long, so there is a ramp to catch
+
+    LoopGuard g;
+    g.prepare (kSr, true, 6.0f, 0.060, 0.100, 0.005, rampUpSeconds);
+
+    CHECK (blocksUntil (g, kLoudPeak, kCalmPeak, 64, 400, isHeldDown) > 0);
+    CHECK (blocksUntil (g, kCalmPeak, kCalmPeak, 64, 2000, isComingBack) > 0);
+
+    CHECK (g.getState() == LoopGuard::State::Releasing);
+    CHECK (g.getGain() > 0.0f);
+    CHECK (g.getGain() < 1.0f);
+
+    // Loud again, mid-ramp. A guard that only watched while Armed would ride
+    // the remaining 400 ms up to unity first, so the bound is what catches it.
+    const int reTrip = blocksUntil (g, kLoudPeak, kCalmPeak, 64, blocksIn (0.120, 64), isHeldDown);
+
+    CHECK (reTrip > 0);
+    CHECK (g.getTripCount() == 2u);
+    CHECK (g.getState() == LoopGuard::State::Tripped);
+    CHECK (bitEqualFloat (g.getGain(), 0.0f));
+}
+
+//==============================================================================
+/** A guard inside the loop it watches cannot tell "the danger has gone" from
+    "the guard is working", so a release into a cycle the operator has not fixed
+    lets the loop build again. The exposure is bounded by making each re-trip
+    hold longer: the second hold is about twice the first. Without the ladder
+    the channel would burst at the trip interval indefinitely - and without the
+    forget, a channel that misbehaved once this morning would carry the long
+    hold into tonight's show. */
+static void testLoopGuardRepeatTripBacksOffTheRelease()
+{
+    using namespace loopguard_test;
+
+    const double releaseSeconds = 0.100;
+
+    LoopGuard g;
+    g.prepare (kSr, true, 6.0f, 0.060, releaseSeconds, 0.005, 0.050);
+
+    CHECK (blocksUntil (g, kLoudPeak, kCalmPeak, 64, 400, isHeldDown) > 0);
+    const int firstHold = blocksUntil (g, kCalmPeak, kCalmPeak, 64, 2000, isComingBack);
+    CHECK (firstHold > 0);
+    CHECK (blocksUntil (g, kCalmPeak, kCalmPeak, 64, 2000, isRestored) > 0);
+
+    // Straight back into the same loop, before the ladder has been forgotten.
+    CHECK (blocksUntil (g, kLoudPeak, kCalmPeak, 64, 400, isHeldDown) > 0);
+    const int secondHold = blocksUntil (g, kCalmPeak, kCalmPeak, 64, 4000, isComingBack);
+    CHECK (secondHold > 0);
+
+    // The base hold is 0.1 s, which is 75 batches of 64 samples: both numbers
+    // are real counts rather than the one block a mid-ramp predicate returns.
+    CHECK (firstHold >= 60);
+    CHECK (secondHold >= (firstHold * 3) / 2);
+    CHECK (secondHold <= firstHold * 3);
+    CHECK (g.getTripCount() == 2u);
+
+    // Now behave. Armed, restored and calm for longer than the forget factor
+    // asks for, and the ladder goes back to the bottom.
+    CHECK (blocksUntil (g, kCalmPeak, kCalmPeak, 64, 4000, isRestored) > 0);
+
+    std::vector<float> idle;
+    const double idleSeconds = (LoopGuard::kBackoffForgetFactor + 2.0) * releaseSeconds;
+    runBlocks (g, kCalmPeak, kCalmPeak, 64, blocksIn (idleSeconds, 64), idle);
+    CHECK (firstNotExactly (idle, 1.0f) == -1);                   // still fully open
+
+    CHECK (blocksUntil (g, kLoudPeak, kCalmPeak, 64, 400, isHeldDown) > 0);
+    const int thirdHold = blocksUntil (g, kCalmPeak, kCalmPeak, 64, 4000, isComingBack);
+    CHECK (thirdHold > 0);
+    CHECK (thirdHold >= 60);
+    CHECK (thirdHold <= (firstHold * 3) / 2);                     // the base hold again
+    CHECK (g.getTripCount() == 3u);
+}
+
+//==============================================================================
+/** The common case, and the one that has to be free: 32 guards on a show where
+    nothing is looping. An armed guard returns before it touches the row, so the
+    feed is not even multiplied by 1.0f, and an unprepared one is transparent
+    rather than a crash.
+
+    FTZ/DAZ is armed here on purpose. In the engine every worker item runs
+    inside juce::ScopedNoDenormals, and with flush-to-zero on, multiplying a
+    denormal by 1.0f returns 0 - so "the row was multiplied by one" and "the row
+    was not written" are two different signals, and only the second one is
+    bit-transparent. Without arming it this test would pass against a guard that
+    had lost its fast path entirely. */
+static void testLoopGuardIdleIsFreeAndTransparent()
+{
+    using namespace loopguard_test;
+
+    LoopGuard g;
+    g.prepare (kSr);
+
+    const auto input = eqtests::makeAwkwardSignal (512);
+    auto bus = input;
+
+    {
+        const juce::ScopedNoDenormals noDenormals;
+
+        for (int i = 0; i < 200; ++i)                             // 2.1 s of nothing
+        {
+            g.observeBlock (0.25f, 0.25f, 512);                   // -12 dBFS
+            g.applyGain (bus.data(), 512);
+        }
+    }
+
+    // Bit-identical, negative zero and denormals included: nothing was written,
+    // so nothing was flushed on the way through.
+    CHECK (eqtests::bitEqualBlock (bus, input));
+    CHECK (! g.isTripped());
+    CHECK (g.getState() == LoopGuard::State::Armed);
+    CHECK (g.getTripCount() == 0u);
+    CHECK (bitEqualFloat (g.getGain(), 1.0f));
+
+    // Nothing to do means nothing is dereferenced either.
+    g.applyGain (nullptr, 512);
+    g.observeBlock (0.25f, 0.25f, 0);
+    CHECK (bitEqualFloat (g.getGain(), 1.0f));
+
+    // A guard that was never prepared never trips and never touches the row.
+    LoopGuard fresh;
+    auto untouched = input;
+    fresh.observeBlock (1000.0f, 1000.0f, 512);
+    fresh.applyGain (untouched.data(), 512);
+    CHECK (eqtests::bitEqualBlock (untouched, input));
+    CHECK (! fresh.isTripped());
+    CHECK (bitEqualFloat (fresh.getGain(), 1.0f));
+
+    // reset() is what emergency Clear does: armed and open again, with the
+    // cumulative count left alone.
+    LoopGuard tripped;
+    tripped.prepare (kSr, true, 6.0f, 0.060);
+    std::vector<float> applied;
+    runBlocks (tripped, kLoudPeak, kCalmPeak, 64, 200, applied);
+    CHECK (tripped.isTripped());
+    tripped.reset();
+    CHECK (! tripped.isTripped());
+    CHECK (bitEqualFloat (tripped.getGain(), 1.0f));
+    CHECK (tripped.getTripCount() == 1u);
+}
+
+//==============================================================================
+/** effectsGlobalLoopGuard = 0. An operator who is deliberately building a
+    feedback bunch has to be able to turn the guard off, and off has to mean
+    off: not a guard that trips silently, not a row multiplied by a unity gain,
+    nothing at all. The switch is live, because the alternative is rebuilding
+    the engine to change it. */
+static void testLoopGuardSwitchedOffIsInert()
+{
+    using namespace loopguard_test;
+
+    LoopGuard g;
+    g.prepare (kSr, false, 6.0f, 0.060);
+    CHECK (! g.isEnabled());
+
+    const auto input = eqtests::makeAwkwardSignal (512);
+    auto bus = input;
+
+    {
+        const juce::ScopedNoDenormals noDenormals;
+
+        for (int i = 0; i < 200; ++i)                             // 2.1 s of runaway
+        {
+            g.observeBlock (kLoudPeak, kLoudPeak, 512);
+            g.applyGain (bus.data(), 512);
+        }
+    }
+
+    CHECK (eqtests::bitEqualBlock (bus, input));
+    CHECK (! g.isTripped());
+    CHECK (g.getTripCount() == 0u);
+    CHECK (bitEqualFloat (g.getGain(), 1.0f));
+
+    // Switched on mid-show, it starts watching from there.
+    g.setEnabled (true);
+    CHECK (g.isEnabled());
+    CHECK (blocksUntil (g, kLoudPeak, kLoudPeak, 64, 400, isHeldDown) > 0);
+    CHECK (g.getTripCount() == 1u);
+
+    // Switched off while tripped, it gives the feed straight back rather than
+    // leaving a bus held down that nothing is watching any more.
+    g.setEnabled (false);
+    CHECK (! g.isTripped());
+    CHECK (bitEqualFloat (g.getGain(), 1.0f));
+    CHECK (g.getTripCount() == 1u);                               // cumulative, kept
+
+    auto stillLoud = input;
+    g.observeBlock (kLoudPeak, kLoudPeak, 512);
+    g.applyGain (stillLoud.data(), 512);
+    CHECK (eqtests::bitEqualBlock (stillLoud, input));
+}
+
+//==============================================================================
+/** The two thresholds have to tile the number line. Loud is "not at or under
+    the ceiling" and calm is "at or under the ceiling less the hysteresis", so
+    with the hysteresis set to zero the two meet exactly and a feed parked on
+    the ceiling is calm rather than neither. Written the other way round, that
+    one value would freeze both clocks and the guard would stay down for ever on
+    a signal it does not consider loud. */
+static void testLoopGuardZeroHysteresisHasNoDeadBand()
+{
+    using namespace loopguard_test;
+
+    const float ceiling = spatcore::dsp::FastDecibels::dbToGain (6.0f);
+
+    LoopGuard g;
+    g.prepare (kSr, true, 6.0f, 0.060, 0.100, 0.005, 0.050, /*hysteresis*/ 0.0);
+
+    // Parked exactly on the ceiling is not loud: it never trips.
+    std::vector<float> applied;
+    runBlocks (g, ceiling, 0.0f, 64, 200, applied);
+    CHECK (firstNotExactly (applied, 1.0f) == -1);
+    CHECK (! g.isTripped());
+
+    // Over it, it trips; back on it, it is calm and releases.
+    CHECK (blocksUntil (g, kLoudPeak, 0.0f, 64, 400, isHeldDown) > 0);
+    const int cameBack = blocksUntil (g, ceiling, 0.0f, 64, 2000, isComingBack);
+    CHECK (cameBack > 0);
+    CHECK (cameBack <= blocksIn (0.300, 64));
+    CHECK (g.getTripCount() == 1u);
+}
+
+//==============================================================================
+/** A channel that has gone non-finite is the last one whose loop feed should be
+    restored. A running max would drop the NaN (every comparison against one is
+    false) and the guard would never see the block that mattered most, so the
+    peak and both thresholds are written as negated comparisons. */
+static void testLoopGuardNonFinitePeakTripsAndHolds()
+{
+    using namespace loopguard_test;
+
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+
+    std::vector<float> block (64, 0.1f);
+    block[7] = nan;
+    CHECK (std::isnan (LoopGuard::peakOf (block.data(), 64)));
+    CHECK (bitEqualFloat (LoopGuard::peakOf (nullptr, 64), 0.0f));
+
+    std::vector<float> finite (64, -0.5f);
+    finite[3] = 0.75f;
+    CHECK (bitEqualFloat (LoopGuard::peakOf (finite.data(), 64), 0.75f));
+
+    LoopGuard g;
+    g.prepare (kSr, true, 6.0f, 0.060);
+
+    std::vector<float> applied;
+    runBlocks (g, nan, 0.0f, 64, 60, applied);                    // 80 ms of NaN
+    CHECK (g.isTripped());
+
+    // A calm return cannot talk it round while the feed is still NaN, and
+    // neither can the veto budget: that budget only ever runs while the FEED is
+    // calm, and a NaN feed never is.
+    CHECK (blocksUntil (g, nan, 0.0f, 64, 2000, isComingBack) == -1);
+    CHECK (bitEqualFloat (g.getGain(), 0.0f));
+}
+
+//==============================================================================
+// effects/EffectsEngine
+//==============================================================================
+
+//==============================================================================
+// effects/EffectsEngineCore.h + effects/EffectsEngine.h
+//
+// The engine is asserted through the ledger above everything else: a block
+// written at callback n comes back at n+1, and a block routed through a second
+// effects channel comes back at n+2. That one property is what the whole
+// feedback design rests on, so every other test here exists to stop something
+// from quietly breaking it - the worker count, a late driver, a lapped ring, a
+// teardown under a live callback, the emergency Clear and the loop guard.
+//
+// Needs, in the includer:
+//     #include "spatcore/effects/EffectsEngineCore.h"
+//     #include "spatcore/effects/EffectsEngine.h"
+//==============================================================================
+
+namespace engine_test
+{
+    using namespace spatcore::effects;
+    namespace srt = spatcore::rt;
+
+    inline float peakOf (const std::vector<float>& v) noexcept
+    {
+        float p = 0.0f;
+        for (float x : v)
+            p = std::max (p, std::fabs (x));
+        return p;
+    }
+
+    inline bool isSilent (const std::vector<float>& v) noexcept
+    {
+        for (float x : v)
+            if (x != 0.0f)
+                return false;
+        return true;
+    }
+
+    inline std::vector<float> dcBlock (int n, float value)
+    {
+        return std::vector<float> ((size_t) n, value);
+    }
+
+    //==========================================================================
+    /** A module that plants ONE non-finite sample in the middle of the block
+        and leaves the last sample finite.
+
+        That is the exact shape neither existing guard can see: ModuleSlot and
+        EffectChain both test isfinite(buf[n-1]), which is the right trade for
+        the recursive structures where this really happens, and blind to a
+        memoryless module passing a single bad sample through. It is here to
+        prove the engine scans the whole return block. */
+    class MidBlockNanModule : public IEffectModule
+    {
+    public:
+        ModuleId type() const noexcept override { return ModuleId::Trem; }
+        void prepare (const ChainConfig&) override {}
+        void reset() noexcept override {}
+
+        ParamApplyInfo applyParams (const EffectChannelParams&, int) noexcept override
+        {
+            return { false, false };            // always active
+        }
+
+        void process (float* inout, int n) noexcept override
+        {
+            if (n > 2)
+                inout[n / 2] = std::numeric_limits<float>::quiet_NaN();
+        }
+
+        int getLatencySamples() const noexcept override { return 0; }
+    };
+
+    inline std::unique_ptr<IEffectModule> nanFactory (ModuleId type, int, const ChainConfig&)
+    {
+        if (type == ModuleId::Trem)
+            return std::make_unique<MidBlockNanModule>();
+
+        return nullptr;                          // every other slot passes through
+    }
+
+    //==========================================================================
+    /** A consumer, minus the audio device.
+
+        One ring per render source with the effect returns last and contiguous,
+        a feed matrix triplet, and a callback() that does the two jobs the app's
+        device callback does, in the app's order: pop every return into the
+        render-source row that belongs to it, write every render source into its
+        ring, then let the driver run. Driving the core synchronously is what
+        makes the ledger assertable exactly rather than eventually. */
+    struct Rig
+    {
+        Rig (int numInputs, int numEffects, int blockSize, int ringBlocks = 8)
+            : nIn (numInputs), nFx (numEffects), block (blockSize)
+        {
+            nSrc = nIn + nFx;
+            firstFx = nIn;
+            stride = nFx;
+
+            for (int i = 0; i < nSrc; ++i)
+            {
+                auto r = std::make_unique<srt::SharedInputRingBuffer>();
+                r->setSize (block * ringBlocks);
+                rings.push_back (std::move (r));
+            }
+
+            levels.assign ((size_t) (nSrc * stride), 0.0f);
+            delays.assign ((size_t) (nSrc * stride), 0.0f);
+            hf.assign ((size_t) (nSrc * stride), 0.0f);
+
+            silence.assign ((size_t) block, 0.0f);
+            popped.assign ((size_t) nFx, std::vector<float> ((size_t) block, 0.0f));
+
+            config.sampleRate = 48000.0;
+            config.blockSize = block;
+            config.numSources = nSrc;
+            config.numEffects = nFx;
+            config.matrixStride = stride;
+            config.firstEffectSourceRow = firstFx;
+            config.workerThreads = 0;
+            config.returnCushionBlocks = 1;
+            config.maxFeedDelaySeconds = 0.05;       // the tests ask for a block or two
+            config.maxEffectDelaySeconds = 0.25;
+            config.moduleFactory = nullptr;          // eleven pass-through slots
+        }
+
+        void level (int src, int fx, float linear) noexcept
+        {
+            levels[(size_t) (src * stride + fx)] = linear;
+        }
+
+        void delayMs (int src, int fx, float ms) noexcept
+        {
+            delays[(size_t) (src * stride + fx)] = ms;
+        }
+
+        bool prepare()
+        {
+            const bool ok = core.prepare (config, rings);
+            core.setFeedMatrices (delays.data(), levels.data(), hf.data(), stride, nSrc, nFx);
+            return ok;
+        }
+
+        /** One device callback. @returns batches the driver ran. */
+        int callback (const std::vector<const float*>& inputs)
+        {
+            for (int fx = 0; fx < nFx; ++fx)
+                core.pullReturn (fx, popped[(size_t) fx].data(), block);
+
+            for (int i = 0; i < nIn; ++i)
+            {
+                const float* src = (i < (int) inputs.size() && inputs[(size_t) i] != nullptr)
+                                       ? inputs[(size_t) i] : silence.data();
+                rings[(size_t) i]->write (src, block);
+            }
+
+            for (int fx = 0; fx < nFx; ++fx)
+                rings[(size_t) (firstFx + fx)]->write (popped[(size_t) fx].data(), block);
+
+            return core.drainAvailable();
+        }
+
+        int callbackSilent()
+        {
+            return callback (std::vector<const float*> ((size_t) nIn, nullptr));
+        }
+
+        int callbackOn (int inputIndex, const float* data)
+        {
+            std::vector<const float*> in ((size_t) nIn, nullptr);
+            in[(size_t) inputIndex] = data;
+            return callback (in);
+        }
+
+        /** Fill every ring without letting the driver run, which is how a
+            backlog and a lap are staged. */
+        void writeAllRings (const float* data)
+        {
+            for (int i = 0; i < nSrc; ++i)
+                rings[(size_t) i]->write (data != nullptr ? data : silence.data(), block);
+        }
+
+        int nIn, nFx, block, nSrc, firstFx, stride;
+        std::vector<std::unique_ptr<srt::SharedInputRingBuffer>> rings;
+        std::vector<float> levels, delays, hf, silence;
+        std::vector<std::vector<float>> popped;
+        EffectsEngineCore::Config config;
+        EffectsEngineCore core;
+    };
+}
+
+//==============================================================================
+// THE LEDGER. One hop is one block, two hops are two, and the return cushion
+// is the only thing that moves either number.
+//==============================================================================
+
+static void testEffectsEngineBlockLedger()
+{
+    using namespace engine_test;
+
+    Rig rig (2, 2, 64);
+    rig.level (0, 0, 1.0f);                  // input 0 -> effect 0
+    rig.level (rig.firstFx + 0, 1, 1.0f);    // effect 0's RETURN -> effect 1
+    CHECK (rig.prepare());
+    CHECK (rig.core.getReturnCushionBlocks() == 1);
+
+    const auto signal = module_test::awkwardBlock (64, 5);
+
+    // Callback 0 writes the block. Nothing can have come back yet: the pull
+    // happens at the TOP of the callback, before the write.
+    CHECK (rig.callbackOn (0, signal.data()) == 1);
+    CHECK (isSilent (rig.popped[0]));
+    CHECK (isSilent (rig.popped[1]));
+
+    // Callback 1 pops it. A send at unity with no delay is the identity, so
+    // this is a bit-exact assertion and not an approximate one.
+    CHECK (rig.callbackSilent() == 1);
+    for (int i = 0; i < 64; ++i)
+        CHECK (bitEqualFloat (rig.popped[0][(size_t) i], signal[(size_t) i]));
+    CHECK (isSilent (rig.popped[1]));
+
+    // Callback 2 pops the same audio out of the SECOND channel: effect 0's
+    // return re-entered the matrix as a render source on the next batch.
+    CHECK (rig.callbackSilent() == 1);
+    CHECK (isSilent (rig.popped[0]));
+    for (int i = 0; i < 64; ++i)
+        CHECK (bitEqualFloat (rig.popped[1][(size_t) i], signal[(size_t) i]));
+
+    // At a cushion of one the ring holds exactly one block at every pull: one
+    // pops per callback and one arrives per batch. Neither counter may move.
+    CHECK (rig.core.getUnderruns (0) == 0);
+    CHECK (rig.core.getUnderruns (1) == 0);
+    CHECK (rig.core.getReturnDiscards (0) == 0);
+    CHECK (rig.core.getReturnDiscards (1) == 0);
+
+    // And the cushion IS the latency. The design document's ledger and its
+    // discard rule disagreed by one block; the ledger is the user-visible
+    // claim, so the ring is primed with exactly `cushion` blocks and a pull
+    // discards anything above that. Cushion 2 therefore moves every arrival by
+    // exactly one block and buys one block of slack against a late driver.
+    Rig cushioned (2, 2, 64);
+    cushioned.config.returnCushionBlocks = 2;
+    cushioned.level (0, 0, 1.0f);
+    CHECK (cushioned.prepare());
+    CHECK (cushioned.core.getReturnCushionBlocks() == 2);
+
+    CHECK (cushioned.callbackOn (0, signal.data()) == 1);
+    CHECK (isSilent (cushioned.popped[0]));
+    CHECK (cushioned.callbackSilent() == 1);
+    CHECK (isSilent (cushioned.popped[0]));           // one block later than above
+    CHECK (cushioned.callbackSilent() == 1);
+    for (int i = 0; i < 64; ++i)
+        CHECK (bitEqualFloat (cushioned.popped[0][(size_t) i], signal[(size_t) i]));
+
+    // The cushion holds, rather than creeping: after a hundred callbacks the
+    // arrival is still two blocks, which is what the discard rule is for.
+    //
+    // BOTH halves of the priming, not just one. The underrun count catches a
+    // ring primed with too FEW blocks; without the discard count an extra
+    // priming block would be silently corrected by the first pull and cost a
+    // startup glitch that no assertion here could see.
+    CHECK (cushioned.core.getUnderruns (0) == 0);
+    CHECK (cushioned.core.getReturnDiscards (0) == 0);
+}
+
+//==============================================================================
+// DETERMINISM. An offline render and a live render have to be the same render,
+// so the worker count must not be able to reach the arithmetic.
+//==============================================================================
+
+static void testEffectsEngineWorkerDeterminism()
+{
+    using namespace engine_test;
+
+    const int block = 64;
+    const int numBlocks = 40;
+
+    EffectChannelParams p;
+    p.trem.bypass = 0;
+    p.trem.rateHz = 3.0f;
+    p.trem.depthDb = 9.0f;
+    p.crush.bypass = 0;
+    p.crush.bits = 6.0f;
+    p.crush.rateHz = 9000.0f;
+    p.delay.bypass = 0;
+    p.delay.timeMs = 20.0f;
+    p.delay.feedback = 40.0f;
+    p.delay.mix = 50.0f;
+    p.revision = 1;
+
+    std::vector<std::vector<float>> sequential, parallel;
+
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        Rig rig (4, 4, block);
+        rig.config.workerThreads = (pass == 0) ? 0 : 3;
+        rig.config.moduleFactory = &createModule;          // real modules, real state
+
+        for (int src = 0; src < 4; ++src)
+            for (int fx = 0; fx < 4; ++fx)
+                rig.level (src, fx, 0.2f + 0.1f * (float) ((src + fx) % 3));
+
+        rig.level (rig.firstFx + 0, 1, 0.4f);              // and one effect -> effect route
+        rig.delayMs (1, 2, 0.5f);                          // a fractional feed delay
+
+        CHECK (rig.prepare());
+
+        for (int fx = 0; fx < 4; ++fx)
+            rig.core.publishChannelParams (fx, p);
+
+        std::vector<std::vector<float>> captured;
+
+        for (int b = 0; b < numBlocks; ++b)
+        {
+            std::vector<std::vector<float>> inputs;
+            std::vector<const float*> ptrs;
+            for (int i = 0; i < 4; ++i)
+            {
+                inputs.push_back (module_test::awkwardBlock (block, 100 + b * 7 + i));
+                ptrs.push_back (inputs.back().data());
+            }
+
+            rig.callback (ptrs);
+
+            for (int fx = 0; fx < 4; ++fx)
+                captured.push_back (rig.popped[(size_t) fx]);
+        }
+
+        if (pass == 0)
+        {
+            sequential = std::move (captured);
+            CHECK (rig.core.getNumWorkers() == 0);
+        }
+        else
+        {
+            parallel = std::move (captured);
+
+            // Without this the test could pass by running sequentially twice.
+            CHECK (rig.core.getNumWorkers() == 3);
+        }
+    }
+
+    CHECK (sequential.size() == parallel.size());
+
+    bool identical = true;
+    for (size_t b = 0; b < sequential.size() && b < parallel.size(); ++b)
+        for (size_t i = 0; i < sequential[b].size(); ++i)
+            if (! bitEqualFloat (sequential[b][i], parallel[b][i]))
+                identical = false;
+
+    CHECK (identical);
+
+    // A test that compared two silent renders would pass for the wrong reason.
+    float loudest = 0.0f;
+    for (const auto& b : sequential)
+        loudest = std::max (loudest, peakOf (b));
+    CHECK (loudest > 0.01f);
+}
+
+//==============================================================================
+// LATE DRIVER. Latency must never creep, on either side.
+//==============================================================================
+
+static void testEffectsEngineBacklogSkip()
+{
+    using namespace engine_test;
+
+    Rig rig (1, 1, 64, 8);                   // eight blocks of ring, so no lap
+    rig.config.maxSourceBacklogBlocks = 2;
+    rig.level (0, 0, 1.0f);
+    CHECK (rig.prepare());
+
+    // Three whole blocks pending, each a different DC value, and nothing has
+    // drained them.
+    for (int b = 1; b <= 3; ++b)
+    {
+        const auto dc = dcBlock (64, 0.1f * (float) b);
+        rig.writeAllRings (dc.data());
+    }
+
+    CHECK (rig.core.drainAvailable() == 1);              // one batch, not three
+    CHECK (rig.core.getSourceSkips() == 1);
+    CHECK (rig.core.getRingWraps() == 0);
+
+    // And it kept the NEWEST block, which is the whole point: an engine that
+    // worked through the backlog would be permanently two blocks late.
+    std::vector<float> out ((size_t) 64, -1.0f);
+    CHECK (rig.core.pullReturn (0, out.data(), 64));
+    for (int i = 0; i < 64; ++i)
+        CHECK (bitEqualFloat (out[(size_t) i], 0.3f));
+}
+
+static void testEffectsEngineRingWrapResync()
+{
+    using namespace engine_test;
+
+    // Four blocks of ring: the depth every shared ring in the app has today.
+    Rig rig (1, 1, 64, 4);
+    rig.config.maxSourceBacklogBlocks = 8;               // out of the way; this is about the lap
+    rig.level (0, 0, 1.0f);
+    CHECK (rig.prepare());
+
+    // Five blocks written and none read laps the consumer. The cursor's own
+    // arithmetic cannot say so - it reports a plausible ONE block available,
+    // which is why this needs the ring's additive counter to be visible at all.
+    for (int b = 1; b <= 5; ++b)
+    {
+        const auto dc = dcBlock (64, 0.1f * (float) b);
+        rig.writeAllRings (dc.data());
+    }
+
+    CHECK (rig.rings[0]->getAvailableAt (0) == 64);      // the aliasing, pinned
+    CHECK (rig.rings[0]->getTotalWritten() == 5u * 64u);
+
+    CHECK (rig.core.drainAvailable() == 1);
+    CHECK (rig.core.getRingWraps() == 1);
+    CHECK (rig.core.getSourceSkips() == 0);
+
+    // Resynced onto the newest block rather than onto whatever the stale cursor
+    // happened to point at.
+    std::vector<float> out ((size_t) 64, -1.0f);
+    CHECK (rig.core.pullReturn (0, out.data(), 64));
+    for (int i = 0; i < 64; ++i)
+        CHECK (bitEqualFloat (out[(size_t) i], 0.5f));
+
+    // Back in step: the next block is taken normally, with no second wrap.
+    const auto dc = dcBlock (64, 0.9f);
+    rig.writeAllRings (dc.data());
+    CHECK (rig.core.drainAvailable() == 1);
+    CHECK (rig.core.getRingWraps() == 1);
+}
+
+//==============================================================================
+// THE CONFIGURATION FLOORS. Two Config fields are consumer hints that know
+// nothing about the block size, and both of them are unsafe below it rather
+// than merely useless.
+//==============================================================================
+
+static void testEffectsEngineShortFeedHistory()
+{
+    using namespace engine_test;
+
+    // Five milliseconds of history is 240 samples at 48 kHz: an ordinary
+    // number to write down, and less than half a 512-sample block.
+    // AcousticSendMatrix::writeInputs wraps by copying (numSamples - length)
+    // floats to the START of a length-sized row, so a line shorter than the
+    // block writes off the end of it - past the allocation, for the last
+    // source. The engine floors the history at two blocks for that reason.
+    Rig rig (2, 1, 512, 8);
+    rig.config.maxFeedDelaySeconds = 0.005;
+    rig.level (0, 0, 1.0f);
+    CHECK (rig.prepare());
+
+    const auto signal = module_test::awkwardBlock (512, 29);
+
+    CHECK (rig.callbackOn (0, signal.data()) == 1);
+    CHECK (isSilent (rig.popped[0]));
+
+    // The ledger, unchanged and still bit-exact: the floor lengthens the line,
+    // it does not change what a zero-delay unity send does.
+    CHECK (rig.callbackSilent() == 1);
+    for (int i = 0; i < 512; ++i)
+        CHECK (bitEqualFloat (rig.popped[0][(size_t) i], signal[(size_t) i]));
+
+    // Zero is the same story told by a consumer that did not fill the field in.
+    Rig zero (1, 1, 256, 8);
+    zero.config.maxFeedDelaySeconds = 0.0;
+    zero.level (0, 0, 1.0f);
+    CHECK (zero.prepare());
+
+    const auto other = module_test::awkwardBlock (256, 31);
+    CHECK (zero.callbackOn (0, other.data()) == 1);
+    CHECK (zero.callbackSilent() == 1);
+    for (int i = 0; i < 256; ++i)
+        CHECK (bitEqualFloat (zero.popped[0][(size_t) i], other[(size_t) i]));
+}
+
+static void testEffectsEngineRefusesUndersizedRing()
+{
+    using namespace engine_test;
+
+    // A ring of exactly one block can never deliver one - SharedInputRingBuffer
+    // reserves a slot - so the availability gate never opens and the engine
+    // would sit there for ever with batches, wraps and skips all reading zero.
+    // Below TWO blocks the lap threshold (capacity - block) drops under the one
+    // block legitimately in flight between a callback and its batch, so every
+    // batch would declare a lap and reset every chain. Both are refused at
+    // prepare(), where a consumer can see them.
+    Rig tooSmall (1, 1, 64, 1);
+    tooSmall.level (0, 0, 1.0f);
+    CHECK (! tooSmall.prepare());
+    CHECK (! tooSmall.core.isReady());
+
+    std::vector<float> out ((size_t) 64, 7.0f);
+    CHECK (! tooSmall.core.pullReturn (0, out.data(), 64));
+    CHECK (isSilent (out));
+
+    // And exactly two blocks is accepted and works, so the floor is a floor
+    // rather than a margin invented for comfort.
+    Rig atFloor (1, 1, 64, 2);
+    atFloor.level (0, 0, 1.0f);
+    CHECK (atFloor.prepare());
+
+    const auto signal = module_test::awkwardBlock (64, 47);
+    CHECK (atFloor.callbackOn (0, signal.data()) == 1);
+    CHECK (atFloor.callbackSilent() == 1);
+    for (int i = 0; i < 64; ++i)
+        CHECK (bitEqualFloat (atFloor.popped[0][(size_t) i], signal[(size_t) i]));
+
+    CHECK (atFloor.core.getRingWraps() == 0);
+    CHECK (atFloor.core.getUnderruns (0) == 0);
+}
+
+//==============================================================================
+// THE PUBLISHED MATRIX IS NOT THE CHANNEL COUNT. It bounds what may be READ
+// from the matrix, and nothing else: every live channel runs every batch.
+//==============================================================================
+
+static void testEffectsEngineUnroutedChannelsStillRun()
+{
+    using namespace engine_test;
+
+    // Four channels live, a matrix that claims two. The two it does not reach
+    // still have to run: their chains hold the tails, and their return rings
+    // are what the audio callback pops on every single callback. A sweep bounded
+    // by the published count would freeze them mid-tail and underrun the
+    // callback for ever, with no telemetry saying why.
+    Rig rig (2, 4, 64);
+    for (int fx = 0; fx < 4; ++fx)
+        rig.level (0, fx, 1.0f);
+
+    CHECK (rig.core.prepare (rig.config, rig.rings));
+    rig.core.setFeedMatrices (rig.delays.data(), rig.levels.data(), rig.hf.data(),
+                              rig.stride, rig.nSrc, 2);              // two, not four
+
+    const auto signal = module_test::awkwardBlock (64, 41);
+
+    CHECK (rig.callbackOn (0, signal.data()) == 1);
+    CHECK (rig.callbackSilent() == 1);
+
+    // The routed channels render, and render exactly.
+    for (int i = 0; i < 64; ++i)
+    {
+        CHECK (bitEqualFloat (rig.popped[0][(size_t) i], signal[(size_t) i]));
+        CHECK (bitEqualFloat (rig.popped[1][(size_t) i], signal[(size_t) i]));
+    }
+
+    // The unrouted ones render silence - not stale audio, and not a cell of
+    // somebody else's matrix row.
+    CHECK (isSilent (rig.popped[2]));
+    CHECK (isSilent (rig.popped[3]));
+
+    for (int b = 0; b < 20; ++b)
+        rig.callbackSilent();
+
+    // The assertion this test exists for: every channel was fed a block every
+    // callback, whether the matrix reached it or not.
+    for (int fx = 0; fx < 4; ++fx)
+        CHECK (rig.core.getUnderruns (fx) == 0);
+
+    // And nothing latched: publishing the full count brings them back on the
+    // next batch, on the same one-block ledger as any other channel.
+    rig.core.setFeedMatrices (rig.delays.data(), rig.levels.data(), rig.hf.data(),
+                              rig.stride, rig.nSrc, rig.nFx);
+
+    CHECK (rig.callbackOn (0, signal.data()) == 1);
+    CHECK (rig.callbackSilent() == 1);
+
+    for (int i = 0; i < 64; ++i)
+        CHECK (bitEqualFloat (rig.popped[3][(size_t) i], signal[(size_t) i]));
+
+    for (int fx = 0; fx < 4; ++fx)
+        CHECK (rig.core.getUnderruns (fx) == 0);
+}
+
+static void testEffectsEngineNarrowStrideDoesNotAlias()
+{
+    using namespace engine_test;
+
+    // computeNodeFeed indexes levels[src * stride + fx] into an array the
+    // consumer sized numSources * stride, so a channel index at or above the
+    // stride reads the NEXT source's row - and, on the last source, past the
+    // end of the allocation. The aliasing is the observable half: at stride 2,
+    // channel 2's cell for source 0 IS source 1's cell for channel 0.
+    Rig rig (2, 4, 64);
+    rig.stride = 2;
+    rig.config.matrixStride = 2;
+
+    rig.level (0, 0, 1.0f);                  // source 0 -> channel 0, the real route
+    rig.level (1, 0, 1.0f);                  // source 1 -> channel 0, and the alias
+
+    CHECK (rig.prepare());
+
+    const auto signal = module_test::awkwardBlock (64, 43);
+
+    CHECK (rig.callbackOn (0, signal.data()) == 1);
+    CHECK (rig.callbackSilent() == 1);
+
+    // Channel 0 is inside the stride and renders normally (source 1 is silent,
+    // so this is still the identity).
+    for (int i = 0; i < 64; ++i)
+        CHECK (bitEqualFloat (rig.popped[0][(size_t) i], signal[(size_t) i]));
+
+    // Channels 2 and 3 are outside it. A channel that read the aliased cell
+    // would be carrying the input at unity right here.
+    CHECK (isSilent (rig.popped[2]));
+    CHECK (isSilent (rig.popped[3]));
+
+    for (int b = 0; b < 8; ++b)
+        rig.callbackSilent();
+
+    for (int fx = 0; fx < 4; ++fx)
+        CHECK (rig.core.getUnderruns (fx) == 0);
+}
+
+//==============================================================================
+// MUTE AND THE LOOP-GUARD SWITCH. Both are live operator controls that the
+// template's own shape would get wrong.
+//==============================================================================
+
+static void testEffectsEngineMuteKeepsChainsRunning()
+{
+    using namespace engine_test;
+
+    // The reverb feed's muted branch skips its whole sweep, which is right
+    // there and wrong here: the tails live inside the chains being skipped, so
+    // skipping would freeze every delay, starve every return ring and resume a
+    // frozen tail on unmute. Muted silences the FEED and nothing else.
+    EffectChannelParams p;
+    p.delay.bypass = 0;
+    p.delay.timeMs = 10.0f;
+    p.delay.feedback = 70.0f;
+    p.delay.mix = 100.0f;
+    p.revision = 1;
+
+    Rig rig (1, 1, 64);
+    rig.config.moduleFactory = &createModule;
+    rig.level (0, 0, 1.0f);
+    CHECK (rig.prepare());
+    rig.core.publishChannelParams (0, p);
+
+    const auto hot = module_test::awkwardBlock (64, 53);
+    rig.callbackOn (0, hot.data());
+
+    for (int b = 0; b < 12; ++b)
+        rig.callbackSilent();
+
+    CHECK (! isSilent (rig.popped[0]));               // a tail is running
+
+    rig.core.setMuted (true);
+    CHECK (rig.core.getMuted());
+
+    rig.callbackSilent();
+    const float early = peakOf (rig.popped[0]);
+
+    for (int b = 0; b < 30; ++b)
+        rig.callbackSilent();
+
+    const float late = peakOf (rig.popped[0]);
+
+    CHECK (early > 0.0f);                             // the chain kept producing
+    CHECK (late < early);                             // and the tail moved on
+    CHECK (rig.core.getUnderruns (0) == 0);           // the ring never starved
+
+    rig.core.setMuted (false);
+    CHECK (! rig.core.getMuted());
+
+    rig.callbackOn (0, hot.data());
+    rig.callbackSilent();
+    CHECK (! isSilent (rig.popped[0]));
+    CHECK (rig.core.getUnderruns (0) == 0);
+}
+
+static void testEffectsEngineLoopGuardSwitch()
+{
+    using namespace engine_test;
+
+    Rig rig (1, 1, 64);
+    rig.config.loopGuardCeilingDb = 6.0f;
+    rig.config.loopGuardTripSeconds = 0.004;          // three blocks at 64/48k
+    rig.config.loopGuardRampDownSeconds = 0.0005;
+    rig.config.loopGuardReleaseSeconds = 10.0;        // far longer than this test
+    rig.level (0, 0, 1.0f);
+    rig.level (rig.firstFx + 0, 0, 1.5f);             // the runaway
+    CHECK (rig.prepare());
+    CHECK (rig.core.isLoopGuardEnabled());
+
+    const auto in = module_test::awkwardBlock (64, 59);
+
+    for (int b = 0; b < 60 && ! rig.core.isLoopGuardTripped (0); ++b)
+        rig.callbackOn (0, in.data());
+
+    CHECK (rig.core.isLoopGuardTripped (0));
+    const std::uint32_t trips = rig.core.getLoopGuardTrips (0);
+    CHECK (trips == 1);
+
+    // Off, at the next batch boundary rather than by a rebuild. Turning it off
+    // RE-ARMS every guard: someone switching it off mid-trip is asking for
+    // their loop back now, not one release time from now.
+    rig.core.setLoopGuardEnabled (false);
+    CHECK (! rig.core.isLoopGuardEnabled());
+
+    rig.callbackOn (0, in.data());
+    rig.callbackOn (0, in.data());
+    CHECK (! rig.core.isLoopGuardTripped (0));
+
+    // The trip counter is a history, not a state, so switching off does not
+    // rewrite it - and nothing counts while the guard is not watching.
+    CHECK (rig.core.getLoopGuardTrips (0) == trips);
+
+    // And back on: the same runaway trips it again.
+    rig.core.setLoopGuardEnabled (true);
+    CHECK (rig.core.isLoopGuardEnabled());
+
+    for (int b = 0; b < 60 && ! rig.core.isLoopGuardTripped (0); ++b)
+        rig.callbackOn (0, in.data());
+
+    CHECK (rig.core.isLoopGuardTripped (0));
+    CHECK (rig.core.getLoopGuardTrips (0) > trips);
+
+    // prepare() takes the switch from Config, so a call before it is discarded
+    // rather than remembered. That is worth pinning: it is the shape of bug
+    // that looks like the switch being ignored at random.
+    Rig fresh (1, 1, 64);
+    fresh.config.loopGuardEnabled = true;
+    fresh.level (0, 0, 1.0f);
+    fresh.core.setLoopGuardEnabled (false);
+    CHECK (fresh.prepare());
+    CHECK (fresh.core.isLoopGuardEnabled());
+}
+
+//==============================================================================
+// THE GATE. The audio callback degrades to silence and never waits.
+//==============================================================================
+
+static void testEffectsEngineReadyGate()
+{
+    using namespace engine_test;
+
+    Rig rig (1, 2, 64);
+    rig.level (0, 0, 1.0f);
+
+    std::vector<float> out ((size_t) 64, 7.0f);
+
+    // Before prepare: no crash, no stale buffer handed back, silence.
+    CHECK (! rig.core.pullReturn (0, out.data(), 64));
+    CHECK (isSilent (out));
+
+    CHECK (rig.prepare());
+
+    const auto signal = module_test::awkwardBlock (64, 11);
+    rig.callbackOn (0, signal.data());
+
+    std::fill (out.begin(), out.end(), 7.0f);
+    CHECK (rig.core.pullReturn (0, out.data(), 64));
+    CHECK (! isSilent (out));
+
+    // Out of range is silence too, not an index into whatever is next in
+    // memory.
+    std::fill (out.begin(), out.end(), 7.0f);
+    CHECK (! rig.core.pullReturn (99, out.data(), 64));
+    CHECK (isSilent (out));
+
+    // After release: the same, for as long as the app leaves it torn down.
+    rig.core.release();
+    CHECK (! rig.core.isReady());
+
+    std::fill (out.begin(), out.end(), 7.0f);
+    CHECK (! rig.core.pullReturn (0, out.data(), 64));
+    CHECK (isSilent (out));
+
+    std::fill (out.begin(), out.end(), 7.0f);
+    CHECK (! rig.core.pullReturn (0, out.data(), 64));
+    CHECK (isSilent (out));
+}
+
+static void testEffectsEnginePullDuringRebuild()
+{
+    using namespace engine_test;
+
+    // prepare() holds the lock across the whole reallocation, which is the only
+    // thing that makes a rebuild safe under a live callback. The callback must
+    // come out of it promptly with silence rather than blocking on it or
+    // reading a ring that is being destroyed.
+    Rig rig (2, 4, 64);
+    rig.level (0, 0, 1.0f);
+    CHECK (rig.prepare());
+
+    std::atomic<bool> stop { false };
+    std::atomic<int> rebuilds { 0 };
+
+    std::thread rebuilder ([&rig, &stop, &rebuilds]
+    {
+        // No count of its own: a rebuilder that could finish before the puller
+        // was scheduled would leave the puller with nothing to race against.
+        while (! stop.load (std::memory_order_relaxed))
+        {
+            rig.core.prepare (rig.config, rig.rings);
+            rig.core.setFeedMatrices (rig.delays.data(), rig.levels.data(), rig.hf.data(),
+                                      rig.stride, rig.nSrc, rig.nFx);
+            rebuilds.fetch_add (1, std::memory_order_relaxed);
+        }
+    });
+
+    std::vector<float> out ((size_t) 64, 0.0f);
+    bool garbage = false;
+    int pulls = 0;
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds (3);
+
+    // Runs until there has been enough of both to be a race, and is bounded by
+    // a clock as well so a loaded runner can never hang the suite here.
+    while (std::chrono::steady_clock::now() < deadline
+           && (pulls < 500 || rebuilds.load (std::memory_order_relaxed) < 20))
+    {
+        std::fill (out.begin(), out.end(), 7.0f);
+
+        if (! rig.core.pullReturn (0, out.data(), 64) && ! isSilent (out))
+            garbage = true;
+
+        ++pulls;
+    }
+
+    stop.store (true, std::memory_order_relaxed);
+    rebuilder.join();
+
+    CHECK (pulls > 0);
+    CHECK (rebuilds.load (std::memory_order_relaxed) > 0);
+    CHECK (! garbage);                                   // a refused pull always leaves silence
+}
+
+//==============================================================================
+// EMERGENCY CLEAR. Per channel it drops that chain's tails; only "all" touches
+// the source history that every channel and the reverb send share.
+//==============================================================================
+
+static void testEffectsEngineRequestClear()
+{
+    using namespace engine_test;
+
+    // A delay with feedback, so there is a tail to drop in the first place.
+    EffectChannelParams p;
+    p.delay.bypass = 0;
+    p.delay.timeMs = 10.0f;
+    p.delay.feedback = 70.0f;
+    p.delay.mix = 100.0f;
+    p.revision = 1;
+
+    for (int mode = 0; mode < 3; ++mode)          // 0 = no clear, 1 = one channel, 2 = all
+    {
+        Rig rig (1, 2, 64);
+        rig.config.moduleFactory = &createModule;
+        rig.level (0, 0, 1.0f);
+        rig.level (0, 1, 1.0f);
+        CHECK (rig.prepare());
+
+        rig.core.publishChannelParams (0, p);
+        rig.core.publishChannelParams (1, p);
+
+        const auto hot = module_test::awkwardBlock (64, 3);
+        rig.callbackOn (0, hot.data());
+
+        // Long enough for the first taps to come back: the delay is 10 ms and
+        // a block is 1.33 ms.
+        for (int b = 0; b < 20; ++b)
+            rig.callbackSilent();
+
+        CHECK (! isSilent (rig.popped[0]));
+        CHECK (! isSilent (rig.popped[1]));
+
+        if (mode == 1)
+            rig.core.requestClear (0);
+        else if (mode == 2)
+            rig.core.requestClear (-1);
+
+        // Two callbacks: one for the batch that honours it, one to pop what
+        // that batch produced.
+        rig.callbackSilent();
+        rig.callbackSilent();
+
+        if (mode == 0)
+        {
+            CHECK (rig.core.getClearCount() == 0);
+            CHECK (! isSilent (rig.popped[0]));
+            CHECK (! isSilent (rig.popped[1]));
+        }
+        else if (mode == 1)
+        {
+            CHECK (rig.core.getClearCount() == 1);
+            CHECK (isSilent (rig.popped[0]));     // its tail is gone
+            CHECK (! isSilent (rig.popped[1]));   // and nobody else's is
+        }
+        else
+        {
+            CHECK (rig.core.getClearCount() == 1);
+            CHECK (isSilent (rig.popped[0]));
+            CHECK (isSilent (rig.popped[1]));
+        }
+    }
+}
+
+static void testEffectsEngineClearAllWipesHistory()
+{
+    using namespace engine_test;
+
+    // A feed delay of two blocks makes the shared source history observable:
+    // what a batch renders was written two batches ago, so wiping the history
+    // shows up as silence where the delayed copy would have been.
+    const float twoBlocksMs = 2000.0f * 64.0f / 48000.0f;
+
+    for (int mode = 0; mode < 3; ++mode)          // 0 = no clear, 1 = one channel, 2 = all
+    {
+        Rig rig (1, 1, 64);
+        rig.level (0, 0, 1.0f);
+        rig.delayMs (0, 0, twoBlocksMs);
+        CHECK (rig.prepare());
+
+        const auto hot = dcBlock (64, 0.5f);
+        rig.callbackOn (0, hot.data());           // the only audio there will be
+
+        if (mode == 1)
+            rig.core.requestClear (0);
+        else if (mode == 2)
+            rig.core.requestClear (-1);
+
+        float loudest = 0.0f;
+        for (int b = 0; b < 8; ++b)
+        {
+            rig.callbackSilent();
+            loudest = std::max (loudest, peakOf (rig.popped[0]));
+        }
+
+        if (mode == 2)
+            CHECK (loudest == 0.0f);              // the history went with it
+        else
+            CHECK (loudest > 0.1f);               // a per-channel clear leaves it alone
+    }
+}
+
+//==============================================================================
+// THE LOOP GUARD. It may only ever touch the effect -> effect bus.
+//==============================================================================
+
+static void testEffectsEngineLoopGuardSparesInputRows()
+{
+    using namespace engine_test;
+
+    const int block = 64;
+    const int numBlocks = 90;
+
+    std::vector<std::vector<float>> guarded, reference;
+    std::uint32_t trips = 0;
+    bool tripped = false;
+
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        Rig rig (1, 1, block);
+        rig.config.loopGuardCeilingDb = 6.0f;
+        rig.config.loopGuardTripSeconds = 0.004;          // three blocks at 64/48k
+        rig.config.loopGuardRampDownSeconds = 0.0005;     // a completion time: gone inside a block
+        rig.config.loopGuardReleaseSeconds = 10.0;        // far longer than this test runs
+        rig.level (0, 0, 1.0f);
+
+        // Pass 0 is the runaway: the channel feeds itself at a gain above one.
+        // Pass 1 is the same engine with that route absent, which is exactly
+        // what the guard should leave behind once it has clamped the bus.
+        if (pass == 0)
+            rig.level (rig.firstFx + 0, 0, 1.5f);
+
+        CHECK (rig.prepare());
+
+        std::vector<std::vector<float>> captured;
+
+        for (int b = 0; b < numBlocks; ++b)
+        {
+            const auto in = module_test::awkwardBlock (block, 200 + b);
+            rig.callbackOn (0, in.data());
+            captured.push_back (rig.popped[0]);
+        }
+
+        if (pass == 0)
+        {
+            guarded = std::move (captured);
+            trips = rig.core.getLoopGuardTrips (0);
+            tripped = rig.core.isLoopGuardTripped (0);
+        }
+        else
+        {
+            reference = std::move (captured);
+            CHECK (rig.core.getLoopGuardTrips (0) == 0);  // nothing to trip on
+        }
+    }
+
+    CHECK (trips == 1);
+    CHECK (tripped);
+
+    // The runaway happened: the early blocks are not the reference.
+    bool divergedEarly = false;
+    for (size_t b = 4; b < 12 && b < guarded.size(); ++b)
+        for (size_t i = 0; i < guarded[b].size(); ++i)
+            if (! bitEqualFloat (guarded[b][i], reference[b][i]))
+                divergedEarly = true;
+    CHECK (divergedEarly);
+
+    // And once the guard has settled the bus at zero, what is left is the
+    // input contribution BIT FOR BIT. That is the assertion the two-pass feed
+    // exists for: the guard scales its own scratch row, so the input rows are
+    // summed identically whether it has tripped or not.
+    bool tailIdentical = true;
+    for (size_t b = guarded.size() - 10; b < guarded.size(); ++b)
+        for (size_t i = 0; i < guarded[b].size(); ++i)
+            if (! bitEqualFloat (guarded[b][i], reference[b][i]))
+                tailIdentical = false;
+    CHECK (tailIdentical);
+}
+
+//==============================================================================
+// The non-finite guard, on the one shape the chain's own guards cannot see.
+//==============================================================================
+
+static void testEffectsEngineScansWholeReturnBlock()
+{
+    using namespace engine_test;
+
+    Rig rig (1, 1, 64);
+    rig.config.moduleFactory = &nanFactory;
+    rig.level (0, 0, 1.0f);
+    CHECK (rig.prepare());
+
+    EffectChannelParams p;
+    p.trem.bypass = 0;
+    p.revision = 1;
+    rig.core.publishChannelParams (0, p);
+
+    const auto in = module_test::awkwardBlock (64, 17);
+
+    for (int b = 0; b < 4; ++b)
+    {
+        rig.callbackOn (0, in.data());
+
+        // Silence rather than a NaN on its way to a speaker, every block.
+        for (int i = 0; i < 64; ++i)
+            CHECK (std::isfinite (rig.popped[0][(size_t) i]));
+    }
+
+    CHECK (rig.core.getNanTrips (0) >= 1);
+    CHECK (isSilent (rig.popped[0]));
+}
+
+//==============================================================================
+// The thread wrapper. Bounded by an iteration count AND a clock, so it cannot
+// hang whatever the scheduler does.
+//
+// Two of its assertions ARE timings, and deliberately: a test that never checks
+// the driver ran would pass for an engine whose thread does nothing. sawAudio
+// and a batch count above zero need the driver to be scheduled inside five
+// seconds against a one-millisecond callback, which is a machine problem rather
+// than a failure if it ever fires. Everything else here - the join, the flag,
+// the silent pull afterwards - holds unconditionally.
+//==============================================================================
+
+static void testEffectsEngineThreadedSmoke()
+{
+    using namespace engine_test;
+    using Clock = std::chrono::steady_clock;
+
+    const int block = 128;
+    const int nIn = 2, nFx = 4;
+    const int nSrc = nIn + nFx;
+    const int firstFx = nIn;
+
+    std::vector<std::unique_ptr<srt::SharedInputRingBuffer>> rings;
+    for (int i = 0; i < nSrc; ++i)
+    {
+        auto r = std::make_unique<srt::SharedInputRingBuffer>();
+        r->setSize (block * 8);
+        rings.push_back (std::move (r));
+    }
+
+    std::vector<float> levels ((size_t) (nSrc * nFx), 0.0f);
+    for (int src = 0; src < nIn; ++src)
+        for (int fx = 0; fx < nFx; ++fx)
+            levels[(size_t) (src * nFx + fx)] = 0.5f;
+
+    EffectsEngine engine;
+    EffectsEngineCore::Config config;
+    config.sampleRate = 48000.0;
+    config.blockSize = block;
+    config.numSources = nSrc;
+    config.numEffects = nFx;
+    config.matrixStride = nFx;
+    config.firstEffectSourceRow = firstFx;
+    config.workerThreads = 2;
+    config.maxFeedDelaySeconds = 0.05;
+    config.maxEffectDelaySeconds = 0.25;
+    config.moduleFactory = nullptr;
+
+    CHECK (engine.prepare (config, rings));
+    engine.setFeedMatrices (nullptr, levels.data(), nullptr, nFx, nSrc, nFx);
+    CHECK (engine.isReady());
+    CHECK (engine.startThread());
+
+    std::vector<std::vector<float>> popped ((size_t) nFx, std::vector<float> ((size_t) block, 0.0f));
+    const auto input = module_test::awkwardBlock (block, 23);
+
+    bool sawAudio = false;
+    int callbacks = 0;
+    const auto deadline = Clock::now() + std::chrono::seconds (5);
+
+    // Keeps going until the driver has actually been seen, so the assertion
+    // below fails for a broken engine rather than for a busy runner, and stops
+    // at the deadline either way.
+    while (Clock::now() < deadline && (callbacks < 200 || ! sawAudio))
+    {
+        for (int fx = 0; fx < nFx; ++fx)
+        {
+            engine.pullReturn (fx, popped[(size_t) fx].data(), block);
+            if (! isSilent (popped[(size_t) fx]))
+                sawAudio = true;
+        }
+
+        for (int i = 0; i < nIn; ++i)
+            rings[(size_t) i]->write (input.data(), block);
+
+        for (int fx = 0; fx < nFx; ++fx)
+            rings[(size_t) (firstFx + fx)]->write (popped[(size_t) fx].data(), block);
+
+        engine.notifyInputAvailable();
+        ++callbacks;
+
+        std::this_thread::sleep_for (std::chrono::milliseconds (1));
+    }
+
+    CHECK (callbacks > 0);
+    CHECK (sawAudio);                                     // the driver really ran
+    CHECK (engine.getBatchCount() > 0);
+
+    for (int fx = 0; fx < nFx; ++fx)
+        CHECK (engine.getCore().getNanTrips (fx) == 0);
+
+    // Teardown under a live puller: the thread joins, the flag drops, and a
+    // pull afterwards is silence rather than a crash.
+    engine.release();
+    CHECK (! engine.isThreadRunning());
+    CHECK (! engine.isReady());
+
+    std::vector<float> out ((size_t) block, 7.0f);
+    CHECK (! engine.pullReturn (0, out.data(), block));
+    CHECK (isSilent (out));
+}
+
 static void testStereoPassThroughIdentity()
 {
     using namespace spatcore::dsp;
@@ -10230,6 +12079,36 @@ int main()
         testChainLatencySum();
         testChainBypassAndMute();
         testChainNeutralAndGuarded();
+        testLoopGuardTripTimeIsBlockSizeIndependent();
+        testLoopGuardRampToZeroIsMonotonic();
+        testLoopGuardDipBelowCeilingNeverTrips();
+        testLoopGuardReleasesAndRampsBack();
+        testLoopGuardReleaseWaitsForSilence();
+        testLoopGuardHotReturnDelaysRelease();
+        testLoopGuardHotReturnVetoIsBounded();
+        testLoopGuardRetripsOnTheWayBack();
+        testLoopGuardRepeatTripBacksOffTheRelease();
+        testLoopGuardIdleIsFreeAndTransparent();
+        testLoopGuardSwitchedOffIsInert();
+        testLoopGuardZeroHysteresisHasNoDeadBand();
+        testLoopGuardNonFinitePeakTripsAndHolds();
+        testEffectsEngineBlockLedger();
+        testEffectsEngineWorkerDeterminism();
+        testEffectsEngineBacklogSkip();
+        testEffectsEngineRingWrapResync();
+        testEffectsEngineShortFeedHistory();
+        testEffectsEngineRefusesUndersizedRing();
+        testEffectsEngineUnroutedChannelsStillRun();
+        testEffectsEngineNarrowStrideDoesNotAlias();
+        testEffectsEngineMuteKeepsChainsRunning();
+        testEffectsEngineLoopGuardSwitch();
+        testEffectsEngineReadyGate();
+        testEffectsEnginePullDuringRebuild();
+        testEffectsEngineRequestClear();
+        testEffectsEngineClearAllWipesHistory();
+        testEffectsEngineLoopGuardSparesInputRows();
+        testEffectsEngineScansWholeReturnBlock();
+        testEffectsEngineThreadedSmoke();
         testDistortionBypassAndIdentity();
         testDistortionShaperLaw();
         testDistortionShelves();
