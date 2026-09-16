@@ -85,6 +85,11 @@
 #include "reverb/ReverbFeedThread.h"
 #include "reverb/ReverbReturnProcessor.h"
 
+// effects/ - the per-channel effects chain: contract first, then the modules
+#include "effects/EffectsTypes.h"
+#include "effects/EffectParams.h"
+#include "effects/EffectModule.h"
+
 // gpu/ - host-facing surface (interfaces, device manager, plugin factory,
 // pipeline, host state/configs, compile-time backend selectors)
 #include "gpu/GpuBackendInterface.h"
@@ -119,6 +124,11 @@
 // compensation bank matches). It also gives the archive real, non-inline
 // symbols on top of the anchor below.
 template class spatcore::dsp::MultiChannelEQBank<6>;
+
+// Same reasoning for the parameter hand-off: instantiating it here compiles
+// every member against the payload it will actually carry, and proves the
+// POD static_assert against the real EffectChannelParams rather than a stub.
+template class spatcore::rt::RtTripleBuffer<spatcore::effects::EffectChannelParams>;
 
 namespace spatcore
 {

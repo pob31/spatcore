@@ -66,6 +66,13 @@
                                  keyed-noise determinism), FractionalDelayLine
                                  (the direct path's interpolation, to the bit),
                                  DcBlocker, EnvelopeFollower, Waveshaper curves
+     15. effects/ contract       the chain-order parser (strict about exactly the
+                                 11 tokens), the parameter PODs and their
+                                 defaults, and ModuleSlot: a settled slot does no
+                                 arithmetic in either direction, a module that
+                                 fades to silence is reset exactly once, a
+                                 variant change waits for silence and cancels
+                                 cleanly, and a non-finite sample is caught
 */
 
 // OSCParser.h / OSCSerializer.h use juce::OSC* types but (verbatim-moved,
@@ -92,6 +99,9 @@
 #include "spatcore/dsp/DcBlocker.h"
 #include "spatcore/dsp/EnvelopeFollower.h"
 #include "spatcore/dsp/Waveshaper.h"
+#include "spatcore/effects/EffectsTypes.h"
+#include "spatcore/effects/EffectParams.h"
+#include "spatcore/effects/EffectModule.h"
 #include "spatcore/dsp/AcousticTap.h"
 #include "spatcore/reverb/ReverbReturnProcessor.h"
 #include "spatcore/reverb/ReverbSendMatrix.h"
@@ -128,6 +138,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -908,6 +919,375 @@ static void testWaveshaperCurves()
         const float downB = ws::blend (-0.5f, 1.0f, 0.3f, tb);
         CHECK (std::fabs (upB + downB) > 1.0e-3f);
     }
+}
+
+//==============================================================================
+// effects/ - the contract every module and chain is built on.
+//==============================================================================
+
+static void testChainOrderParse()
+{
+    using namespace spatcore::effects;
+
+    ChainOrder order {};
+
+    // The canonical order, and one that reverses it, with whitespace the app's
+    // text field will let through.
+    CHECK (parseChainOrder ("dist,eq1,eq2,dyn1,dyn2,mod,phaser,trem,reverb,delay,crush", order));
+    CHECK (order == kDefaultOrder);
+
+    CHECK (parseChainOrder (" crush , delay ,\treverb,trem,phaser,mod,dyn2,dyn1,eq2,eq1,dist ", order));
+    for (int i = 0; i < kNumModuleSlots; ++i)
+        CHECK (order[(size_t) i] == (std::uint8_t) (kNumModuleSlots - 1 - i));
+
+    CHECK (parseChainOrder ("DIST,Eq1,eQ2,DYN1,dyn2,MOD,Phaser,TREM,reverb,DELAY,Crush", order));
+    CHECK (order == kDefaultOrder);
+
+    // Everything else is refused, and - the part that matters live - a refused
+    // string leaves the caller's order untouched, so a typo cannot silently
+    // reorder a running chain.
+    const ChainOrder sentinel { 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9 };
+    const char* bad[] =
+    {
+        "dist,dist,eq2,dyn1,dyn2,mod,phaser,trem,reverb,delay,crush",   // duplicate
+        "dist,eq1,eq2,dyn1,dyn2,mod,phaser,trem,reverb,delay",          // one short
+        "dist,eq1,eq2,dyn1,dyn2,mod,phaser,trem,reverb,delay,crush,eq1",// one too many
+        "dist,eq3,eq2,dyn1,dyn2,mod,phaser,trem,reverb,delay,crush",    // unknown
+        "dist,eq1,eq2,dyn1,dyn2,mod,phaser,trem,reverb,delay,crush,",   // trailing comma
+        "dist,,eq2,dyn1,dyn2,mod,phaser,trem,reverb,delay,crush",       // empty token
+        "dist eq1,eq2,dyn1,dyn2,mod,phaser,trem,reverb,delay,crush",    // missing comma
+        "",
+        "   "
+    };
+
+    for (const char* csv : bad)
+    {
+        ChainOrder out = sentinel;
+        CHECK (! parseChainOrder (csv, out));
+        CHECK (out == sentinel);
+    }
+
+    ChainOrder nullOut = sentinel;
+    CHECK (! parseChainOrder (nullptr, nullOut));
+    CHECK (nullOut == sentinel);
+
+    // The cooked form has the same rule.
+    CHECK (isValidChainOrder (kDefaultOrder));
+    ChainOrder duplicated = kDefaultOrder;
+    duplicated[3] = duplicated[4];
+    CHECK (! isValidChainOrder (duplicated));
+    ChainOrder outOfRange = kDefaultOrder;
+    outOfRange[0] = kNumModuleSlots;
+    CHECK (! isValidChainOrder (outOfRange));
+
+    // Every slot token is distinct and non-empty - the parser's uniqueness
+    // assumption, and the wire's.
+    for (int i = 0; i < kNumModuleSlots; ++i)
+    {
+        CHECK (kSlots[i].token != nullptr && kSlots[i].token[0] != '\0');
+        for (int j = i + 1; j < kNumModuleSlots; ++j)
+            CHECK (std::strcmp (kSlots[i].token, kSlots[j].token) != 0);
+    }
+}
+
+static void testEffectParamsPod()
+{
+    using namespace spatcore::effects;
+
+    EffectChannelParams p;
+
+    // Every module starts bypassed: a new effects channel is transparent until
+    // somebody asks for something.
+    CHECK (p.dist.bypass == 1);
+    CHECK (p.eq[0].bypass == 1 && p.eq[1].bypass == 1);
+    CHECK (p.dyn[0].bypass == 1 && p.dyn[1].bypass == 1);
+    CHECK (p.mod.bypass == 1);
+    CHECK (p.phaser.bypass == 1);
+    CHECK (p.trem.bypass == 1);
+    CHECK (p.reverb.bypass == 1);
+    CHECK (p.delay.bypass == 1);
+    CHECK (p.crush.bypass == 1);
+
+    CHECK (p.mute == 0);
+    CHECK (p.chainBypass == 0);
+    CHECK (p.revision == 0);
+    CHECK (p.inputTrimLin == 1.0f);
+    CHECK (p.order == kDefaultOrder);
+
+    // Spot-check the tables that are easy to mistype.
+    CHECK (p.eq[1].shape[0] == 1 && p.eq[1].shape[4] == 5 && p.eq[1].shape[5] == 6);
+    CHECK (p.eq[0].freqHz[0] == 80.0f && p.eq[0].freqHz[5] == 12000.0f);
+    CHECK (p.eq[0].q[3] == 0.7f);
+    CHECK (p.crush.ditherDb == -96.0f);          // dither OFF by default
+    CHECK (p.crush.bits == 8.0f && p.crush.rateHz == 12000.0f);
+    CHECK (p.trem.depthDb == 12.0f && p.trem.rateHz == 4.0f);
+    CHECK (p.delay.tapTimeMs[0] == 375.0f && p.delay.tapTimeMs[7] == 3000.0f);
+    CHECK (p.delay.tapLevelDb[1] == -2.0f && p.delay.tapLevelDb[7] == -14.0f);
+    CHECK (p.dyn[0].compRatio == 4.0f && p.dyn[0].lookaheadMs == 1.0f);
+    CHECK (p.dyn[0].compDetectorDelayMs == 0.0f);
+    CHECK (p.dist.shape == 0.5f && p.dist.outputDb == -6.0f);
+
+    // It crosses a thread boundary by value, so keep an eye on the size.
+    CHECK (sizeof (EffectChannelParams) < 2048);
+}
+
+//==============================================================================
+// A stand-in module for the slot tests: a gain with counters, taking its bypass
+// and its "variant" from the crusher's real fields so nothing test-only leaks
+// into the parameter structs.
+//==============================================================================
+
+namespace slot_test
+{
+    using namespace spatcore::effects;
+
+    class GainModule : public IEffectModule
+    {
+    public:
+        ModuleId type() const noexcept override { return ModuleId::Crush; }
+
+        void prepare (const ChainConfig& cfg) override
+        {
+            preparedRate = cfg.sampleRate;
+            preparedBlock = cfg.maxBlock;
+        }
+
+        void reset() noexcept override { ++resets; }
+
+        ParamApplyInfo applyParams (const EffectChannelParams& p, int) noexcept override
+        {
+            pendingFilter = p.crush.filter;
+            return { p.crush.bypass != 0, pendingFilter != runningFilter };
+        }
+
+        void commitPendingVariant() noexcept override
+        {
+            runningFilter = pendingFilter;
+            ++commits;
+        }
+
+        void process (float* inout, int n) noexcept override
+        {
+            ++processCalls;
+
+            for (int i = 0; i < n; ++i)
+                inout[i] *= gain;
+
+            if (emitNonFinite != 0)
+                inout[n - 1] = (emitNonFinite == 1)
+                                 ? std::numeric_limits<float>::quiet_NaN()
+                                 : std::numeric_limits<float>::infinity();
+        }
+
+        int getLatencySamples() const noexcept override { return latency; }
+
+        float gain = 0.5f;
+        int latency = 0;
+        int emitNonFinite = 0;          // 0 none, 1 NaN, 2 Inf
+        int resets = 0, commits = 0, processCalls = 0;
+        std::uint8_t runningFilter = 0, pendingFilter = 0;
+        double preparedRate = 0.0;
+        int preparedBlock = 0;
+    };
+
+    struct Rig
+    {
+        ModuleSlot slot;
+        GainModule* module = nullptr;
+        EffectChannelParams params;
+
+        explicit Rig (int maxBlock = 64)
+        {
+            ChainConfig cfg;
+            cfg.sampleRate = 48000.0;
+            cfg.maxBlock = maxBlock;
+
+            auto owned = std::make_unique<GainModule>();
+            module = owned.get();
+            slot.prepare (cfg, std::move (owned));
+        }
+
+        void apply() noexcept { slot.applyParams (params, 0); }
+
+        /** Runs blocks of DC 1.0 and returns the last output sample. */
+        float run (int blocks, int blockSize = 64) noexcept
+        {
+            float last = 0.0f;
+            std::vector<float> buf ((size_t) blockSize);
+
+            for (int b = 0; b < blocks; ++b)
+            {
+                std::fill (buf.begin(), buf.end(), 1.0f);
+                slot.process (buf.data(), blockSize);
+                last = buf[(size_t) blockSize - 1];
+            }
+
+            return last;
+        }
+    };
+}
+
+static void testModuleSlotBypassFade()
+{
+    using namespace spatcore::effects;
+    slot_test::Rig rig;
+
+    CHECK (rig.module->preparedRate == 48000.0);
+    CHECK (rig.module->preparedBlock == 64);
+
+    // A slot starts bypassed and SETTLED, so the buffer is not touched at all -
+    // not multiplied by one, not crossfaded against itself.
+    CHECK (rig.slot.isBypassedSettled());
+    CHECK (rig.run (4) == 1.0f);
+    CHECK (rig.module->processCalls == 0);
+
+    // Switch the module on: the fade is monotonic and hits 63 % after one tau
+    // (5 ms = 240 samples at 48 kHz).
+    rig.params.crush.bypass = 0;
+    rig.apply();
+
+    // Exactly one tau of audio, handed over in a single call so the slot's
+    // internal chunking at maxBlock is exercised at the same time.
+    float previous = 1.0f;
+    bool monotonic = true;
+    std::vector<float> buf (240, 1.0f);
+    rig.slot.process (buf.data(), 240);
+    for (int i = 0; i < 240; ++i)
+    {
+        if (buf[(size_t) i] > previous)              // gain 0.5: output FALLS as g rises
+            monotonic = false;
+        previous = buf[(size_t) i];
+    }
+    CHECK (monotonic);
+    CHECK (std::fabs (rig.slot.getFadeGain() - 0.6321f) < 0.01f);
+    CHECK (! rig.slot.isActiveSettled());
+
+    // Settled, the module's output goes through untouched: exactly 0.5, not
+    // 0.5 plus a crossfade rounding.
+    rig.run (40);
+    CHECK (rig.slot.isActiveSettled());
+    CHECK (rig.run (2) == 0.5f);
+
+    const int resetsBeforeBypass = rig.module->resets;
+
+    // And back. Fading out resets the module exactly once, at silence.
+    rig.params.crush.bypass = 1;
+    rig.apply();
+    rig.run (40);
+    CHECK (rig.slot.isBypassedSettled());
+    CHECK (rig.run (2) == 1.0f);
+    CHECK (rig.slot.silentResets.load() == 1);
+    CHECK (rig.module->resets == resetsBeforeBypass + 1);
+
+    // Bypassed and settled again, the module is skipped entirely.
+    const int callsBefore = rig.module->processCalls;
+    rig.run (4);
+    CHECK (rig.module->processCalls == callsBefore);
+
+    // A bypass revoked mid-fade just turns the fade around - no reset.
+    rig.params.crush.bypass = 0;
+    rig.apply();
+    rig.run (2);
+    const int resetsMidFade = rig.module->resets;
+    rig.params.crush.bypass = 1;
+    rig.apply();
+    rig.run (1);
+    rig.params.crush.bypass = 0;
+    rig.apply();
+    rig.run (40);
+    CHECK (rig.slot.isActiveSettled());
+    CHECK (rig.module->resets == resetsMidFade);
+}
+
+static void testModuleSlotVariantSwitch()
+{
+    using namespace spatcore::effects;
+    slot_test::Rig rig;
+
+    // Get it running and settled.
+    rig.params.crush.bypass = 0;
+    rig.apply();
+    rig.run (40);
+    CHECK (rig.slot.isActiveSettled());
+    CHECK (rig.module->commits == 0);
+
+    // A change that cannot be interpolated: the module keeps running the old
+    // value while the slot fades out, and the swap happens in silence.
+    rig.params.crush.filter = 1;
+    rig.apply();
+    CHECK (rig.module->runningFilter == 0);       // still the old one
+    CHECK (! rig.slot.isBypassedSettled());
+
+    rig.run (40);
+    CHECK (rig.module->commits == 1);
+    CHECK (rig.module->runningFilter == 1);
+
+    // ...and it comes straight back up, because bypass was never asked for.
+    rig.run (40);
+    CHECK (rig.slot.isActiveSettled());
+    CHECK (rig.run (2) == 0.5f);
+
+    // A change taken back before the fade completes cancels: no commit, no
+    // reset, no audible dip to the bottom.
+    const int commitsBefore = rig.module->commits;
+    const int resetsBefore = rig.module->resets;
+    rig.params.crush.filter = 0;
+    rig.apply();
+    rig.run (2);
+    CHECK (! rig.slot.isBypassedSettled());
+    rig.params.crush.filter = 1;                  // back to what is running
+    rig.apply();
+    rig.run (40);
+    CHECK (rig.slot.isActiveSettled());
+    CHECK (rig.module->commits == commitsBefore);
+    CHECK (rig.module->resets == resetsBefore);
+
+    // A variant change while the slot is already bypassed and silent is taken
+    // immediately - there is nothing to fade.
+    rig.params.crush.bypass = 1;
+    rig.apply();
+    rig.run (40);
+    CHECK (rig.slot.isBypassedSettled());
+    rig.params.crush.filter = 0;
+    rig.apply();
+    rig.run (2);
+    CHECK (rig.module->runningFilter == 0);
+}
+
+static void testNaNGuard()
+{
+    using namespace spatcore::effects;
+    slot_test::Rig rig;
+
+    rig.params.crush.bypass = 0;
+    rig.apply();
+    rig.run (40);
+    CHECK (rig.slot.isActiveSettled());
+
+    // A module that goes bad is silenced and reset, not passed on: a NaN
+    // reaching the return ring would spread through the whole render.
+    const int resetsBefore = rig.module->resets;
+    rig.module->emitNonFinite = 1;
+
+    std::vector<float> buf (64, 1.0f);
+    rig.slot.process (buf.data(), 64);
+    for (int i = 0; i < 64; ++i)
+        CHECK (buf[(size_t) i] == 0.0f);
+    CHECK (rig.slot.nanTrips.load() == 1);
+    CHECK (rig.module->resets == resetsBefore + 1);
+
+    // Recovered: the next clean block passes normally and nothing re-trips.
+    rig.module->emitNonFinite = 0;
+    CHECK (rig.run (1) == 0.5f);
+    CHECK (rig.slot.nanTrips.load() == 1);
+
+    // Infinity counts too.
+    rig.module->emitNonFinite = 2;
+    std::fill (buf.begin(), buf.end(), 1.0f);
+    rig.slot.process (buf.data(), 64);
+    for (int i = 0; i < 64; ++i)
+        CHECK (buf[(size_t) i] == 0.0f);
+    CHECK (rig.slot.nanTrips.load() == 2);
 }
 
 static void testOscRoundtrip()
@@ -4321,6 +4701,11 @@ int main()
         testDcBlocker();
         testEnvelopeFollower();
         testWaveshaperCurves();
+        testChainOrderParse();
+        testEffectParamsPod();
+        testModuleSlotBypassFade();
+        testModuleSlotVariantSwitch();
+        testNaNGuard();
         testOscRoundtrip();
         testRtThreadPriority();
         testGpuHostWorkPoolDeterminism();
