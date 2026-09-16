@@ -340,6 +340,16 @@ The CPU DSP path is **hand-rolled per-sample**, not `juce::dsp`.
   fractionally (`InputBufferProcessor.h:515-518`); output engine scatter-writes into two adjacent
   cells (`OutputBufferProcessor.h:522-524`). Both taps modulo-wrapped (`InputBufferProcessor.h:511-512`).
   Coefficients computed, not tabulated. Delays clamped to buffer length. **[V]**
+- **Shared primitives added for the effects channels** (2026-09, spatcore-only so far).
+  `dsp/AcousticSendMatrix.h` is the reverb send matrix promoted for reuse (`reverb/ReverbSendMatrix.h`
+  is now an alias). `dsp/FractionalDelayLine.h` is a pow2 ring running the SAME 2-tap floor-convention
+  read as the direct path above, so a module and a send never disagree about where a sample is.
+  `DcBlocker` (R = 1 − 2π·5/sr, with an end-of-block flush to true zero), `OnePoleSmoother`
+  (`1 − exp(−1/(τ·sr))` plus a snap — a float one-pole otherwise freezes short of its target
+  forever), `LfoPhasor` (double phase over `LFOWaveforms`, hash-keyed Random), `EnvelopeFollower`
+  (peak/RMS, attack and release), `Waveshaper` curves, and `FastDecibels` — libm-free log2/exp2, so a
+  render hashed on one platform matches another. `rt/RtTripleBuffer.h` is the wait-free parameter
+  hand-off (`RtSnapshot` holds a SpinLock on both sides). **[V]**
 - **Prefilter — the headline divergence.** There is **no √(jω) / +3 dB-per-octave WFS
   field-correction filter (FIR or IIR) anywhere in `Source/`** (independently re-grepped: all
   "pre-filter" hits are the Floor-Reflection chain). The only per-tap spectral shaping is a

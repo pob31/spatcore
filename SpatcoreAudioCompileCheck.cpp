@@ -47,8 +47,11 @@
 #include "dsp/AcousticSendMatrix.h"
 #include "dsp/BiquadResponse.h"
 #include "dsp/DelayTargetSmoother.h"
+#include "dsp/DcBlocker.h"
 #include "dsp/FastDecibels.h"
+#include "dsp/FractionalDelayLine.h"
 #include "dsp/FrDiffusionModel.h"
+#include "dsp/EnvelopeFollower.h"
 #include "dsp/InputSpeedLimiter.h"
 #include "dsp/LFOWaveforms.h"
 #include "dsp/LfoPhasor.h"
@@ -64,6 +67,7 @@
 #include "dsp/TrackingPositionFilter.h"
 #include "dsp/WFSBiquadFilter.h"
 #include "dsp/WFSHighShelfFilter.h"
+#include "dsp/Waveshaper.h"
 
 // wfs/ - CPU delay-sum processors + native-GPU renderer wrappers
 #include "wfs/InputBufferAlgorithm.h"

@@ -63,7 +63,9 @@
                                  its target), FastDecibels (libm-free dB <-> gain:
                                  accuracy, saturation and the values that must be
                                  EXACT), LfoPhasor (phase wrap, shape values,
-                                 keyed-noise determinism)
+                                 keyed-noise determinism), FractionalDelayLine
+                                 (the direct path's interpolation, to the bit),
+                                 DcBlocker, EnvelopeFollower, Waveshaper curves
 */
 
 // OSCParser.h / OSCSerializer.h use juce::OSC* types but (verbatim-moved,
@@ -86,6 +88,10 @@
 #include "spatcore/dsp/OnePoleSmoother.h"
 #include "spatcore/dsp/FastDecibels.h"
 #include "spatcore/dsp/LfoPhasor.h"
+#include "spatcore/dsp/FractionalDelayLine.h"
+#include "spatcore/dsp/DcBlocker.h"
+#include "spatcore/dsp/EnvelopeFollower.h"
+#include "spatcore/dsp/Waveshaper.h"
 #include "spatcore/dsp/AcousticTap.h"
 #include "spatcore/reverb/ReverbReturnProcessor.h"
 #include "spatcore/reverb/ReverbSendMatrix.h"
@@ -627,6 +633,280 @@ static void testLfoPhasor()
             v1 = v2;
         }
         CHECK (linear);
+    }
+}
+
+static void testFractionalDelayLine()
+{
+    using namespace spatcore::dsp;
+
+    // Sizing: a power-of-two ring with room for the interpolation partner.
+    {
+        FractionalDelayLine d;
+        d.prepare (64);
+        CHECK (d.getLength() == 128);
+        CHECK (d.getMaxDelaySamples() == 126);
+    }
+
+    // An impulse at a half-sample delay splits evenly across two samples -
+    // the property that makes a moving source glide instead of stepping.
+    {
+        FractionalDelayLine d;
+        d.prepare (64);
+
+        float out[40] = {};
+        for (int n = 0; n < 40; ++n)
+        {
+            d.write (n == 0 ? 1.0f : 0.0f);
+            out[n] = d.readLinear (10.5f);
+        }
+
+        CHECK (out[10] == 0.5f);
+        CHECK (out[11] == 0.5f);
+        for (int n = 0; n < 40; ++n)
+            if (n != 10 && n != 11)
+                CHECK (out[n] == 0.0f);
+    }
+
+    // A whole-sample delay is exact, and delay 0 is the sample just written.
+    {
+        FractionalDelayLine d;
+        d.prepare (64);
+
+        float out[40] = {};
+        for (int n = 0; n < 40; ++n)
+        {
+            d.write (n == 0 ? 1.0f : 0.0f);
+            out[n] = d.readLinear (10.0f);
+        }
+        CHECK (out[10] == 1.0f);
+        CHECK (out[9] == 0.0f);
+        CHECK (out[11] == 0.0f);
+
+        d.reset();
+        d.write (0.75f);
+        CHECK (d.readLinear (0.0f) == 0.75f);
+        CHECK (d.readInteger (0) == 0.75f);
+    }
+
+    // Reading across the wrap is the same as reading anywhere else.
+    {
+        FractionalDelayLine d;
+        d.prepare (64);
+        for (int n = 0; n < 300; ++n)
+            d.write (0.001f * (float) n);
+        CHECK (std::fabs (d.readLinear (100.0f) - 0.001f * 199.0f) < 1.0e-6f);
+    }
+
+    // The mask is only legitimate if it agrees with a modulo reference on every
+    // index, so check it against one over a long hash-driven trajectory.
+    {
+        FractionalDelayLine d;
+        d.prepare (256);
+        const int length = d.getLength();
+        std::vector<float> reference ((size_t) length, 0.0f);
+        int refWrite = 0;
+        bool identical = true;
+
+        for (int n = 0; n < 1000; ++n)
+        {
+            const float x = FrDiffusion::hashNoiseBipolar ((std::uint32_t) n, 4242u);
+            d.write (x);
+            reference[(size_t) refWrite] = x;
+            refWrite = (refWrite + 1) % length;
+
+            const float delay = 0.5f * (float) ((n * 37) % 250);
+
+            // The same arithmetic as InputBufferProcessor's read, with modulo.
+            float pos = (float) (refWrite - 1) - delay;
+            while (pos < 0.0f)
+                pos += (float) length;
+            const int p1 = (int) pos % length;
+            const int p2 = (p1 + 1) % length;
+            const float frac = pos - (float) (int) pos;
+            const float expected = reference[(size_t) p1]
+                                 + frac * (reference[(size_t) p2] - reference[(size_t) p1]);
+
+            if (! bitEqualFloat (d.readLinear (delay), expected))
+                identical = false;
+        }
+        CHECK (identical);
+    }
+
+    // Out-of-range asks clamp instead of reading out of bounds.
+    {
+        FractionalDelayLine d;
+        d.prepare (32);
+        for (int n = 0; n < 100; ++n)
+            d.write (0.5f);
+        CHECK (std::fabs (d.readLinear (-5.0f) - 0.5f) < 1.0e-6f);
+        CHECK (std::fabs (d.readLinear (1.0e9f) - 0.5f) < 1.0e-6f);
+        CHECK (std::fabs (d.readLinear (std::numeric_limits<float>::quiet_NaN()) - 0.5f) < 1.0e-6f);
+    }
+}
+
+static void testDcBlocker()
+{
+    using namespace spatcore::dsp;
+
+    // DC goes away...
+    {
+        DcBlocker b;
+        b.prepare (48000.0, 5.0f);
+        float y = 0.0f;
+        for (int i = 0; i < 24000; ++i)
+            y = b.processSample (1.0f);
+        CHECK (std::fabs (y) < 1.0e-4f);
+    }
+
+    // ...and audio does not. A 1 kHz tone is untouched to within a fraction of
+    // a percent (a cutoff of 5 Hz is three decades below it).
+    {
+        DcBlocker b;
+        b.prepare (48000.0, 5.0f);
+        float peak = 0.0f;
+        for (int i = 0; i < 48000; ++i)
+        {
+            const float x = std::sin (6.2831853f * 1000.0f * (float) i / 48000.0f);
+            const float y = b.processSample (x);
+            if (i > 4800 && std::fabs (y) > peak)
+                peak = std::fabs (y);
+        }
+        CHECK (peak > 0.99f);
+        CHECK (peak < 1.001f);
+    }
+
+    // reset() really clears the recursion, and a decayed tail parks at true
+    // zero rather than in denormal territory.
+    {
+        DcBlocker b;
+        b.prepare (48000.0);
+        for (int i = 0; i < 1000; ++i)
+            b.processSample (1.0f);
+        b.reset();
+        CHECK (b.processSample (0.0f) == 0.0f);
+
+        for (int i = 0; i < 100; ++i)
+            b.processSample (1.0f);
+        std::vector<float> silence (256, 0.0f);
+        for (int block = 0; block < 400; ++block)
+        {
+            std::fill (silence.begin(), silence.end(), 0.0f);   // processBlock is IN PLACE
+            b.processBlock (silence.data(), 256);
+        }
+        CHECK (b.processSample (0.0f) == 0.0f);
+    }
+}
+
+static void testEnvelopeFollower()
+{
+    using namespace spatcore::dsp;
+
+    // Peak, instant attack: one sample to the top, then an exponential decay
+    // with the release as its time constant.
+    {
+        EnvelopeFollower e;
+        e.prepare (48000.0);
+        e.setMode (EnvelopeFollower::Mode::Peak);
+        e.setTimes (0.0f, 100.0f);
+
+        CHECK (e.processSample (1.0f) == 1.0f);
+        for (int i = 0; i < 4800; ++i)
+            e.processSample (0.0f);
+        CHECK (std::fabs (e.getValue() - 0.36788f) < 2.0e-3f);
+    }
+
+    // A real attack time is a time constant too.
+    {
+        EnvelopeFollower e;
+        e.prepare (48000.0);
+        e.setTimes (10.0f, 100.0f);
+        for (int i = 0; i < 480; ++i)
+            e.processSample (1.0f);
+        CHECK (std::fabs (e.getValue() - 0.63212f) < 2.0e-3f);
+    }
+
+    // Rms mode follows the mean square; getRms and getDb undo that for you.
+    {
+        EnvelopeFollower e;
+        e.prepare (48000.0);
+        e.setMode (EnvelopeFollower::Mode::Rms);
+        e.setTimes (1.0f, 1.0f);
+        for (int i = 0; i < 48000; ++i)
+            e.processSample (0.5f);
+
+        CHECK (std::fabs (e.getValue() - 0.25f) < 1.0e-5f);
+        CHECK (std::fabs (e.getRms() - 0.5f) < 1.0e-5f);
+        CHECK (std::fabs (e.getDb() + 6.0206f) < 1.0e-2f);
+    }
+
+    // A block run agrees with the per-sample path, and reset clears it.
+    {
+        EnvelopeFollower a, b;
+        a.prepare (48000.0);
+        b.prepare (48000.0);
+        a.setTimes (5.0f, 50.0f);
+        b.setTimes (5.0f, 50.0f);
+
+        std::vector<float> data (512);
+        for (int i = 0; i < 512; ++i)
+            data[(size_t) i] = FrDiffusion::hashNoiseBipolar ((std::uint32_t) i, 77u);
+
+        for (int i = 0; i < 512; ++i)
+            a.processSample (data[(size_t) i]);
+        b.processBlock (data.data(), 512);
+        CHECK (bitEqualFloat (a.getValue(), b.getValue()));
+
+        a.reset();
+        CHECK (a.getValue() == 0.0f);
+    }
+}
+
+static void testWaveshaperCurves()
+{
+    using namespace spatcore::dsp;
+    namespace ws = spatcore::dsp::Waveshaper;
+
+    CHECK (ws::hardClip (0.5f) == 0.5f);
+    CHECK (ws::hardClip (2.0f) == 0.8f);
+    CHECK (ws::hardClip (-2.0f) == -0.8f);
+    CHECK (ws::hardClip (2.0f, 1.0f) == 1.0f);
+
+    // Whatever the blend, silence in is silence out - so a bias adds harmonics
+    // without adding DC.
+    for (float shape : { 0.0f, 0.5f, 1.0f })
+    {
+        CHECK (ws::blend (0.0f, shape, 0.0f, 0.0f) == 0.0f);
+        CHECK (std::fabs (ws::blend (0.0f, shape, 0.3f, std::tanh (0.3f))) < 1.0e-7f);
+    }
+
+    // Monotonic across the range (a shaper that folded back would buzz).
+    for (float shape : { 0.0f, 0.5f, 1.0f })
+    {
+        float previous = ws::blend (-3.0f, shape, 0.0f, 0.0f);
+        bool monotonic = true;
+        for (int i = 1; i <= 600; ++i)
+        {
+            const float x = -3.0f + 0.01f * (float) i;
+            const float v = ws::blend (x, shape, 0.0f, 0.0f);
+            if (v < previous - 1.0e-7f)
+                monotonic = false;
+            previous = v;
+        }
+        CHECK (monotonic);
+    }
+
+    // No bias: odd symmetry (odd harmonics only). With bias: asymmetry, which
+    // is where the even harmonics come from.
+    {
+        const float up = ws::blend (0.5f, 1.0f, 0.0f, 0.0f);
+        const float down = ws::blend (-0.5f, 1.0f, 0.0f, 0.0f);
+        CHECK (std::fabs (up + down) < 1.0e-6f);
+
+        const float tb = std::tanh (0.3f);
+        const float upB = ws::blend (0.5f, 1.0f, 0.3f, tb);
+        const float downB = ws::blend (-0.5f, 1.0f, 0.3f, tb);
+        CHECK (std::fabs (upB + downB) > 1.0e-3f);
     }
 }
 
@@ -4037,6 +4317,10 @@ int main()
         testOnePoleSmoother();
         testFastDecibels();
         testLfoPhasor();
+        testFractionalDelayLine();
+        testDcBlocker();
+        testEnvelopeFollower();
+        testWaveshaperCurves();
         testOscRoundtrip();
         testRtThreadPriority();
         testGpuHostWorkPoolDeterminism();
