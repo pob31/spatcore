@@ -73,6 +73,12 @@
                                  fades to silence is reset exactly once, a
                                  variant change waits for silence and cancels
                                  cleanly, and a non-finite sample is caught
+     16. effects/modules        Tremolo (the prototype's dB-linear law, with the
+                                 two waveform legs phase-ALIGNED), Bitcrusher
+                                 (exact quantiser steps, full-length hold runs,
+                                 keyed dither) and the EQ (bit-identical to the
+                                 output EQ bank it wraps); plus every module
+                                 bit-transparent when bypassed and at identity
 */
 
 // OSCParser.h / OSCSerializer.h use juce::OSC* types but (verbatim-moved,
@@ -102,6 +108,9 @@
 #include "spatcore/effects/EffectsTypes.h"
 #include "spatcore/effects/EffectParams.h"
 #include "spatcore/effects/EffectModule.h"
+#include "spatcore/effects/modules/TremoloModule.h"
+#include "spatcore/effects/modules/BitcrusherModule.h"
+#include "spatcore/effects/modules/EffectEQModule.h"
 #include "spatcore/dsp/AcousticTap.h"
 #include "spatcore/reverb/ReverbReturnProcessor.h"
 #include "spatcore/reverb/ReverbSendMatrix.h"
@@ -4573,6 +4582,531 @@ static void testAcousticSendMatrixAlias()
         CHECK (bitEqualFloat (feed[(size_t) i], in.getSample (0, i) * 0.5f));
 }
 
+//==============================================================================
+// effects/modules - the three shipped in this release.
+//==============================================================================
+
+namespace module_test
+{
+    using namespace spatcore::effects;
+
+    inline ChainConfig config (double sr = 48000.0, int maxBlock = 512, std::uint32_t key = 1)
+    {
+        ChainConfig cfg;
+        cfg.sampleRate = sr;
+        cfg.maxBlock = maxBlock;
+        cfg.noiseKey = key;
+        return cfg;
+    }
+
+    /** Runs a module directly (no slot, no fade) over one buffer. */
+    inline void render (IEffectModule& m, std::vector<float>& buf)
+    {
+        m.process (buf.data(), (int) buf.size());
+    }
+
+    inline std::vector<float> dc (int n, float value)
+    {
+        return std::vector<float> ((size_t) n, value);
+    }
+
+    inline std::vector<float> awkwardBlock (int n, int seed)
+    {
+        std::vector<float> v ((size_t) n);
+        for (int i = 0; i < n; ++i)
+            v[(size_t) i] = 0.7f * FrDiffusion::hashNoiseBipolar ((std::uint32_t) (i + seed * 1000), 31u);
+        return v;
+    }
+}
+
+static void testTremoloLaw()
+{
+    using namespace spatcore::effects;
+    namespace fd = spatcore::dsp::FastDecibels;
+
+    const int n = 12001;
+
+    // Sine leg. 4 Hz at 48 kHz: phase 0 at sample 0, a quarter at 3000, a half
+    // at 6000, back to the start at 12000.
+    {
+        TremoloModule m;
+        m.prepare (module_test::config());
+        EffectChannelParams p;
+        p.trem.bypass = 0;
+        p.trem.rateHz = 4.0f;
+        p.trem.depthDb = 12.0f;
+        p.trem.shape = 0.0f;
+        p.trem.mix = 100.0f;
+        CHECK (! m.applyParams (p, 0).bypass);
+
+        std::vector<float> buf = module_test::dc (n, 0.5f);
+        module_test::render (m, buf);
+
+        CHECK (buf[0] == 0.5f);                                        // unity at phase 0, exactly
+        CHECK (std::fabs (buf[6000] / 0.5f - fd::dbToGain (-12.0f)) < 1.0e-4f);
+        CHECK (std::fabs (buf[3000] / 0.5f - fd::dbToGain (-6.0f)) < 1.0e-4f);
+        CHECK (std::fabs (buf[12000] - buf[0]) < 1.0e-4f);             // one full cycle
+    }
+
+    // Triangle leg, at the phases that tell the two shapes apart: a triangle is
+    // half way down at an eighth of a cycle, a sine is not. If the legs were a
+    // quarter cycle out of step (the bug this pins), the -6 dB point below would
+    // not land at 3000 at all.
+    {
+        TremoloModule m;
+        m.prepare (module_test::config());
+        EffectChannelParams p;
+        p.trem.bypass = 0;
+        p.trem.rateHz = 4.0f;
+        p.trem.depthDb = 12.0f;
+        p.trem.shape = 1.0f;
+        p.trem.mix = 100.0f;
+        m.applyParams (p, 0);
+
+        std::vector<float> buf = module_test::dc (n, 0.5f);
+        module_test::render (m, buf);
+
+        CHECK (buf[0] == 0.5f);
+        CHECK (std::fabs (buf[3000] / 0.5f - fd::dbToGain (-6.0f)) < 1.0e-4f);
+        CHECK (std::fabs (buf[6000] / 0.5f - fd::dbToGain (-12.0f)) < 1.0e-4f);
+        CHECK (std::fabs (buf[1500] / 0.5f - fd::dbToGain (-3.0f)) < 1.0e-4f);
+    }
+
+    // Mix scales the modulation against the dry signal.
+    {
+        TremoloModule m;
+        m.prepare (module_test::config());
+        EffectChannelParams p;
+        p.trem.bypass = 0;
+        p.trem.rateHz = 4.0f;
+        p.trem.depthDb = 12.0f;
+        p.trem.shape = 0.0f;
+        p.trem.mix = 50.0f;
+        m.applyParams (p, 0);
+
+        std::vector<float> buf = module_test::dc (n, 0.5f);
+        module_test::render (m, buf);
+
+        const float expected = 0.5f * (0.5f + 0.5f * fd::dbToGain (-12.0f));
+        CHECK (std::fabs (buf[6000] - expected) < 1.0e-4f);
+    }
+}
+
+static void testBitcrusherQuantiser()
+{
+    using namespace spatcore::effects;
+
+    // 8 bits is a step of exactly 1/256 - not almost, because 2^bits comes from
+    // an exact power of two.
+    {
+        BitcrusherModule m;
+        m.prepare (module_test::config());
+        EffectChannelParams p;
+        p.crush.bypass = 0;
+        p.crush.bits = 8.0f;
+        p.crush.rateHz = 48000.0f;            // no decimation
+        p.crush.mix = 100.0f;
+        p.crush.ditherDb = -96.0f;            // dither off
+        m.applyParams (p, 0);
+
+        std::vector<float> buf (1001);
+        for (int i = 0; i < 1001; ++i)
+            buf[(size_t) i] = (float) i / 1000.0f - 0.5f;
+        const std::vector<float> input = buf;
+
+        module_test::render (m, buf);
+
+        bool exact = true, integral = true;
+        for (int i = 0; i < 1001; ++i)
+        {
+            const float expected = std::round (input[(size_t) i] * 256.0f) / 256.0f;
+            if (! bitEqualFloat (buf[(size_t) i], expected))
+                exact = false;
+            const float scaled = buf[(size_t) i] * 256.0f;
+            if (scaled != std::round (scaled))
+                integral = false;
+        }
+        CHECK (exact);
+        CHECK (integral);
+    }
+
+    // One bit leaves three levels.
+    {
+        BitcrusherModule m;
+        m.prepare (module_test::config());
+        EffectChannelParams p;
+        p.crush.bypass = 0;
+        p.crush.bits = 1.0f;
+        p.crush.rateHz = 48000.0f;
+        p.crush.mix = 100.0f;
+        m.applyParams (p, 0);
+
+        std::vector<float> buf (1001);
+        for (int i = 0; i < 1001; ++i)
+            buf[(size_t) i] = (float) i / 1000.0f - 0.5f;
+        module_test::render (m, buf);
+
+        bool onlyThree = true;
+        for (int i = 0; i < 1001; ++i)
+        {
+            const float v = buf[(size_t) i];
+            if (v != -0.5f && v != 0.0f && v != 0.5f)
+                onlyThree = false;
+        }
+        CHECK (onlyThree);
+    }
+
+    // Dither is keyed noise: reproducible for a given key, different for
+    // another, and actually doing something.
+    {
+        EffectChannelParams p;
+        p.crush.bypass = 0;
+        p.crush.bits = 8.0f;
+        p.crush.rateHz = 48000.0f;
+        p.crush.mix = 100.0f;
+        p.crush.ditherDb = 0.0f;
+
+        std::vector<float> a = module_test::awkwardBlock (512, 1);
+        std::vector<float> b = a, c = a, plain = a;
+
+        BitcrusherModule ma, mb, mc, mplain;
+        ma.prepare (module_test::config (48000.0, 512, 5));
+        mb.prepare (module_test::config (48000.0, 512, 5));
+        mc.prepare (module_test::config (48000.0, 512, 6));
+        mplain.prepare (module_test::config (48000.0, 512, 5));
+
+        ma.applyParams (p, 0);
+        mb.applyParams (p, 0);
+        mc.applyParams (p, 0);
+
+        EffectChannelParams noDither = p;
+        noDither.crush.ditherDb = -96.0f;
+        mplain.applyParams (noDither, 0);
+
+        module_test::render (ma, a);
+        module_test::render (mb, b);
+        module_test::render (mc, c);
+        module_test::render (mplain, plain);
+
+        CHECK (eqtests::bitEqualBlock (a, b));               // same key, same stream
+
+        int differsFromOtherKey = 0, differsFromUndithered = 0;
+        for (int i = 0; i < 512; ++i)
+        {
+            if (! bitEqualFloat (a[(size_t) i], c[(size_t) i]))
+                ++differsFromOtherKey;
+            if (! bitEqualFloat (a[(size_t) i], plain[(size_t) i]))
+                ++differsFromUndithered;
+        }
+        CHECK (differsFromOtherKey > 100);
+        CHECK (differsFromUndithered > 100);
+    }
+}
+
+static void testBitcrusherHoldRate()
+{
+    using namespace spatcore::effects;
+
+    // 12 kHz holds at 96 kHz: runs of exactly 8 samples, the first starting at
+    // sample 0.
+    {
+        BitcrusherModule m;
+        m.prepare (module_test::config (96000.0));
+        EffectChannelParams p;
+        p.crush.bypass = 0;
+        p.crush.bits = 24.0f;
+        p.crush.rateHz = 12000.0f;
+        p.crush.mix = 100.0f;
+        m.applyParams (p, 0);
+
+        std::vector<float> buf (4096);
+        for (int i = 0; i < 4096; ++i)
+            buf[(size_t) i] = std::sin (6.2831853f * 1000.0f * (float) i / 96000.0f);
+        const std::vector<float> input = buf;
+
+        module_test::render (m, buf);
+
+        const float step = 16777216.0f;             // 2^24
+        bool runsHold = true, runsDiffer = true, firstSampleHeld = true;
+
+        for (int k = 0; k + 8 <= 4096; k += 8)
+        {
+            for (int j = 1; j < 8; ++j)
+                if (! bitEqualFloat (buf[(size_t) (k + j)], buf[(size_t) k]))
+                    runsHold = false;
+
+            const float expected = std::round (input[(size_t) k] * step) / step;
+            if (! bitEqualFloat (buf[(size_t) k], expected))
+                firstSampleHeld = false;
+
+            if (k + 8 < 4096 && bitEqualFloat (buf[(size_t) (k + 8)], buf[(size_t) k]))
+                runsDiffer = false;                 // a 1 kHz tone always moves
+        }
+
+        CHECK (runsHold);
+        CHECK (firstSampleHeld);
+        CHECK (runsDiffer);
+    }
+
+    // At the device rate there is no decimation at all: every sample is its own.
+    {
+        BitcrusherModule m;
+        m.prepare (module_test::config (96000.0));
+        EffectChannelParams p;
+        p.crush.bypass = 0;
+        p.crush.bits = 24.0f;
+        p.crush.rateHz = 96000.0f;
+        p.crush.mix = 100.0f;
+        m.applyParams (p, 0);
+
+        std::vector<float> buf (512);
+        for (int i = 0; i < 512; ++i)
+            buf[(size_t) i] = std::sin (6.2831853f * 1000.0f * (float) i / 96000.0f);
+        const std::vector<float> input = buf;
+
+        module_test::render (m, buf);
+
+        const float step = 16777216.0f;
+        bool perSample = true;
+        for (int i = 0; i < 512; ++i)
+            if (! bitEqualFloat (buf[(size_t) i], std::round (input[(size_t) i] * step) / step))
+                perSample = false;
+        CHECK (perSample);
+    }
+}
+
+static void testEffectEQModuleMatchesBank()
+{
+    using namespace spatcore::effects;
+    using spatcore::dsp::MultiChannelEQBank;
+
+    EffectChannelParams p;
+    p.eq[0].bypass = 0;
+
+    EffectEQModule m;
+    m.prepare (module_test::config());
+    m.applyParams (p, 0);
+
+    MultiChannelEQBank<6> bank;
+    bank.prepare (48000.0, 1);
+    bank.setChannelEnabled (0, true);
+    for (int b = 0; b < 6; ++b)
+        bank.pushBandParameters (0, b, p.eq[0].shape[b], p.eq[0].freqHz[b],
+                                 p.eq[0].gainDb[b], p.eq[0].q[b], p.eq[0].slope[b]);
+
+    // Bit-identical, block after block - including a first block full of
+    // negative zeros and denormals.
+    for (int block = 0; block < 10; ++block)
+    {
+        std::vector<float> a = (block == 0) ? eqtests::makeAwkwardSignal (256)
+                                            : module_test::awkwardBlock (256, block);
+        std::vector<float> b = a;
+
+        m.process (a.data(), 256);
+        bank.processChannel (0, b.data(), 256);
+        CHECK (eqtests::bitEqualBlock (a, b));
+    }
+
+    // A parameter change lands on both the same way.
+    p.eq[0].gainDb[2] = 6.0f;
+    p.eq[0].shape[0] = 3;
+    p.eq[0].freqHz[2] = 900.0f;
+    m.applyParams (p, 0);
+    bank.setChannelEnabled (0, true);
+    for (int b = 0; b < 6; ++b)
+        bank.pushBandParameters (0, b, p.eq[0].shape[b], p.eq[0].freqHz[b],
+                                 p.eq[0].gainDb[b], p.eq[0].q[b], p.eq[0].slope[b]);
+
+    for (int block = 0; block < 4; ++block)
+    {
+        std::vector<float> a = module_test::awkwardBlock (256, 20 + block);
+        std::vector<float> b = a;
+        m.process (a.data(), 256);
+        bank.processChannel (0, b.data(), 256);
+        CHECK (eqtests::bitEqualBlock (a, b));
+    }
+
+    // Every band off is the identity, to the bit.
+    {
+        EffectChannelParams flat;
+        flat.eq[1].bypass = 0;
+        for (int b = 0; b < 6; ++b)
+            flat.eq[1].shape[b] = 0;
+
+        EffectEQModule off;
+        off.prepare (module_test::config());
+        off.applyParams (flat, 1);                  // the SECOND instance
+
+        std::vector<float> a = eqtests::makeAwkwardSignal (256);
+        const std::vector<float> reference = a;
+        off.process (a.data(), 256);
+        CHECK (eqtests::bitEqualBlock (a, reference));
+    }
+}
+
+static void testResetOnFullBypass()
+{
+    using namespace spatcore::effects;
+
+    // A resonant peak rings for a long time. Bypassing the slot must clear that
+    // tail, so switching back on cannot replay a moment from before.
+    ChainConfig cfg = module_test::config (48000.0, 256);
+
+    ModuleSlot slot;
+    slot.prepare (cfg, std::make_unique<EffectEQModule>());
+
+    EffectChannelParams p;
+    p.eq[0].bypass = 0;
+    p.eq[0].shape[2] = 3;                           // peak
+    p.eq[0].freqHz[2] = 1000.0f;
+    p.eq[0].gainDb[2] = 24.0f;
+    p.eq[0].q[2] = 20.0f;
+    slot.applyParams (p, 0);
+
+    std::vector<float> buf (256, 0.0f);
+    buf[0] = 1.0f;                                  // one impulse, then silence
+    slot.process (buf.data(), 256);
+
+    for (int b = 0; b < 40; ++b)                    // let the fade settle in
+    {
+        std::fill (buf.begin(), buf.end(), 0.0f);
+        slot.process (buf.data(), 256);
+    }
+    CHECK (slot.isActiveSettled());
+
+    // Control: the tail is still ringing at this point.
+    {
+        std::fill (buf.begin(), buf.end(), 0.0f);
+        slot.process (buf.data(), 256);
+        float peak = 0.0f;
+        for (int i = 0; i < 256; ++i)
+            peak = std::fabs (buf[(size_t) i]) > peak ? std::fabs (buf[(size_t) i]) : peak;
+        CHECK (peak > 1.0e-6f);
+    }
+
+    p.eq[0].bypass = 1;
+    slot.applyParams (p, 0);
+    for (int b = 0; b < 40; ++b)
+    {
+        std::fill (buf.begin(), buf.end(), 0.0f);
+        slot.process (buf.data(), 256);
+    }
+    CHECK (slot.isBypassedSettled());
+    CHECK (slot.silentResets.load() == 1);
+
+    p.eq[0].bypass = 0;
+    slot.applyParams (p, 0);
+
+    bool silent = true;
+    for (int b = 0; b < 20; ++b)
+    {
+        std::fill (buf.begin(), buf.end(), 0.0f);
+        slot.process (buf.data(), 256);
+        for (int i = 0; i < 256; ++i)
+            if (buf[(size_t) i] != 0.0f)
+                silent = false;
+    }
+    CHECK (silent);
+}
+
+static void testEffectModulesNeutralAtDefaults()
+{
+    using namespace spatcore::effects;
+
+    ChainConfig cfg = module_test::config (48000.0, 256);
+    const EffectChannelParams defaults;              // every module bypassed
+
+    std::unique_ptr<IEffectModule> modules[3];
+    modules[0] = std::make_unique<TremoloModule>();
+    modules[1] = std::make_unique<BitcrusherModule>();
+    modules[2] = std::make_unique<EffectEQModule>();
+
+    for (auto& module : modules)
+    {
+        ModuleSlot slot;
+        slot.prepare (cfg, std::move (module));
+        slot.applyParams (defaults, 0);
+        CHECK (slot.isBypassedSettled());
+
+        for (int block = 0; block < 8; ++block)
+        {
+            std::vector<float> buf = (block == 0) ? eqtests::makeAwkwardSignal (256)
+                                                  : module_test::awkwardBlock (256, block);
+            const std::vector<float> reference = buf;
+            slot.process (buf.data(), 256);
+            CHECK (eqtests::bitEqualBlock (buf, reference));
+        }
+
+        CHECK (slot.nanTrips.load() == 0);
+        CHECK (slot.getLatencySamples() == 0);
+    }
+}
+
+static void testEffectModulesIdentityWhenActive()
+{
+    using namespace spatcore::effects;
+
+    // Settings at which an ACTIVE module must still be transparent. These are
+    // the ones an operator reaches by turning one control to its end, so a
+    // rounding error here is audible as a change that should not be there.
+    ChainConfig cfg = module_test::config (48000.0, 256);
+
+    // Tremolo: mix 0, and depth 0 at full mix - both bit-exact, the second
+    // because 0 dB converts to exactly 1.
+    for (int variant = 0; variant < 2; ++variant)
+    {
+        TremoloModule m;
+        m.prepare (cfg);
+        EffectChannelParams p;
+        p.trem.bypass = 0;
+        p.trem.depthDb = (variant == 0) ? 12.0f : 0.0f;
+        p.trem.mix = (variant == 0) ? 0.0f : 100.0f;
+        m.applyParams (p, 0);
+
+        std::vector<float> buf = eqtests::makeAwkwardSignal (256);
+        const std::vector<float> reference = buf;
+        m.process (buf.data(), 256);
+        CHECK (eqtests::bitEqualBlock (buf, reference));
+    }
+
+    // Crusher: mix 0 is exact; 24 bits at the device rate is a quantiser step
+    // smaller than the samples themselves, so it is transparent to well inside
+    // a float's precision.
+    {
+        BitcrusherModule m;
+        m.prepare (cfg);
+        EffectChannelParams p;
+        p.crush.bypass = 0;
+        p.crush.mix = 0.0f;
+        m.applyParams (p, 0);
+
+        std::vector<float> buf = eqtests::makeAwkwardSignal (256);
+        const std::vector<float> reference = buf;
+        m.process (buf.data(), 256);
+        CHECK (eqtests::bitEqualBlock (buf, reference));
+    }
+    {
+        BitcrusherModule m;
+        m.prepare (cfg);
+        EffectChannelParams p;
+        p.crush.bypass = 0;
+        p.crush.bits = 24.0f;
+        p.crush.rateHz = 48000.0f;
+        p.crush.mix = 100.0f;
+        m.applyParams (p, 0);
+
+        std::vector<float> buf = module_test::awkwardBlock (256, 3);
+        const std::vector<float> reference = buf;
+        m.process (buf.data(), 256);
+
+        float worst = 0.0f;
+        for (int i = 0; i < 256; ++i)
+            worst = std::fabs (buf[(size_t) i] - reference[(size_t) i]) > worst
+                      ? std::fabs (buf[(size_t) i] - reference[(size_t) i]) : worst;
+        CHECK (worst <= 1.0e-6f);
+    }
+}
+
 static void testStereoPassThroughIdentity()
 {
     using namespace spatcore::dsp;
@@ -4706,6 +5240,13 @@ int main()
         testModuleSlotBypassFade();
         testModuleSlotVariantSwitch();
         testNaNGuard();
+        testTremoloLaw();
+        testBitcrusherQuantiser();
+        testBitcrusherHoldRate();
+        testEffectEQModuleMatchesBank();
+        testResetOnFullBypass();
+        testEffectModulesNeutralAtDefaults();
+        testEffectModulesIdentityWhenActive();
         testOscRoundtrip();
         testRtThreadPriority();
         testGpuHostWorkPoolDeterminism();

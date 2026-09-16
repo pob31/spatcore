@@ -89,6 +89,9 @@
 #include "effects/EffectsTypes.h"
 #include "effects/EffectParams.h"
 #include "effects/EffectModule.h"
+#include "effects/modules/TremoloModule.h"
+#include "effects/modules/BitcrusherModule.h"
+#include "effects/modules/EffectEQModule.h"
 
 // gpu/ - host-facing surface (interfaces, device manager, plugin factory,
 // pipeline, host state/configs, compile-time backend selectors)
