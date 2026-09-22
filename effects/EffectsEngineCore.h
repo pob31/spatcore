@@ -858,6 +858,24 @@ public:
         return inRange (fx) ? channels[static_cast<size_t> (fx)].latencySamples.load (std::memory_order_relaxed) : 0;
     }
 
+    /** One module slot's meter, in dB: the Dynamics module reports its gain
+        reduction, the others their output peak (see IEffectModule::getMeterDb).
+        Every module already keeps this in a relaxed atomic it writes per
+        block, so the GUI reads it straight from the module - no telemetry copy,
+        no reset on read. The chains are allocated in prepare() and stable until
+        release(), and a slot index out of range or a chain not built reads 0. */
+    float getSlotMeterDb (int fx, int slot) const noexcept
+    {
+        if (slot < 0 || slot >= kNumModuleSlots)
+            return 0.0f;
+
+        if (fx < 0 || fx >= static_cast<int> (chains.size()))
+            return 0.0f;
+
+        const auto& chain = chains[static_cast<size_t> (fx)];
+        return chain != nullptr ? chain->getSlot (slot).getMeterDb() : 0.0f;
+    }
+
     float getFeedPeak (int fx) const noexcept      { return channelFloat (fx, &ChannelTelemetry::feedPeak); }
     float getFeedMeanSq (int fx) const noexcept    { return channelFloat (fx, &ChannelTelemetry::feedMeanSq); }
     float getReturnPeak (int fx) const noexcept    { return channelFloat (fx, &ChannelTelemetry::returnPeak); }

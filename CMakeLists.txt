@@ -437,6 +437,7 @@ if(SPATCORE_UI)
     add_library(spatcore-ui STATIC
         ui/SpatcoreUiCompileCheck.cpp
         ui/patch/PatchMatrixComponent.cpp
+        ui/sends/SendMatrixComponent.cpp
     )
 
     target_include_directories(spatcore-ui PUBLIC "${SPATCORE_INCLUDE_ROOT}")
