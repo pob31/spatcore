@@ -11046,6 +11046,65 @@ static void testEffectsEngineBlockLedger()
 }
 
 //==============================================================================
+// THE PER-SLOT METER. Every module keeps one in a relaxed atomic it writes per
+// block (gain reduction for Dynamics, output peak for the others), and the GUI
+// reads it straight off the module through the core rather than from a
+// telemetry copy. This proves the read reaches the RIGHT slot of the RIGHT
+// chain, that a bypassed slot reads 0, and that an index off either edge
+// reads 0 instead of touching memory.
+//==============================================================================
+
+static void testEffectsEngineSlotMeter()
+{
+    using namespace engine_test;
+
+    constexpr int kDyn1Slot = 3;             // kSlots: dist, eq1, eq2, dyn1, dyn2, ...
+    constexpr int kDyn2Slot = 4;
+
+    Rig rig (1, 2, 64);
+    rig.config.moduleFactory = &createModule;          // real modules
+    rig.level (0, 0, 1.0f);                             // input 0 -> effect 0 only
+    CHECK (rig.prepare());
+
+    // Effect 0: dyn1 compressing hard, dyn2 bypassed. Effect 1: untouched.
+    EffectChannelParams p;
+    p.dyn[0].bypass = 0;
+    p.dyn[0].compOn = 1;
+    p.dyn[0].compThresholdDb = -40.0f;
+    p.dyn[0].compRatio = 20.0f;
+    p.dyn[0].compAttackMs = 0.1f;
+    p.dyn[1].bypass = 1;
+    p.revision = 1;
+    rig.core.publishChannelParams (0, p);
+
+    // Nothing has run: every meter reads its idle value.
+    CHECK (rig.core.getSlotMeterDb (0, kDyn1Slot) == 0.0f);
+
+    // A hot DC block, well above the threshold, for long enough that the
+    // 0.1 ms attack has settled many times over.
+    const auto hot = dcBlock (64, 0.9f);
+    for (int b = 0; b < 40; ++b)
+        rig.callbackOn (0, hot.data());
+
+    const float gr = rig.core.getSlotMeterDb (0, kDyn1Slot);
+    CHECK (gr < -1.0f);                                 // real gain reduction, in dB
+    CHECK (gr > -60.0f);                                // and a sane amount of it
+
+    // The bypassed instance of the SAME module on the SAME chain reads idle:
+    // the read is per slot, not per module type.
+    CHECK (rig.core.getSlotMeterDb (0, kDyn2Slot) == 0.0f);
+
+    // The other chain got no signal and no compressor: idle.
+    CHECK (rig.core.getSlotMeterDb (1, kDyn1Slot) == 0.0f);
+
+    // Off either edge is 0, never a read past the arrays.
+    CHECK (rig.core.getSlotMeterDb (-1, kDyn1Slot) == 0.0f);
+    CHECK (rig.core.getSlotMeterDb (2, kDyn1Slot) == 0.0f);
+    CHECK (rig.core.getSlotMeterDb (0, -1) == 0.0f);
+    CHECK (rig.core.getSlotMeterDb (0, kNumModuleSlots) == 0.0f);
+}
+
+//==============================================================================
 // DETERMINISM. An offline render and a live render have to be the same render,
 // so the worker count must not be able to reach the arithmetic.
 //==============================================================================
@@ -12094,6 +12153,7 @@ int main()
         testLoopGuardNonFinitePeakTripsAndHolds();
         testEffectsEngineBlockLedger();
         testEffectsEngineWorkerDeterminism();
+        testEffectsEngineSlotMeter();
         testEffectsEngineBacklogSkip();
         testEffectsEngineRingWrapResync();
         testEffectsEngineShortFeedHistory();

@@ -34,6 +34,12 @@
 #include "patch/PatchMatrixConfig.h"
 #include "patch/PatchMatrixComponent.h"
 
+// ui/sends/ - the dB send matrix (sources x effects). Schema-free: it listens
+// to no ValueTree and names no property, every question goes back to the host
+// through a provider, so it reaches nothing outside ui/.
+#include "sends/SendMatrixConfig.h"
+#include "sends/SendMatrixComponent.h"
+
 namespace spatcore
 {
     // Referenced by nothing at runtime; exists so the archive is never empty.
