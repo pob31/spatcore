@@ -7,7 +7,9 @@
 #include "../../dsp/FrDiffusionModel.h"
 #include "../../dsp/OnePoleSmoother.h"
 #include "../../reverb/ReverbFDNAlgorithm.h"
+#include "reverb/ReverbLfo.h"
 #include <juce_audio_basics/juce_audio_basics.h>
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -30,8 +32,9 @@ namespace spatcore::effects
     setParams RETURNS the variant flag rather than being told it, because only
     the model knows which of its parameters are build-time. prepare() allocates
     and is never realtime; everything else, commitPendingVariant() included,
-    runs on the audio thread - the slot calls it once the output has faded to
-    silence, so a model must reach its new topology without allocating there.
+    runs on the audio thread - the module rebuilds an IDLE instance there when
+    a change needs another topology, so a model must reach its new topology
+    without allocating.
 */
 class IEffectReverbModel
 {
@@ -54,6 +57,15 @@ public:
 
     /** Mono, in place: the predelayed input goes in, the wet tail comes out. */
     virtual void process (float* inout, int numSamples) noexcept = 0;
+
+    /** True when `params` asks for a topology this instance is not built at.
+        Asked WITHOUT handing the parameters over: the module turns such a
+        change into a spillover to an idle twin, and the instance that is about
+        to ring out must keep playing with the values it had. */
+    virtual bool isBuildDifferent (const ReverbParams& params) const noexcept = 0;
+
+    /** The Size the instance is built at (what process() runs). */
+    virtual float getBuiltSize() const noexcept = 0;
 };
 
 //==============================================================================
@@ -64,7 +76,7 @@ public:
 
     The network is BUILT at a size well above the largest the parameter surface
     allows, and then immediately rebuilt at the size actually wanted. fdnSize is
-    read only in prepareNode, so changing it means re-preparing, and the slot
+    read only in prepareNode, so changing it means re-preparing, and the module
     calls commitPendingVariant() on the AUDIO thread. Preparing at 2.5 first
     leaves every delay line's vector holding capacity for more samples than any
     size in 0.5..2 can ask for, so every later rebuild is a vector::assign whose
@@ -91,8 +103,8 @@ public:
     (predelay, tone, mix) live in the module and are smoothed there.
 
     A size commit rebuilds and clears the network, about 200 KiB of stores at
-    48 kHz. It happens at silence when someone moves the size control, not per
-    block.
+    48 kHz. It happens on an idle instance when someone moves the size control
+    (the module spills the old tail over the new one), not per block.
 */
 class FdnReverbModel final : public IEffectReverbModel
 {
@@ -198,7 +210,20 @@ public:
     /** The size the network is currently built at - the value process() is
         running, which is not the value setParams was last given while a commit
         is outstanding. */
-    float getBuiltSize() const noexcept { return builtSize; }
+    float getBuiltSize() const noexcept override { return builtSize; }
+
+    bool isBuildDifferent (const ReverbParams& params) const noexcept override
+    {
+        return quantiseSize (clampParam (params.size, kMinSize, kMaxSize)) != builtSize;
+    }
+
+    /** Two decimals. A fader that sends 1.0000001 must not rebuild the network,
+        and the shortest line only changes length every 1/337 of a size step
+        anyway. */
+    static float quantiseSize (float v) noexcept
+    {
+        return static_cast<float> (static_cast<int> (v * 100.0f + 0.5f)) * 0.01f;
+    }
 
 private:
     static float clampParam (float v, float lo, float hi) noexcept
@@ -208,14 +233,6 @@ private:
         if (! (v > lo)) return lo;
         if (v > hi)     return hi;
         return v;
-    }
-
-    /** Two decimals. A fader that sends 1.0000001 must not rebuild the network,
-        and the shortest line only changes length every 1/337 of a size step
-        anyway. */
-    static float quantiseSize (float v) noexcept
-    {
-        return static_cast<float> (static_cast<int> (v * 100.0f + 0.5f)) * 0.01f;
     }
 
     /** One network per effects channel. The offset lands on the line lengths,
@@ -251,8 +268,36 @@ private:
 /**
     Reverb: predelay, a tail from the selected model, tone, and a wet mix.
 
-    The wet path is predelay -> model -> one-pole low pass -> make-up -> mix.
+    The wet path is predelay -> tail -> one-pole low pass -> make-up -> mix.
     The dry path is the buffer, untouched.
+
+    THE TAIL IS A POOL, NOT A MODEL. Every tail class is built twice, in
+    prepare(). One instance is ACTIVE and takes the input. A change that needs
+    another topology - a model of another class, another size - does not fade
+    the reverb out: the idle twin is rebuilt at the new topology, the input is
+    crossfaded onto it over 5 ms, and the instance that was active RINGS OUT
+    with the values it had, fed silence, until its tail is gone. That is
+    spillover, what a hardware reverb does on a program change: a cue that
+    changes the room does not chop the tail that is still in the air. So the
+    module never reports a variant, and the slot never fades it for one.
+
+    - The input is PARTITIONED, never doubled or dropped: the incoming instance
+      takes w(k) of it and the outgoing one 1 - w(k), w a raised cosine. Every
+      gain in the pool moves continuously, so no transition can click,
+      whatever arrives when.
+    - One crossfade at a time. A change that arrives during one waits for it -
+      5 ms at most - while the input carries on moving across.
+    - At most three instances run: the active one, one RINGING, and one DYING,
+      a ringing instance whose voice the next change needed, faded out over
+      5 ms. Rapid changes cost the oldest tail, never a click.
+    - A ringing instance goes idle once its output has stayed under -96 dBFS
+      for 50 ms, and is faded out after 30 s whatever it is doing.
+    - Nothing to spill, nothing spilled: while no instance has run since the
+      last reset - the first set after prepare(), a bypassed slot - a change
+      takes effect at once.
+    - Settled, with one instance and no transition, the path is the
+      single-model path it always was, sample for sample: no crossfade, no
+      summing with a zero.
 
     The wet leg carries a fixed gain of two, measured rather than guessed. The
     FDN's own times-four is a level CORRECTION, not headroom, and with it alone
@@ -281,9 +326,10 @@ private:
     the alternative, a mute-move-unmute envelope, puts a hole in the feed
     instead, which it does not.
 
-    prepare() allocates. Nothing else does, the size commit included - see
-    FdnReverbModel. About 265 KiB per instance at 48 kHz (a network sized for
-    2.5, plus a quarter-second predelay ring), doubling with the rate.
+    prepare() allocates. Nothing else does: an idle instance is rebuilt inside
+    the capacity prepare() gave it - see FdnReverbModel. About 480 KiB per
+    module at 48 kHz (two networks sized for 2.5, plus a quarter-second
+    predelay ring), doubling with the rate.
 */
 class EffectReverbModule final : public IEffectModule
 {
@@ -293,6 +339,22 @@ public:
     /** Wet make-up on top of the FDN's own +12 dB correction. A measured
         figure, not a round one - see the class note. */
     static constexpr float kWetGain = 2.0f;
+
+    /** The input crossfade onto an incoming instance, and a dying one's fade. */
+    static constexpr double kSpillFadeSeconds = 0.005;
+
+    /** A ringing instance is idle once its wet output has stayed under
+        kQuietGain (-96 dBFS) for kQuietHoldSeconds, and is faded out after
+        kMaxRingSeconds whatever it is doing. */
+    static constexpr float kQuietGain = 1.5849e-5f;
+    static constexpr double kQuietHoldSeconds = 0.05;
+    static constexpr double kMaxRingSeconds = 30.0;
+
+    /** Tail classes, each built twice, so a change inside a class - a size -
+        spills over as surely as a change between classes does. */
+    static constexpr int kNumClasses = 1;
+    static constexpr int kInstancesPerClass = 2;
+    static constexpr int kNumInstances = kNumClasses * kInstancesPerClass;
 
     ModuleId type() const noexcept override { return ModuleId::Reverb; }
 
@@ -304,6 +366,8 @@ public:
 
         predelay.prepare (static_cast<int> (std::ceil (kMaxPredelayMs * 0.001 * sampleRate)) + 2);
         wetScratch.assign (static_cast<size_t> (maxBlock), 0.0f);
+        ringScratch.assign (static_cast<size_t> (maxBlock), 0.0f);
+        dyingScratch.assign (static_cast<size_t> (maxBlock), 0.0f);
 
         predelaySamples.setTimeConstant (sampleRate, kParamTauSeconds);
         predelaySamples.setSnapEpsilon (1.0e-3f);           // samples, not a unit gain
@@ -311,13 +375,34 @@ public:
         toneCoef.setSnapEpsilon (1.0e-6f);                  // a one-pole coefficient
         wet.setTimeConstant (sampleRate, kParamTauSeconds);
 
-        // Building a model allocates, so which one runs is a prepare-time
-        // choice rather than a live parameter. v1 has exactly one, which is
-        // also why a project saved by a later version naming another model
-        // gets a reverb here rather than silence.
+        // w(k) = sin^2 (pi k / 2N), from the libm-free sine so a render hashes
+        // the same on every platform. Its complement is the outgoing share.
+        fadeLen = static_cast<int> (kSpillFadeSeconds * sampleRate + 0.5);
+        if (fadeLen < 1)
+            fadeLen = 1;
+        fadeIn.assign (static_cast<size_t> (fadeLen), 0.0f);
+        for (int k = 0; k < fadeLen; ++k)
+        {
+            const float s = ReverbLfo::sin2pi (static_cast<double> (k) / (4.0 * static_cast<double> (fadeLen)));
+            fadeIn[static_cast<size_t> (k)] = s * s;
+        }
+
+        quietHoldSamples = static_cast<int> (kQuietHoldSeconds * sampleRate);
+        maxRingSamples = static_cast<int> (kMaxRingSeconds * sampleRate);
+
+        // Every instance, now. Building a model allocates, so the pool is
+        // fixed here and a change of model only ever SELECTS from it.
         const ReverbParams defaults;
-        model = std::make_unique<FdnReverbModel>();
-        model->prepare (config, defaults);
+        for (int k = 0; k < kNumInstances; ++k)
+        {
+            instance (k).prepare (config, defaults);
+            dirty[k] = true;                                // reset() below clears them all
+        }
+
+        active = firstOfClass (classFor (defaults));
+        ringing = -1;
+        dying = -1;
+        transitionWanted = false;
 
         setTargets (defaults);
         snapOnNextApply = true;
@@ -329,8 +414,20 @@ public:
         predelay.reset();
         toneState = 0.0f;
 
-        if (model != nullptr)
-            model->reset();
+        for (int k = 0; k < kNumInstances; ++k)
+            clearIfDirty (k);
+
+        ringing = -1;
+        dying = -1;
+        xfadePos = fadeLen;
+
+        // Silent now, so a change still waiting for a voice has nothing left
+        // to spill over: it takes effect directly.
+        if (transitionWanted)
+        {
+            switchDirectly (wanted);
+            transitionWanted = false;
+        }
 
         predelaySamples.snap (predelaySamples.getTarget());
         toneCoef.snap (toneCoef.getTarget());
@@ -344,7 +441,26 @@ public:
         const ReverbParams& r = params.reverb;
 
         setTargets (r);
-        const bool pending = (model != nullptr) && model->setParams (r);
+
+        if (! needsTransition (r))
+        {
+            transitionWanted = false;               // a change taken back before it could start
+            instance (active).setParams (r);        // the runtime values
+        }
+        else if (snapOnNextApply || ! anyDirty())
+        {
+            // Nothing has run since the last reset, so there is no tail to
+            // spill: the first set after prepare() - a freshly loaded show must
+            // not spill over defaults it never meant to play - or a slot that
+            // is bypassed and silent.
+            switchDirectly (r);
+            transitionWanted = false;
+        }
+        else
+        {
+            wanted = r;
+            transitionWanted = ! tryStartTransition (r);
+        }
 
         if (snapOnNextApply)
         {
@@ -352,45 +468,14 @@ public:
             toneCoef.snap (toneCoef.getTarget());
             wet.snap (wet.getTarget());
             snapOnNextApply = false;
-
-            // The first set after prepare() IS the project's settings. A size
-            // that differs from the one prepare() guessed takes effect now,
-            // while nothing is listening, instead of making a freshly loaded
-            // show fade once before it is right.
-            if (pending && model != nullptr)
-            {
-                model->commitPendingVariant();
-                return { r.bypass != 0, false };
-            }
         }
 
-        return { r.bypass != 0, pending };
-    }
-
-    void commitPendingVariant() noexcept override
-    {
-        if (model != nullptr)
-            model->commitPendingVariant();
-
-        // The slot always calls reset() immediately before this, so most of
-        // what follows is already done. It is repeated anyway because a module
-        // that only half-clears itself here is a trap: everything reset() drops
-        // has to be dropped here too, or the day someone commits without
-        // resetting first it leaks a stale meter and a mid-glide smoother into
-        // a network that has just been rebuilt underneath them.
-        predelay.reset();
-        toneState = 0.0f;
-
-        predelaySamples.snap (predelaySamples.getTarget());
-        toneCoef.snap (toneCoef.getTarget());
-        wet.snap (wet.getTarget());
-
-        meterDb.store (spatcore::dsp::FastDecibels::kMinDb, std::memory_order_relaxed);
+        return { r.bypass != 0, false };
     }
 
     void process (float* inout, int numSamples) noexcept override
     {
-        if (model == nullptr || inout == nullptr || numSamples <= 0 || wetScratch.empty())
+        if (inout == nullptr || numSamples <= 0 || wetScratch.empty())
             return;
 
         // Sixteen recursive delay lines decay into denormals and stay there,
@@ -398,6 +483,10 @@ public:
         // normals. Flushing them makes a quiet channel cheaper than a loud one
         // rather than dearer, and the module's own state is flushed below.
         juce::ScopedNoDenormals noDenormals;
+
+        // A change that had to wait for the pool starts on a block boundary.
+        if (transitionWanted && tryStartTransition (wanted))
+            transitionWanted = false;
 
         float peak = 0.0f;
         int done = 0;
@@ -427,12 +516,121 @@ public:
         return meterDb.load (std::memory_order_relaxed);
     }
 
+    /** Instances ringing out or fading under the active one: 0, 1 or 2. */
+    int getSpillVoices() const noexcept      { return (ringing >= 0 ? 1 : 0) + (dying >= 0 ? 1 : 0); }
+
+    /** True while a change waits for the pool to free a voice. */
+    bool isTransitionWaiting() const noexcept { return transitionWanted; }
+
+    /** The Size the ACTIVE instance is built at - what the input is going to. */
+    float getActiveSize() const noexcept     { return instance (active).getBuiltSize(); }
+
 private:
     static float clampParam (float v, float lo, float hi) noexcept
     {
         if (! (v > lo)) return lo;
         if (v > hi)     return hi;
         return v;
+    }
+
+    /** The tail class a parameter set runs on. */
+    static int classFor (const ReverbParams& r) noexcept
+    {
+        juce::ignoreUnused (r);
+        return 0;                                   // the FDN is the only class so far
+    }
+
+    static int firstOfClass (int cls) noexcept      { return cls * kInstancesPerClass; }
+    static int classOfInstance (int k) noexcept     { return k / kInstancesPerClass; }
+
+    IEffectReverbModel& instance (int k) noexcept              { return fdn[k]; }
+    const IEffectReverbModel& instance (int k) const noexcept  { return fdn[k]; }
+
+    bool needsTransition (const ReverbParams& r) const noexcept
+    {
+        return classFor (r) != classOfInstance (active) || instance (active).isBuildDifferent (r);
+    }
+
+    bool anyDirty() const noexcept
+    {
+        for (int k = 0; k < kNumInstances; ++k)
+            if (dirty[k])
+                return true;
+        return false;
+    }
+
+    /** An instance that has run since it was last cleared is cleared before
+        anything takes it again. */
+    void clearIfDirty (int k) noexcept
+    {
+        if (dirty[k])
+        {
+            instance (k).reset();
+            dirty[k] = false;
+        }
+    }
+
+    /** No tail to spill: the wanted topology becomes the active one at once. */
+    void switchDirectly (const ReverbParams& r) noexcept
+    {
+        const int cls = classFor (r);
+        if (classOfInstance (active) != cls)
+        {
+            clearIfDirty (active);
+            active = firstOfClass (cls);
+        }
+
+        IEffectReverbModel& m = instance (active);
+        if (m.setParams (r))
+            m.commitPendingVariant();
+    }
+
+    /** Starts a spillover onto an idle instance built at `r`. False while the
+        pool cannot take one yet - a crossfade still running, or the voice it
+        needs still fading out - and the next block tries again. */
+    bool tryStartTransition (const ReverbParams& r) noexcept
+    {
+        if (xfadePos < fadeLen)
+            return false;
+
+        // The active instance is about to ring, so the one ringing now has to
+        // go. Fed silence since its own crossfade ended, only its output needs
+        // the fade.
+        if (ringing >= 0)
+        {
+            if (dying >= 0)
+                return false;
+
+            dying = ringing;
+            dyingPos = 0;
+            ringing = -1;
+        }
+
+        const int cls = classFor (r);
+        int target = -1;
+        for (int k = firstOfClass (cls); k < firstOfClass (cls) + kInstancesPerClass; ++k)
+        {
+            if (k != active && k != dying)
+            {
+                target = k;
+                break;
+            }
+        }
+
+        if (target < 0)
+            return false;                           // its twin is the one fading out
+
+        IEffectReverbModel& m = instance (target);
+        if (m.setParams (r))
+            m.commitPendingVariant();               // inside the capacity prepare() gave it
+        clearIfDirty (target);
+
+        ringing = active;
+        ringAge = 0;
+        ringQuiet = 0;
+        active = target;
+        xfadePos = 0;
+        return true;
     }
 
     /** 1 - exp(-2*pi*f/sr) without libm, so an offline render of the same
@@ -455,6 +653,105 @@ private:
         wet.setTarget (clampParam (r.mix, 0.0f, 100.0f) * 0.01f);
     }
 
+    /** The tail: the active instance alone when settled, the pool while a
+        change spills over. */
+    void runTail (float* w, int n) noexcept
+    {
+        if (ringing < 0 && dying < 0 && xfadePos >= fadeLen)
+        {
+            instance (active).process (w, n);
+            dirty[active] = true;
+            return;
+        }
+
+        const bool crossfading = xfadePos < fadeLen;
+        float* rs = ringScratch.data();
+        float* ds = dyingScratch.data();
+
+        // The partition: the incoming instance takes w * fadeIn, the outgoing
+        // one the rest - and silence once the crossfade is over.
+        if (crossfading)
+        {
+            for (int i = 0; i < n; ++i)
+            {
+                const int k = xfadePos + i;
+                const float g = k < fadeLen ? fadeIn[static_cast<size_t> (k)] : 1.0f;
+                rs[i] = w[i] * (1.0f - g);
+                w[i] = w[i] * g;
+            }
+        }
+        else if (ringing >= 0)
+        {
+            std::fill (rs, rs + n, 0.0f);
+        }
+
+        if (ringing >= 0)
+        {
+            instance (ringing).process (rs, n);
+            dirty[ringing] = true;
+        }
+
+        if (dying >= 0)
+        {
+            std::fill (ds, ds + n, 0.0f);
+            instance (dying).process (ds, n);
+            dirty[dying] = true;
+
+            for (int i = 0; i < n; ++i)
+            {
+                const int k = dyingPos + i;
+                ds[i] *= k < fadeLen ? 1.0f - fadeIn[static_cast<size_t> (k)] : 0.0f;
+            }
+        }
+
+        instance (active).process (w, n);
+        dirty[active] = true;
+
+        float ringPeak = 0.0f;
+        if (ringing >= 0)
+        {
+            for (int i = 0; i < n; ++i)
+            {
+                const float v = rs[i];
+                const float magnitude = v < 0.0f ? -v : v;
+                if (magnitude > ringPeak)
+                    ringPeak = magnitude;
+                w[i] += v;
+            }
+        }
+
+        if (dying >= 0)
+            for (int i = 0; i < n; ++i)
+                w[i] += ds[i];
+
+        if (crossfading)
+            xfadePos = (fadeLen - xfadePos) > n ? xfadePos + n : fadeLen;
+
+        if (dying >= 0)
+        {
+            dyingPos += n;
+            if (dyingPos >= fadeLen)
+                dying = -1;                         // faded out: idle, cleared when next taken
+        }
+
+        if (ringing >= 0)
+        {
+            ringAge += n;
+            ringQuiet = (! crossfading && ringPeak * kWetGain < kQuietGain) ? ringQuiet + n : 0;
+
+            if (ringQuiet >= quietHoldSamples)
+            {
+                ringing = -1;                       // rung out: idle, cleared when next taken
+            }
+            else if (ringAge >= maxRingSamples && dying < 0)
+            {
+                dying = ringing;
+                dyingPos = 0;
+                ringing = -1;
+            }
+        }
+    }
+
     void processChunk (float* inout, int n, float& peak) noexcept
     {
         float* w = wetScratch.data();
@@ -467,7 +764,7 @@ private:
             w[i] = predelay.readLinear (predelaySamples.next());
         }
 
-        model->process (w, n);
+        runTail (w, n);
 
         for (int i = 0; i < n; ++i)
         {
@@ -489,15 +786,30 @@ private:
         }
     }
 
-    std::unique_ptr<IEffectReverbModel> model;
+    FdnReverbModel fdn[kInstancesPerClass];
+    bool dirty[kNumInstances] = {};
+
+    int active = 0;
+    int ringing = -1;
+    int dying = -1;
+    int xfadePos = 0;
+    int dyingPos = 0;
+    int ringAge = 0;
+    int ringQuiet = 0;
+    bool transitionWanted = false;
+    ReverbParams wanted;
 
     spatcore::dsp::FractionalDelayLine predelay;
-    std::vector<float> wetScratch;
+    std::vector<float> wetScratch, ringScratch, dyingScratch;
+    std::vector<float> fadeIn;
     spatcore::dsp::OnePoleSmoother predelaySamples, toneCoef, wet;
 
     double sampleRate = 48000.0;
     float msToSamples = 48.0f;
     int maxBlock = 0;
+    int fadeLen = 1;
+    int quietHoldSamples = 2400;
+    int maxRingSamples = 1440000;
     float toneState = 0.0f;
     bool snapOnNextApply = true;
 

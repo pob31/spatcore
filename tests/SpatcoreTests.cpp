@@ -182,9 +182,11 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <new>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -206,6 +208,43 @@ static bool bitEqualFloat (float a, float b) noexcept
 {
     return std::memcmp (&a, &b, sizeof (float)) == 0;
 }
+
+//==============================================================================
+// Heap-allocation probe. A realtime path's promise not to allocate can only be
+// checked by counting: every operator new in the program comes through the
+// replacement below, and a test that wants to know opens a Scope around the
+// calls it is asking about. Counting is off everywhere else, so the other
+// tests (and their threads) run exactly as they did.
+namespace alloc_probe
+{
+    static std::atomic<bool> counting { false };
+    static std::atomic<long> count { 0 };
+
+    struct Scope
+    {
+        Scope()  { count.store (0); counting.store (true); }
+        ~Scope() { counting.store (false); }
+
+        long allocations() const { return count.load(); }
+    };
+}
+
+void* operator new (std::size_t n)
+{
+    if (alloc_probe::counting.load (std::memory_order_relaxed))
+        alloc_probe::count.fetch_add (1, std::memory_order_relaxed);
+
+    if (void* p = std::malloc (n > 0 ? n : 1))
+        return p;
+
+    throw std::bad_alloc();
+}
+
+void* operator new[] (std::size_t n)                    { return operator new (n); }
+void operator delete (void* p) noexcept                  { std::free (p); }
+void operator delete[] (void* p) noexcept                { std::free (p); }
+void operator delete (void* p, std::size_t) noexcept     { std::free (p); }
+void operator delete[] (void* p, std::size_t) noexcept   { std::free (p); }
 
 //==============================================================================
 static void testLockFreeRingBuffer()
@@ -8730,18 +8769,16 @@ static void testEffectReverbResetClearsTail()
     CHECK (silent);
 }
 
-static void testEffectReverbSizeVariant()
+static void testEffectReverbSizeSpillover()
 {
     using namespace spatcore::effects;
 
     const ChainConfig cfg = module_test::config (48000.0, 256);
 
-    // The FIRST applyParams after prepare() is a deliberate exception to the
-    // pending/fade contract, and it needs a size that prepare() did NOT build
-    // to say anything at all. prepare() carries no parameters, so it builds at
-    // the default; the first set IS the project's settings, and it commits them
-    // there and then rather than making a freshly loaded show fade once before
-    // it is right.
+    // The FIRST applyParams after prepare() builds the project's size there and
+    // then. prepare() carries no parameters, so it built the default; a freshly
+    // loaded show must neither fade nor spill over defaults it never meant to
+    // play.
     {
         EffectReverbModule loaded, atDefault;
         loaded.prepare (cfg);
@@ -8750,50 +8787,159 @@ static void testEffectReverbSizeVariant()
         EffectChannelParams saved = reverb_test::params (100.0f, 0.0f);
         saved.reverb.size = 1.6f;                   // NOT the 1.0 prepare() guessed
         CHECK (! loaded.applyParams (saved, 0).variantPending);
+        CHECK (loaded.getSpillVoices() == 0);
+        CHECK (std::fabs (loaded.getActiveSize() - 1.6f) < 1.0e-5f);
 
         EffectChannelParams guessed = reverb_test::params (100.0f, 0.0f);
-        guessed.reverb.size = 1.0f;
         CHECK (! atDefault.applyParams (guessed, 0).variantPending);
 
-        // Committed, not quietly dropped: 1.6 is a different network from 1.0.
+        // Built, not quietly dropped: 1.6 is a different network from 1.0.
         CHECK (! eqtests::bitEqualBlock (reverb_test::impulseResponse (loaded, 2048),
                                          reverb_test::impulseResponse (atDefault, 2048)));
 
-        // The exception is for the first set only - the next one fades.
+        // Past the first set, with a tail running, a size change never asks the
+        // slot for a fade: the input moves to the new size at once, and the old
+        // network rings out underneath it.
         saved.reverb.size = 1.2f;
-        CHECK (loaded.applyParams (saved, 0).variantPending);
+        CHECK (! loaded.applyParams (saved, 0).variantPending);
+        CHECK (loaded.getSpillVoices() == 1);
+        CHECK (std::fabs (loaded.getActiveSize() - 1.2f) < 1.0e-5f);
+
+        // Handed the same set again, nothing new starts.
+        loaded.applyParams (saved, 0);
+        CHECK (loaded.getSpillVoices() == 1 && ! loaded.isTransitionWaiting());
+
+        // A module that has not run since its last reset has no tail to spill,
+        // so a change there is taken directly - a bypassed slot is one.
+        loaded.reset();
+        CHECK (loaded.getSpillVoices() == 0);
+        saved.reverb.size = 0.8f;
+        loaded.applyParams (saved, 0);
+        CHECK (loaded.getSpillVoices() == 0);
+        CHECK (std::fabs (loaded.getActiveSize() - 0.8f) < 1.0e-5f);
+
+        // Runtime values never spill: a decay change reaches the running network.
+        std::vector<float> excite = module_test::awkwardBlock (1024, 2);
+        module_test::render (loaded, excite);
+        saved.reverb.rt60 = 3.0f;
+        loaded.applyParams (saved, 0);
+        CHECK (loaded.getSpillVoices() == 0);
     }
 
-    EffectReverbModule running, reference;
-    running.prepare (cfg);
-    reference.prepare (cfg);
+    // THE PARTITION. At predelay 0 and fully wet the module is linear, so a
+    // spillover must be exactly two reverbs summed: the old network fed the
+    // input up to the change and the fading complement after it, the new one
+    // fed the share fading in. A doubled or dropped input, a tail cut short or
+    // a new network that did not start from silence all show up as a
+    // difference against the two rendered in isolation.
+    {
+        const int before = 6000, n = 30000;
+        const int fade = (int) (EffectReverbModule::kSpillFadeSeconds * 48000.0 + 0.5);
+        std::vector<float> in = module_test::awkwardBlock (n, 21);
+        for (int i = before + 3000; i < n; ++i)
+            in[(size_t) i] = 0.0f;                  // then silence: the tails ring on
 
-    EffectChannelParams p = reverb_test::params (100.0f, 0.0f);
-    p.reverb.size = 1.0f;
-    CHECK (! running.applyParams (p, 0).variantPending);   // the first set, snapped
-    CHECK (! reference.applyParams (p, 0).variantPending);
-    CHECK (! running.applyParams (p, 0).variantPending);   // handed it again: still nothing
+        EffectChannelParams p = reverb_test::params (100.0f, 0.0f);
+        p.reverb.rt60 = 2.0f;
 
-    // Asking for another size does not change what is RUNNING - the old network
-    // carries on until the slot has faded out and committed.
-    p.reverb.size = 1.6f;
-    CHECK (running.applyParams (p, 0).variantPending);
-    CHECK (eqtests::bitEqualBlock (reverb_test::impulseResponse (running, 2048),
-                                   reverb_test::impulseResponse (reference, 2048)));
+        EffectReverbModule spill;
+        spill.prepare (cfg);
+        spill.applyParams (p, 0);
 
-    // Taken back before the fade completes, the change cancels itself.
-    p.reverb.size = 1.0f;
-    CHECK (! running.applyParams (p, 0).variantPending);
+        std::vector<float> out = in;
+        spill.process (out.data(), before);
+        p.reverb.size = 1.6f;
+        spill.applyParams (p, 0);
+        spill.process (out.data() + before, n - before);
 
-    // Committed at silence, it is a different network.
-    p.reverb.size = 1.6f;
-    CHECK (running.applyParams (p, 0).variantPending);
-    running.reset();
-    running.commitPendingVariant();
-    CHECK (! running.applyParams (p, 0).variantPending);
-    reference.reset();
-    CHECK (! eqtests::bitEqualBlock (reverb_test::impulseResponse (running, 2048),
-                                     reverb_test::impulseResponse (reference, 2048)));
+        EffectReverbModule oldNet, newNet;
+        oldNet.prepare (cfg);
+        newNet.prepare (cfg);
+        EffectChannelParams po = reverb_test::params (100.0f, 0.0f);
+        po.reverb.rt60 = 2.0f;
+        oldNet.applyParams (po, 0);
+        po.reverb.size = 1.6f;
+        newNet.applyParams (po, 0);
+
+        std::vector<float> outOld = in, outNew ((size_t) n, 0.0f);
+        for (int i = before; i < n; ++i)
+        {
+            const int k = i - before;
+            const double s = k < fade ? std::sin (3.141592653589793 * (double) k / (2.0 * fade)) : 1.0;
+            const float g = (float) (s * s);
+            outOld[(size_t) i] = in[(size_t) i] * (1.0f - g);
+            outNew[(size_t) i] = in[(size_t) i] * g;
+        }
+        module_test::render (oldNet, outOld);
+        module_test::render (newNet, outNew);
+
+        float worst = 0.0f, peak = 0.0f;
+        for (int i = 0; i < n; ++i)
+        {
+            const float d = std::fabs (out[(size_t) i] - (outOld[(size_t) i] + outNew[(size_t) i]));
+            worst = d > worst ? d : worst;
+            peak = std::fabs (out[(size_t) i]) > peak ? std::fabs (out[(size_t) i]) : peak;
+        }
+        // Measured 6.3e-7 against a peak of 0.85: rounding, and the module's
+        // libm-free fade against the std::sin one here. A share dropped or a
+        // tail cut short misses by four orders of magnitude.
+        CHECK (peak > 0.1f);
+        CHECK (worst < 1.0e-4f * peak);
+
+        // ...and the spill is audible, not a technicality: 100 to 200 ms after
+        // the change the old network still carries a real share of the output
+        // (measured -18.5 dB of -15.8).
+        CHECK (reverb_test::windowDb (outOld, before + 4800, before + 9600)
+               > reverb_test::windowDb (out, before + 4800, before + 9600) - 12.0);
+
+        // No dip: the 50 ms after the change are as loud as the 50 ms before
+        // (measured +1.1 dB - the input is still arriving).
+        CHECK (reverb_test::windowDb (out, before, before + 2400)
+               > reverb_test::windowDb (out, before - 2400, before) - 3.0);
+    }
+
+    // A voice taken again starts from silence. Size 1.0 is excited and left
+    // ringing under 1.6; a change back to 1.0 needs the ringing network's
+    // voice, so it waits while that one fades out, then takes it. Fed silence
+    // throughout, the reverb that comes back must be silent - an instance
+    // reused dirty would replay the old tail at full level.
+    {
+        EffectReverbModule m;
+        m.prepare (cfg);
+        EffectChannelParams p = reverb_test::params (100.0f, 0.0f);
+        p.reverb.rt60 = 8.0f;
+        m.applyParams (p, 0);
+
+        std::vector<float> excite = module_test::awkwardBlock (4800, 5);
+        module_test::render (m, excite);
+
+        std::vector<float> silence (480, 0.0f);
+        p.reverb.size = 1.6f;
+        m.applyParams (p, 0);                       // 1.0 rings, 1.6 takes the (silent) input
+        module_test::render (m, silence);           // 10 ms: the crossfade is over
+        CHECK (m.getSpillVoices() == 1);
+        CHECK (reverb_test::windowDb (silence, 240, 480) > -40.0);  // the old tail, still loud
+
+        p.reverb.size = 1.0f;
+        m.applyParams (p, 0);                       // 1.0's voice is the ringing one:
+        CHECK (m.isTransitionWaiting());            // the change waits...
+        CHECK (m.getSpillVoices() == 1);            // ...while that voice dies
+
+        std::fill (silence.begin(), silence.end(), 0.0f);
+        module_test::render (m, silence);           // faded out inside these 10 ms
+        CHECK (m.getSpillVoices() == 0);
+        CHECK (m.isTransitionWaiting());            // and the change starts on a block boundary
+
+        std::vector<float> after (4800, 0.0f);
+        module_test::render (m, after);
+        CHECK (! m.isTransitionWaiting());
+        CHECK (std::fabs (m.getActiveSize() - 1.0f) < 1.0e-5f);
+
+        float residue = 0.0f;
+        for (int i = 0; i < 4800; ++i)
+            residue = std::fabs (after[(size_t) i]) > residue ? std::fabs (after[(size_t) i]) : residue;
+        CHECK (residue < 1.0e-12f);                // measured exactly 0
+    }
 
     // Built at the capacity size and then at the size asked for, so what runs
     // is what was requested - before and after a commit.
@@ -8803,10 +8949,208 @@ static void testEffectReverbSizeVariant()
     direct.prepare (cfg, rp);
     CHECK (std::fabs (direct.getBuiltSize() - 1.3f) < 1.0e-5f);
     rp.size = 0.5f;
+    CHECK (direct.isBuildDifferent (rp));           // asked without handing it over
+    CHECK (std::fabs (direct.getBuiltSize() - 1.3f) < 1.0e-5f);
     CHECK (direct.setParams (rp));                  // pending, and not yet applied
     CHECK (std::fabs (direct.getBuiltSize() - 1.3f) < 1.0e-5f);
     direct.commitPendingVariant();
     CHECK (std::fabs (direct.getBuiltSize() - 0.5f) < 1.0e-5f);
+    CHECK (! direct.isBuildDifferent (rp));
+    rp.size = 0.501f;                               // quantised: the same network
+    CHECK (! direct.isBuildDifferent (rp));
+}
+
+static void testEffectReverbSpilloverRelease()
+{
+    using namespace spatcore::effects;
+
+    // A ringing network costs a whole second reverb, so it has to stop: once
+    // its output has stayed under -96 dBFS for 50 ms, or at 30 s whatever it
+    // is doing.
+    const ChainConfig cfg = module_test::config (48000.0, 512);
+
+    // A short tail: gone long before the cap.
+    {
+        EffectReverbModule m;
+        m.prepare (cfg);
+        EffectChannelParams p = reverb_test::params (100.0f, 0.0f);
+        p.reverb.rt60 = 0.3f;
+        p.reverb.rt60LowMult = 1.0f;
+        p.reverb.rt60HighMult = 1.0f;
+        m.applyParams (p, 0);
+
+        std::vector<float> excite = module_test::awkwardBlock (4800, 9);
+        module_test::render (m, excite);
+
+        p.reverb.size = 1.5f;
+        m.applyParams (p, 0);
+        std::vector<float> silence (4800, 0.0f);
+        module_test::render (m, silence);           // 100 ms: -20 dB, still ringing
+        CHECK (m.getSpillVoices() == 1);
+
+        std::vector<float> more (96000, 0.0f);      // 2 s
+        module_test::render (m, more);
+        CHECK (m.getSpillVoices() == 0);
+    }
+
+    // A tail that barely decays - 72 s in the low band - is faded at the cap.
+    {
+        EffectReverbModule m;
+        m.prepare (cfg);
+        EffectChannelParams p = reverb_test::params (100.0f, 0.0f);
+        p.reverb.rt60 = 8.0f;
+        p.reverb.rt60LowMult = 9.0f;
+        p.reverb.crossoverLow = 500.0f;
+        m.applyParams (p, 0);
+
+        std::vector<float> excite = module_test::awkwardBlock (4800, 13);
+        module_test::render (m, excite);
+
+        p.reverb.size = 1.5f;
+        m.applyParams (p, 0);
+
+        std::vector<float> second (48000, 0.0f);
+        for (int s = 0; s < 29; ++s)
+        {
+            std::fill (second.begin(), second.end(), 0.0f);
+            module_test::render (m, second);
+        }
+        CHECK (m.getSpillVoices() == 1);            // 29 s: still ringing...
+        CHECK (m.getMeterDb() > -60.0f);            // ...and loud (-51 dB), so quiet is not what ends it
+
+        std::vector<float> last (52800, 0.0f);      // past 30 s, and the 5 ms fade
+        module_test::render (m, last);
+        CHECK (m.getSpillVoices() == 0);
+    }
+}
+
+static void testEffectReverbSpilloverRapid()
+{
+    using namespace spatcore::effects;
+
+    // Changes faster than the pool can spill them: a new size every 64-sample
+    // block for 40 blocks. Whatever the pool does with them - wait for a
+    // crossfade, steal the oldest tail - no gain may step, so the output stays
+    // as smooth as the reverb of a low sine is. The sine fades in, so nothing
+    // but a step inside the module can put a click in its reverb.
+    const int block = 64, warm = 48000, changes = 40, n = warm + block * changes + 24000;
+    const ChainConfig cfg = module_test::config (48000.0, block);
+    const float sizes[] = { 1.6f, 0.7f, 1.3f, 2.0f, 0.5f, 1.0f, 1.8f };
+
+    std::vector<float> sine ((size_t) n);
+    for (int i = 0; i < n; ++i)
+    {
+        const double ramp = i < 4800 ? 0.5 - 0.5 * std::cos (3.141592653589793 * (double) i / 4800.0) : 1.0;
+        sine[(size_t) i] = (float) (0.5 * ramp * std::sin (6.283185307179586 * 80.0 * (double) i / 48000.0));
+    }
+
+    bool sawWaiting = false;
+    float lastSize = 0.0f;
+    long allocations = -1;
+
+    auto render = [&] (bool withChanges)
+    {
+        EffectReverbModule m;
+        m.prepare (cfg);
+        EffectChannelParams p = reverb_test::params (100.0f, 0.0f);
+        p.reverb.rt60 = 2.0f;
+        m.applyParams (p, 0);
+
+        std::vector<float> buf = sine;
+        alloc_probe::Scope probe;
+
+        for (int b = 0; b * block < n; ++b)
+        {
+            const int at = b * block;
+            if (withChanges && at >= warm && at < warm + block * changes)
+            {
+                p.reverb.size = sizes[(size_t) (b % 7)];
+                m.applyParams (p, 0);
+                sawWaiting = sawWaiting || m.isTransitionWaiting();
+            }
+            m.process (buf.data() + at, (n - at) < block ? (n - at) : block);
+        }
+
+        allocations = probe.allocations();
+        lastSize = m.getActiveSize();
+        return buf;
+    };
+
+    const std::vector<float> still = render (false);
+    const std::vector<float> busy = render (true);
+    CHECK (allocations == 0);                       // the whole storm, rebuilds included
+
+    // Every change was eventually honoured, in order: the last one runs.
+    CHECK (sawWaiting);
+    CHECK (std::fabs (lastSize - sizes[(size_t) ((warm / block + changes - 1) % 7)]) < 1.0e-5f);
+
+    // Curvature - the second difference - is what a click is made of, and
+    // almost nothing for the reverb of an 80 Hz sine.
+    auto curvature = [] (const std::vector<float>& v, int from, int to)
+    {
+        float worst = 0.0f;
+        for (int i = from; i < to; ++i)
+        {
+            const float c = std::fabs (v[(size_t) i] - 2.0f * v[(size_t) (i - 1)] + v[(size_t) (i - 2)]);
+            worst = c > worst ? c : worst;
+        }
+        return worst;
+    };
+
+    const int from = warm, to = warm + block * changes + 12000;
+    const float cStill = curvature (still, from, to);
+    const float cBusy = curvature (busy, from, to);
+
+    float peakBusy = 0.0f;
+    bool finite = true;
+    for (int i = from; i < n; ++i)
+    {
+        finite = finite && std::isfinite (busy[(size_t) i]);
+        peakBusy = std::fabs (busy[(size_t) i]) > peakBusy ? std::fabs (busy[(size_t) i]) : peakBusy;
+    }
+
+    // Measured 3.9e-5 against 1.5e-5 without the changes. Switching the input
+    // hard gives 0.10, cutting a dying voice instead of fading it 0.067, and
+    // starting a change during a crossfade - a gain jumping from mid-fade to
+    // full - 1.7e-4, the smallest step there is to catch.
+    CHECK (finite);
+    CHECK (cBusy < 4.0f * cStill);
+
+    // No runaway. (Not a level match: a room's response at 80 Hz is not flat,
+    // so every size in the storm answers the same sine at its own level. The
+    // partition above is what proves the input is never doubled.)
+    CHECK (peakBusy < 1.0f);
+
+    // Deterministic: the same storm twice is the same bits.
+    CHECK (eqtests::bitEqualBlock (render (true), busy));
+
+    // Through a slot: a size change asks for no fade, so the slot stays fully
+    // wet across it - where the variant it used to report would have dipped
+    // the whole reverb to silence and back.
+    {
+        ModuleSlot slot;
+        slot.prepare (cfg, std::make_unique<EffectReverbModule>());
+        EffectChannelParams p = reverb_test::params (100.0f, 0.0f);
+        slot.applyParams (p, 0);
+
+        std::vector<float> noise = module_test::awkwardBlock (48000, 17);
+        for (int at = 0; at < 24000; at += block)
+            slot.process (noise.data() + at, block);
+        CHECK (slot.isActiveSettled());
+
+        p.reverb.size = 1.7f;
+        slot.applyParams (p, 0);
+        CHECK (slot.isActiveSettled());
+
+        bool settled = true;
+        for (int at = 24000; at < 48000; at += block)
+        {
+            slot.process (noise.data() + at, block);
+            settled = settled && slot.isActiveSettled();
+        }
+        CHECK (settled);
+        CHECK (reverb_test::windowDb (noise, 24000, 26400) > reverb_test::windowDb (noise, 21600, 24000) - 3.0);
+    }
 }
 
 static void testEffectReverbExtremesAndDeterminism()
@@ -8854,11 +9198,7 @@ static void testEffectReverbExtremesAndDeterminism()
         p.reverb.size = c.size;
         p.reverb.toneHz = c.tone;
 
-        if (m.applyParams (p, 0).variantPending)
-        {
-            m.reset();
-            m.commitPendingVariant();               // build the extreme size for real
-        }
+        CHECK (! m.applyParams (p, 0).variantPending);  // the first set builds the size for real
 
         std::vector<float> buf = module_test::awkwardBlock (4096, 11);
         const std::vector<float> in = buf;
@@ -9051,11 +9391,7 @@ static void testEffectReverbPresets()
 
         EffectChannelParams cp = reverb_test::params (100.0f, 0.0f);
         CHECK (applyReverbPreset (cp.reverb, t));               // predelay comes from the row
-        if (m.applyParams (cp, 0).variantPending)
-        {
-            m.reset();
-            m.commitPendingVariant();
-        }
+        CHECK (! m.applyParams (cp, 0).variantPending);
 
         const std::vector<float> ir = reverb_test::impulseResponse (m, 16384);
 
@@ -12475,7 +12811,9 @@ int main()
         testEffectReverbTone();
         testEffectReverbWetLevel();
         testEffectReverbResetClearsTail();
-        testEffectReverbSizeVariant();
+        testEffectReverbSizeSpillover();
+        testEffectReverbSpilloverRelease();
+        testEffectReverbSpilloverRapid();
         testEffectReverbExtremesAndDeterminism();
         testEffectReverbPresets();
         testReverbDelayLineReads();
