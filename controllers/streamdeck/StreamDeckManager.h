@@ -7,6 +7,9 @@
  * Routes UI navigation events (tab/subtab/channel changes) to page switches.
  * Routes device events (button press, dial rotation) to the active page bindings.
  * Handles bidirectional parameter sync and ComboBox dial interaction mode.
+ * Announces each hardware edit gesture (onEditGestureStart) before its first
+ * write, so the owner can give it one undo step - StreamDeckGestureTracker
+ * says what a gesture is.
  */
 
 #include <juce_events/juce_events.h>
@@ -14,6 +17,7 @@
 #include "StreamDeckDevice.h"
 #include "StreamDeckPage.h"
 #include "StreamDeckRenderer.h"
+#include "StreamDeckGestureTracker.h"
 
 namespace spatcore::controllers {
 
@@ -195,6 +199,18 @@ public:
         to read AppSettings directly). Unset -> full brightness. */
     std::function<int()> getConnectBrightness;
 
+    /** Called when a hardware EDIT GESTURE starts, just before its first
+        write: a run of turns of one dial (a pause longer than the idle time,
+        another dial or any navigation ends the run), a button press, a dial
+        press that acts, a combo choice confirmed. The owner opens one undo
+        step per call, so one Ctrl+Z takes back one gesture - the GUI's rule
+        for a drag. `what` names the control (its parameter or label, on one
+        line). Unset -> the writes land wherever the owner's undo stands. */
+    std::function<void (const juce::String& what)> onEditGestureStart;
+
+    /** The pause that ends a run of dial turns (default 800 ms). */
+    void setGestureIdleMs (std::uint32_t ms) noexcept { gestures.setIdleMs (ms); }
+
     //==========================================================================
     // Override Page (for floating windows like Audio Interface & Patch)
     //==========================================================================
@@ -264,6 +280,8 @@ public:
     /** Set the active section on the current page (for bidirectional sync). */
     void setActiveSection (int sectionIndex)
     {
+        gestures.breakRun();
+
         auto* page = getCurrentPage();
         if (page != nullptr && sectionIndex >= 0 && sectionIndex < page->numSections)
         {
@@ -293,6 +311,7 @@ public:
     /** Force a full visual refresh of the current page. */
     void refreshCurrentPage()
     {
+        gestures.breakRun();                // the bindings are about to be rebuilt
         invalidateButtonCache();
 
         if (overridePageFactory)
@@ -335,6 +354,7 @@ private:
             if (page->topRowButtons[buttonIndex].isValid())
             {
                 auto& btn = page->topRowButtons[buttonIndex];
+                beginPressGesture (btn.label);
                 if (btn.type == ButtonBinding::Toggle && btn.getState)
                 {
                     btn.onPress();
@@ -353,6 +373,7 @@ private:
             // Then check for navigation override
             if (page->topRowNavigateToTab[buttonIndex] >= 0)
             {
+                gestures.breakRun();
                 if (onRequestMainTabChange)
                     onRequestMainTabChange (page->topRowNavigateToTab[buttonIndex]);
                 if (page->topRowNavigateToSubTab[buttonIndex] >= 0 && onRequestSubTabChange)
@@ -381,6 +402,8 @@ private:
 
             if (! binding.isValid())
                 return;
+
+            beginPressGesture (binding.label);
 
             if (binding.type == ButtonBinding::Toggle && binding.getState)
             {
@@ -457,6 +480,12 @@ private:
         // Use fine mode only when altBinding is NOT active (alt IS the alternate parameter)
         bool useFine = dialPressed[dialIndex] && ! hasAlt;
 
+        // One undo step per run of turns of this control: the alternate
+        // binding is a control of its own.
+        const std::int64_t key = (static_cast<std::int64_t> (page->activeSectionIndex) * 4 + dialIndex) * 2 + (hasAlt ? 1 : 0);
+        if (gestures.turn (key, juce::Time::getMillisecondCounter()))
+            beginGesture (active.paramName);
+
         isUpdatingFromController = true;
         float newVal = active.applyStep (direction, useFine);
         active.setValue (newVal);
@@ -485,6 +514,7 @@ private:
 
         if (binding.onPress)
         {
+            beginPressGesture (binding.paramName);
             binding.onPress();
             // Re-render LCD to reflect new state
             auto img = renderer.renderLcdZone (binding);
@@ -495,6 +525,7 @@ private:
             if (comboModeActive && comboDialIndex == dialIndex)
             {
                 // Confirm selection and exit combo mode
+                beginPressGesture (binding.paramName);
                 isUpdatingFromController = true;
                 binding.setValue (static_cast<float> (comboSelectedIndex));
                 isUpdatingFromController = false;
@@ -647,6 +678,7 @@ private:
 
     void exitComboMode()
     {
+        gestures.breakRun();                // every caller is navigation or a combo choice
         comboModeActive = false;
         comboDialIndex = -1;
         comboSelectedIndex = 0;
@@ -684,6 +716,19 @@ private:
     //==========================================================================
     // Helpers
     //==========================================================================
+
+    void beginGesture (const juce::String& what)
+    {
+        if (onEditGestureStart)
+            onEditGestureStart (what.replaceCharacters ("\r\n", "  ").trim());
+    }
+
+    /** A press is a gesture of its own, and ends any run of turns. */
+    void beginPressGesture (const juce::String& what)
+    {
+        gestures.press();
+        beginGesture (what);
+    }
 
     static int makePageKey (int mainTab, int subTab)
     {
@@ -731,6 +776,9 @@ private:
 
     // Guard flag to prevent feedback loops during controller→parameter updates
     bool isUpdatingFromController = false;
+
+    // When a run of hardware input becomes a new undo step
+    StreamDeckGestureTracker gestures;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (StreamDeckManager)
 };

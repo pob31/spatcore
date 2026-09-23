@@ -143,6 +143,7 @@
 #include "spatcore/effects/modules/reverb/EarlyReflections.h"
 #include "spatcore/effects/modules/reverb/ReverbTailModel.h"
 #include "spatcore/effects/modules/reverb/PlateReverbModel.h"
+#include "spatcore/controllers/streamdeck/StreamDeckGestureTracker.h"
 #include "spatcore/effects/modules/reverb/ModulatedHallModel.h"
 #include "spatcore/effects/modules/reverb/ShimmerTap.h"
 #include "spatcore/effects/modules/reverb/ReverbLfo.h"
@@ -10126,6 +10127,60 @@ static void testEffectReverbReflectionStorm()
 }
 
 //==============================================================================
+// controllers/streamdeck/StreamDeckGestureTracker - one undo step per gesture
+//==============================================================================
+
+static void testStreamDeckGestureTracker()
+{
+    using spatcore::controllers::StreamDeckGestureTracker;
+
+    StreamDeckGestureTracker g;
+    CHECK (g.getIdleMs() == 800);
+
+    // A run of turns of one control is one gesture, up to and including a
+    // pause of exactly the idle time...
+    CHECK (g.turn (3, 1000));
+    CHECK (! g.turn (3, 1100));
+    CHECK (! g.turn (3, 1900));
+    // ...a longer pause starts the next one...
+    CHECK (g.turn (3, 2701));
+    // ...and so does another control - and coming back to the first.
+    CHECK (g.turn (5, 2750));
+    CHECK (g.turn (3, 2760));
+
+    // A press is a gesture of its own and ends the run: the next turn of the
+    // same control starts a new gesture at once.
+    g.press();
+    CHECK (g.turn (3, 2770));
+    CHECK (! g.turn (3, 2780));
+
+    // Navigation ends the run the same way.
+    g.breakRun();
+    CHECK (g.turn (3, 2790));
+
+    // The first turn is always a gesture, whatever its key or time.
+    StreamDeckGestureTracker fresh;
+    CHECK (fresh.turn (0, 0));
+
+    // The millisecond counter wraps every 49.7 days: the gap is taken modulo
+    // 2^32, both ways - 272 ms across the wrap is the same run, 1536 ms is not.
+    StreamDeckGestureTracker wrapSame;
+    CHECK (wrapSame.turn (1, 0xFFFFFF00u));
+    CHECK (! wrapSame.turn (1, 0x00000010u));
+    StreamDeckGestureTracker wrapNew;
+    CHECK (wrapNew.turn (1, 0xFFFFFF00u));
+    CHECK (wrapNew.turn (1, 0x00000500u));
+
+    // The idle time is the caller's.
+    StreamDeckGestureTracker quick (40);
+    CHECK (quick.turn (7, 100));
+    CHECK (! quick.turn (7, 140));
+    CHECK (quick.turn (7, 181));
+    quick.setIdleMs (1000);
+    CHECK (! quick.turn (7, 1100));
+}
+
+//==============================================================================
 // effects/modules/reverb/PlateReverbModel - model 1
 //==============================================================================
 
@@ -10198,7 +10253,9 @@ static void testPlateReverbModel()
     const int plate = (int) ReverbModel::Plate;
 
     // Where a plate sits against the dry: where the FDN does (-4.9 dB at
-    // 1.5 s), so the mix control means the same on both. Measured -4.91; the
+    // 1.5 s), so the mix control means the same on both. Measured -4.98 for
+    // this channel, -4.91 on average over eight (the FDN's -4.94) - the
+    // per-channel tap signs move a channel's level, not the average; the
     // paper's own output gain gives +1.6. PlateReverbModel::kOutputGain is
     // pinned here or nowhere.
     const double level = reverb_test::wetLevelDb (plate, 1.5f);
@@ -10263,6 +10320,63 @@ static void testPlateReverbModel()
     // Same key, same plate; another key, another plate.
     CHECK (eqtests::bitEqualBlock (renderChunked (4096, 1), ref));
     CHECK (! eqtests::bitEqualBlock (renderChunked (4096, 2), ref));
+
+    // Eight channels' plates on one burst must be eight plates at every
+    // frequency, not one plate whose taps sit a fraction of a millisecond
+    // apart. Each tap takes a sign per channel, as the hall's outputs do.
+    // The burst is LOW (two poles at 250 Hz) because that is where the
+    // difference lies: the per-channel lengths alone already part the highs
+    // - on white noise the eight correlate at 0.013 without the signs and
+    // 0.009 with them - but on this burst it is 0.51 without and 0.13 with.
+    // The levels stay within 0.74 dB of each other.
+    {
+        std::vector<float> burst = module_test::awkwardBlock (12000, 23);
+        const float lp = 1.0f - std::exp (-2.0f * 3.14159265f * 250.0f / 48000.0f);
+        float z1 = 0.0f, z2 = 0.0f;
+        for (auto& x : burst)
+        {
+            z1 += lp * (x - z1);
+            z2 += lp * (z1 - z2);
+            x = z2;
+        }
+        burst.resize (96000, 0.0f);
+
+        std::vector<std::vector<float>> wets;
+        for (std::uint32_t key = 1; key <= 8; ++key)
+        {
+            EffectReverbModule m;
+            m.prepare (module_test::config (48000.0, 512, key));
+            m.applyParams (reverb_test::modelParams (plate, 100.0f, 0.0f), 0);
+            std::vector<float> buf = burst;
+            module_test::render (m, buf);
+            wets.push_back (std::move (buf));
+        }
+
+        double sumR = 0.0, lo = 1.0e300, hi = 0.0;
+        int pairs = 0;
+        for (size_t a = 0; a < wets.size(); ++a)
+        {
+            double ea = 0.0;
+            for (float x : wets[a])
+                ea += (double) x * x;
+            lo = ea < lo ? ea : lo;
+            hi = ea > hi ? ea : hi;
+
+            for (size_t b = a + 1; b < wets.size(); ++b)
+            {
+                double ab = 0.0, eb = 0.0;
+                for (size_t i = 0; i < wets[a].size(); ++i)
+                {
+                    ab += (double) wets[a][i] * wets[b][i];
+                    eb += (double) wets[b][i] * wets[b][i];
+                }
+                sumR += std::fabs (ab) / std::sqrt (ea * eb);
+                ++pairs;
+            }
+        }
+        CHECK (sumR / pairs < 0.25);
+        CHECK (10.0 * std::log10 (hi / lo) < 2.0);
+    }
 
     // With no depth there is no modulation, so the rate cannot matter - to the
     // bit, since a Hermite read at a whole delay returns the stored sample.
@@ -14457,6 +14571,7 @@ int main()
         testModulatedHallSpillover();
         testShimmerTap();
         testShimmerModel();
+        testStreamDeckGestureTracker();
         testMultitapDelayNeutral();
         testMultitapDelayTapPlacement();
         testMultitapDelayTimeModulation();

@@ -39,10 +39,14 @@ namespace spatcore::effects
     - ModDepth 50 % is the paper's excursion (16 samples at 29761 Hz, 0.54 ms);
       ModRate is the LFO. The two halves take sine and cosine, and the
       excursion glides so a depth change does not jump the read position.
-    - Per effects channel, each tank line is up to 3 % longer or shorter and
-      the LFO starts at its own phase, both from the noise key: thirty-two
-      plates built to the paper's numbers would be one plate thirty-two
-      times, and would comb instead of spreading.
+    - Per effects channel, each tank line is up to 3 % longer or shorter, the
+      LFO starts at its own phase, and each of the fourteen output taps takes
+      its own sign, all from the noise key: thirty-two plates built to the
+      paper's numbers would be one plate thirty-two times, and would comb
+      instead of spreading. The lengths alone are not enough - 3 % moves a
+      tap by a fraction of a millisecond, which decorrelates nothing below a
+      few kilohertz - so the signs do the spreading at every frequency, as
+      the hall's per-channel output signs do (testPlateReverbModel).
 
     Size is build-time (the lengths), everything else runtime. Every line is
     allocated in prepare() at the largest size, so a rebuild is a matter of
@@ -84,6 +88,13 @@ public:
             jitter[i] = 1.0f + kLineJitter * spatcore::dsp::FrDiffusion::hashNoiseBipolar (static_cast<std::uint32_t> (16 + i), key);
             tank[i].prepare (lengthOf (kTankBase[i] * jitter[i], kReverbMaxSize) + maxExcursion() + 4);
         }
+
+        // The paper's signs, each flipped or not per channel. A flip changes how
+        // the taps add, not what they carry: the decay, the bands and the
+        // level on average are the paper's.
+        for (int t = 0; t < 14; ++t)
+            tapSign[t] = spatcore::dsp::FrDiffusion::hashNoiseBipolar (static_cast<std::uint32_t> (64 + t), key) < 0.0f
+                             ? -kTaps[t].sign : kTaps[t].sign;
 
         lfo.prepare (sampleRate);
         lfo.setStartPhase (0.5 + 0.5 * static_cast<double> (spatcore::dsp::FrDiffusion::hashNoiseBipolar (40u, key)));
@@ -326,7 +337,7 @@ private:
         // t is the line's input t samples ago.
         float acc = 0.0f;
         for (int t = 0; t < 14; ++t)
-            acc += kTaps[t].sign * tank[kTaps[t].line].readInteger (tapAt[t] + 1);
+            acc += tapSign[t] * tank[kTaps[t].line].readInteger (tapAt[t] + 1);
 
         return kOutputGain * acc;
     }
@@ -344,6 +355,7 @@ private:
     int inLen[4] = {};
     int len[kTankLines] = {};
     int tapAt[14] = {};
+    float tapSign[14] = {};
 
     float inDiff1 = 0.0f, inDiff2 = 0.0f, decDiff1 = 0.5f;
     float decayRt60 = 1.5f, decayLow = 1.3f, decayHigh = 0.4f;
