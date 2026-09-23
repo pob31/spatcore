@@ -139,8 +139,12 @@ struct TremoloParams
 struct ReverbParams
 {
     std::uint8_t bypass = 1;
-    std::uint8_t model = 0;                 // 0 FDN; plate / SDN-style / IR later
-    std::uint8_t type = 0;                  // preset within the model
+    std::uint8_t model = 0;                 // ReverbModel (EffectPresets.h): 0 FDN, 1 Plate,
+                                            // 4 Modulated Hall, 5 Shimmer; 2 / 3 reserved (run the FDN)
+    std::uint8_t type = 6;                  // the preset id (ReverbType); 6 = Medium Hall, whose row
+                                            // is exactly the defaults below. The DSP never reads it.
+    std::uint8_t erProfile = 0;             // ErProfile: 0 Off, 1 Room, 2 Chamber, 3 Hall, 4 Cathedral
+    std::uint8_t shimmerPitch = 0;          // ShimmerInterval: 0 = an octave up
 
     float predelayMs = 10.0f;
     float rt60 = 1.5f;
@@ -152,6 +156,11 @@ struct ReverbParams
     float size = 1.0f;
     float toneHz = 12000.0f;
     float mix = 30.0f;
+
+    float erLevelDb = -6.0f;                // early reflections vs the tail, dB
+    float modRateHz = 0.8f;                 // tank modulation (Plate, Modulated Hall, Shimmer)
+    float modDepth = 50.0f;                 // %
+    float shimmerAmount = 50.0f;            // % of the shimmer lines' feedback that is pitch-shifted
 };
 
 struct MultitapParams

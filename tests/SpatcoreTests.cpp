@@ -8923,25 +8923,45 @@ static void testEffectReverbPresets()
 {
     using namespace spatcore::effects;
 
-    // The factory table is DATA, and data is what rots quietly: nothing else in
-    // this suite reads EffectPresets.h at all. Two things are pinned here - that
-    // the rows are inside the surface the module clamps to (a factory room must
-    // never arrive at the FDN having been trimmed on the way), and that
-    // expanding a type writes the room without touching the taste.
-    CHECK (findReverbPreset (0, (int) ReverbType::Custom) == nullptr);
-    CHECK (findReverbPreset (0, -1) == nullptr);
-    CHECK (findReverbPreset (0, kNumReverbPresets) == nullptr);
-    CHECK (findReverbPreset (1, 0) == nullptr);     // no table for a model v1 has not got
+    // The factory table is DATA, and data is what rots quietly. Pinned here:
+    // every row is inside the surface the models clamp to, names an
+    // implemented model and valid enums; the five shipped rooms keep their
+    // numbers (projects store their ids); row 6 is exactly the defaults (so a
+    // fresh channel is not a label over values it does not hold); and
+    // expanding a preset writes the room and the model without touching taste.
+    const int count = (int) ReverbType::Count;
+    CHECK (count == 23);
+    CHECK (findReverbPreset ((int) ReverbType::Custom) == nullptr);
+    CHECK (findReverbPreset (-1) == nullptr);
+    CHECK (findReverbPreset (count) == nullptr);
 
-    for (int t = 0; t < kNumReverbPresets; ++t)
+    // The model a stored id runs: 2 and 3 are reserved, anything unknown is
+    // the FDN.
+    CHECK (resolveReverbModel (0) == 0 && resolveReverbModel (1) == 1);
+    CHECK (resolveReverbModel (2) == 0 && resolveReverbModel (3) == 0);
+    CHECK (resolveReverbModel (4) == 4 && resolveReverbModel (5) == 5);
+    CHECK (resolveReverbModel (6) == 0 && resolveReverbModel (-1) == 0 && resolveReverbModel (255) == 0);
+
+    int rows = 0;
+    for (int t = 0; t < count; ++t)
     {
-        const ReverbPreset* row = findReverbPreset (0, t);
-        CHECK (row != nullptr);
+        const ReverbPreset* row = findReverbPreset (t);
+        if (t == (int) ReverbType::Custom)
+        {
+            CHECK (row == nullptr);
+            continue;
+        }
 
+        CHECK (row != nullptr);
         if (row == nullptr)
             continue;
 
+        ++rows;
         CHECK (row->name != nullptr);
+        CHECK (resolveReverbModel (row->model) == (int) row->model);        // an implemented model
+        CHECK (row->erProfile < (std::uint8_t) ErProfile::Count);
+        CHECK (row->shimmerPitch < (std::uint8_t) ShimmerInterval::Count);
+        CHECK (row->erLevelDb >= -30.0f && row->erLevelDb <= 6.0f);
         CHECK (row->rt60 >= 0.2f && row->rt60 <= 8.0f);
         CHECK (row->rt60LowMult >= 0.1f && row->rt60LowMult <= 9.0f);
         CHECK (row->rt60HighMult >= 0.1f && row->rt60HighMult <= 9.0f);
@@ -8949,40 +8969,92 @@ static void testEffectReverbPresets()
         CHECK (row->crossoverHigh >= 1000.0f && row->crossoverHigh <= 10000.0f);
         CHECK (row->crossoverLow < row->crossoverHigh);
         CHECK (row->diffusion >= 0.0f && row->diffusion <= 1.0f);
-        CHECK (row->size >= FdnReverbModel::kMinSize && row->size <= FdnReverbModel::kMaxSize);
+        CHECK (row->size >= kReverbMinSize && row->size <= kReverbMaxSize);
         CHECK (row->predelayMs >= 0.0f && row->predelayMs <= EffectReverbModule::kMaxPredelayMs);
+        CHECK (row->modRateHz >= 0.05f && row->modRateHz <= 5.0f);
+        CHECK (row->modDepth >= 0.0f && row->modDepth <= 100.0f);
+        CHECK (row->shimmerAmount >= 0.0f && row->shimmerAmount <= 100.0f);
+    }
+    CHECK (rows == count - 1);
+
+    // The shipped rooms, frozen: model 0, no early reflections, the values
+    // every existing project that stores ids 0..4 was saved with.
+    struct Frozen { float rt60, lo, hi, xLo, xHi, diff, size, pre; };
+    const Frozen frozen[5] = {
+        { 0.6f, 1.1f, 0.5f, 200.0f, 4000.0f, 0.60f, 0.6f,  5.0f },
+        { 1.2f, 1.2f, 0.6f, 180.0f, 5000.0f, 0.80f, 0.8f,  8.0f },
+        { 2.4f, 1.3f, 0.4f, 200.0f, 4000.0f, 0.50f, 1.3f, 20.0f },
+        { 5.0f, 1.5f, 0.3f, 150.0f, 3000.0f, 0.40f, 1.8f, 40.0f },
+        { 1.8f, 0.8f, 0.9f, 300.0f, 8000.0f, 0.95f, 0.7f,  0.0f } };
+    for (int t = 0; t < 5; ++t)
+    {
+        const ReverbPreset* row = findReverbPreset (t);
+        CHECK (row != nullptr && row->model == 0 && row->erProfile == 0);
+        if (row != nullptr)
+            CHECK (row->rt60 == frozen[t].rt60 && row->rt60LowMult == frozen[t].lo
+                   && row->rt60HighMult == frozen[t].hi && row->crossoverLow == frozen[t].xLo
+                   && row->crossoverHigh == frozen[t].xHi && row->diffusion == frozen[t].diff
+                   && row->size == frozen[t].size && row->predelayMs == frozen[t].pre);
     }
 
-    // Expanding a type writes the room and leaves tone, mix, bypass and model
-    // exactly as the player left them.
+    // Row 6 IS the defaults, field for field, and the default type points at it.
+    {
+        const ReverbParams d;
+        const ReverbPreset* row = findReverbPreset ((int) ReverbType::MediumHall);
+        CHECK (d.type == (std::uint8_t) ReverbType::MediumHall);
+        CHECK (row != nullptr);
+        if (row != nullptr)
+            CHECK (row->model == d.model && row->erProfile == d.erProfile && row->erLevelDb == d.erLevelDb
+                   && row->predelayMs == d.predelayMs && row->rt60 == d.rt60
+                   && row->rt60LowMult == d.rt60LowMult && row->rt60HighMult == d.rt60HighMult
+                   && row->crossoverLow == d.crossoverLow && row->crossoverHigh == d.crossoverHigh
+                   && row->diffusion == d.diffusion && row->size == d.size && row->modRateHz == d.modRateHz
+                   && row->modDepth == d.modDepth && row->shimmerPitch == d.shimmerPitch
+                   && row->shimmerAmount == d.shimmerAmount);
+    }
+
+    // Expanding writes the type, the model and the room, and leaves tone, mix
+    // and bypass exactly as the player left them.
     ReverbParams p;
     p.toneHz = 6543.0f;
     p.mix = 42.0f;
     p.bypass = 0;
-    p.model = 0;
-    CHECK (applyReverbPreset (p, 0, (int) ReverbType::Hall));
-    CHECK (p.type == (std::uint8_t) ReverbType::Hall);
-    CHECK (p.rt60 == 2.4f && p.size == 1.3f && p.predelayMs == 20.0f);   // the plan's Hall row
-    CHECK (p.toneHz == 6543.0f && p.mix == 42.0f && p.bypass == 0 && p.model == 0);
+    CHECK (applyReverbPreset (p, (int) ReverbType::VocalPlate));
+    CHECK (p.type == (std::uint8_t) ReverbType::VocalPlate);
+    CHECK (p.model == (std::uint8_t) ReverbModel::Plate);
+    CHECK (p.rt60 == 1.6f && p.size == 0.9f && p.predelayMs == 25.0f && p.modDepth == 45.0f);
+    CHECK (p.toneHz == 6543.0f && p.mix == 42.0f && p.bypass == 0);
 
-    // A type with no row is an answer, not a failure: the caller keeps what it
+    CHECK (applyReverbPreset (p, (int) ReverbType::ShimmerFifthOctave));
+    CHECK (p.model == (std::uint8_t) ReverbModel::Shimmer
+           && p.shimmerPitch == (std::uint8_t) ShimmerInterval::FifthAndOctave && p.shimmerAmount == 55.0f);
+
+    CHECK (applyReverbPreset (p, (int) ReverbType::StoneCathedral));
+    CHECK (p.model == (std::uint8_t) ReverbModel::ModulatedHall && p.erProfile == (std::uint8_t) ErProfile::Cathedral
+           && p.erLevelDb == -8.0f);
+
+    // An id with no row is an answer, not a failure: the caller keeps what it
     // has, which is what makes Custom a state rather than a special case.
     const ReverbParams before = p;
-    CHECK (! applyReverbPreset (p, 0, (int) ReverbType::Custom));
-    CHECK (p.type == before.type && p.rt60 == before.rt60 && p.size == before.size);
+    CHECK (! applyReverbPreset (p, (int) ReverbType::Custom));
+    CHECK (! applyReverbPreset (p, 99));
+    CHECK (p.type == before.type && p.model == before.model && p.rt60 == before.rt60 && p.size == before.size);
 
     // ...and every shipped row is a reverb that actually makes a sound.
-    for (int t = 0; t < kNumReverbPresets; ++t)
+    for (int t = 0; t < count; ++t)
     {
+        if (findReverbPreset (t) == nullptr)
+            continue;
+
         EffectReverbModule m;
         m.prepare (module_test::config (48000.0, 256));
 
         EffectChannelParams cp = reverb_test::params (100.0f, 0.0f);
-        CHECK (applyReverbPreset (cp.reverb, 0, t));            // predelay comes from the row
+        CHECK (applyReverbPreset (cp.reverb, t));               // predelay comes from the row
         if (m.applyParams (cp, 0).variantPending)
         {
             m.reset();
-            m.commitPendingVariant();                           // four of the five resize
+            m.commitPendingVariant();
         }
 
         const std::vector<float> ir = reverb_test::impulseResponse (m, 16384);
@@ -8992,7 +9064,7 @@ static void testEffectReverbPresets()
             finite = finite && std::isfinite (ir[(size_t) i]);
 
         CHECK (finite);
-        CHECK (reverb_test::windowDb (ir, 4096, 16384) > -70.0);    // measures -53.5 to -45.2
+        CHECK (reverb_test::windowDb (ir, 4096, 16384) > -70.0);
     }
 }
 
