@@ -7,9 +7,12 @@
 #include "../../dsp/FrDiffusionModel.h"
 #include "../../dsp/OnePoleSmoother.h"
 #include "../../reverb/ReverbFDNAlgorithm.h"
+#include "reverb/EarlyReflections.h"
+#include "reverb/ReverbDelayLine.h"
 #include "reverb/ReverbLfo.h"
 #include <juce_audio_basics/juce_audio_basics.h>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -266,38 +269,47 @@ private:
 
 //==============================================================================
 /**
-    Reverb: predelay, a tail from the selected model, tone, and a wet mix.
+    Reverb: predelay, early reflections, a tail from the selected model, tone,
+    and a wet mix.
 
-    The wet path is predelay -> tail -> one-pole low pass -> make-up -> mix.
-    The dry path is the buffer, untouched.
+    The wet path is predelay -> reflections + tail -> one-pole low pass ->
+    make-up -> mix. The dry path is the buffer, untouched. With reflections on,
+    the predelayed signal also goes into a ring that the reflection taps read,
+    and the tail takes its input from the same ring a profile's tail delay
+    later - see reverb/EarlyReflections.h.
 
-    THE TAIL IS A POOL, NOT A MODEL. Every tail class is built twice, in
-    prepare(). One instance is ACTIVE and takes the input. A change that needs
-    another topology - a model of another class, another size - does not fade
-    the reverb out: the idle twin is rebuilt at the new topology, the input is
-    crossfaded onto it over 5 ms, and the instance that was active RINGS OUT
-    with the values it had, fed silence, until its tail is gone. That is
-    spillover, what a hardware reverb does on a program change: a cue that
-    changes the room does not chop the tail that is still in the air. So the
-    module never reports a variant, and the slot never fades it for one.
+    THE WET IS A SET OF WORLDS, NOT A MODEL. A world is one tail instance and
+    the reflection pattern it runs with. Every tail class is built twice, in
+    prepare(), and one world is ACTIVE. A change that needs another topology -
+    a model of another class, another size, another reflection profile - does
+    not fade the reverb out: a new world is built on the idle twin, and the
+    input is partitioned between the two BY THE TIME IT WAS WRITTEN. Sound that
+    arrived before the change plays out entirely in the old world - its
+    reflections and its tail, with the values it had - and sound after it
+    entirely in the new one, the switch smoothed by a 5 ms raised cosine on
+    the write time. That is spillover, what a hardware reverb does on a program
+    change: a cue that changes the room does not chop the tail that is still
+    in the air. So the module never reports a variant, and the slot never
+    fades it for one.
 
-    - The input is PARTITIONED, never doubled or dropped: the incoming instance
-      takes w(k) of it and the outgoing one 1 - w(k), w a raised cosine. Every
-      gain in the pool moves continuously, so no transition can click,
-      whatever arrives when.
-    - One crossfade at a time. A change that arrives during one waits for it -
-      5 ms at most - while the input carries on moving across.
-    - At most three instances run: the active one, one RINGING, and one DYING,
-      a ringing instance whose voice the next change needed, faded out over
-      5 ms. Rapid changes cost the oldest tail, never a click.
-    - A ringing instance goes idle once its output has stayed under -96 dBFS
-      for 50 ms, and is faded out after 30 s whatever it is doing.
+    Every world is linear and the partition is on the input, so a spillover is
+    exactly the old world fed the input up to the change plus the new world
+    fed the rest: no sample doubled or dropped, no gain that steps.
+
+    - One crossfade at a time: a change that arrives within 5 ms of the last
+      one waits for it.
+    - At most three worlds run: the active one, one RINGING, and one DYING - a
+      ringing world whose voice the next change needed, faded out over 5 ms.
+      Rapid changes cost the oldest tail, never a click.
+    - A ringing world goes idle once it has read its last input and its output
+      has stayed under -96 dBFS for 50 ms, and is faded out after 30 s
+      whatever it is doing.
     - Nothing to spill, nothing spilled: while no instance has run since the
       last reset - the first set after prepare(), a bypassed slot - a change
       takes effect at once.
-    - Settled, with one instance and no transition, the path is the
-      single-model path it always was, sample for sample: no crossfade, no
-      summing with a zero.
+    - Settled, one world with reflections off is the single-model path it
+      always was, sample for sample: no ring, no crossfade, no summing with a
+      zero.
 
     The wet leg carries a fixed gain of two, measured rather than guessed. The
     FDN's own times-four is a level CORRECTION, not headroom, and with it alone
@@ -306,7 +318,8 @@ private:
     reverb audible instead of balancing it. Doubling puts a 0.6 s room about
     8 dB under the dry, a 1.5 s hall 5 dB under and a 5 s cathedral level with
     it, which is a spread a mix control can work either side of. Two is exact in
-    binary, so it costs the wet no accuracy.
+    binary, so it costs the wet no accuracy. The reflection tables are
+    normalised against it: at ER Level 0 dB they carry the dry's energy.
 
     Latency is reported as zero, and that is not a shortcut. A reverb adds a
     tail, not a delay: the dry component leaves in the same sample it arrived
@@ -327,9 +340,10 @@ private:
     instead, which it does not.
 
     prepare() allocates. Nothing else does: an idle instance is rebuilt inside
-    the capacity prepare() gave it - see FdnReverbModel. About 480 KiB per
-    module at 48 kHz (two networks sized for 2.5, plus a quarter-second
-    predelay ring), doubling with the rate.
+    the capacity prepare() gave it - see FdnReverbModel - and a reflection
+    pattern is a fixed-size array. About 560 KiB per module at 48 kHz (two
+    networks sized for 2.5, a quarter-second predelay ring and a 0.4 s
+    reflection ring), doubling with the rate.
 */
 class EffectReverbModule final : public IEffectModule
 {
@@ -340,15 +354,19 @@ public:
         figure, not a round one - see the class note. */
     static constexpr float kWetGain = 2.0f;
 
-    /** The input crossfade onto an incoming instance, and a dying one's fade. */
+    /** The input crossfade between two worlds, and a dying world's fade. */
     static constexpr double kSpillFadeSeconds = 0.005;
 
-    /** A ringing instance is idle once its wet output has stayed under
+    /** A ringing world is idle once its wet output has stayed under
         kQuietGain (-96 dBFS) for kQuietHoldSeconds, and is faded out after
         kMaxRingSeconds whatever it is doing. */
     static constexpr float kQuietGain = 1.5849e-5f;
     static constexpr double kQuietHoldSeconds = 0.05;
     static constexpr double kMaxRingSeconds = 30.0;
+
+    /** The reflections' level, dB against the dry. */
+    static constexpr float kMinErLevelDb = -30.0f;
+    static constexpr float kMaxErLevelDb = 6.0f;
 
     /** Tail classes, each built twice, so a change inside a class - a size -
         spills over as surely as a change between classes does. */
@@ -363,17 +381,22 @@ public:
         sampleRate = config.sampleRate > 0.0 ? config.sampleRate : 48000.0;
         maxBlock = config.maxBlock > 0 ? config.maxBlock : 1;
         msToSamples = static_cast<float> (sampleRate * 0.001);
+        noiseKey = config.noiseKey;
 
         predelay.prepare (static_cast<int> (std::ceil (kMaxPredelayMs * 0.001 * sampleRate)) + 2);
+        erRing.prepare (erMaxReadSamples (sampleRate) + 1);        // a delay of d reads d + 1 after the write
         wetScratch.assign (static_cast<size_t> (maxBlock), 0.0f);
         ringScratch.assign (static_cast<size_t> (maxBlock), 0.0f);
         dyingScratch.assign (static_cast<size_t> (maxBlock), 0.0f);
+        for (auto& b : erScratch)
+            b.assign (static_cast<size_t> (maxBlock), 0.0f);
 
         predelaySamples.setTimeConstant (sampleRate, kParamTauSeconds);
         predelaySamples.setSnapEpsilon (1.0e-3f);           // samples, not a unit gain
         toneCoef.setTimeConstant (sampleRate, kParamTauSeconds);
         toneCoef.setSnapEpsilon (1.0e-6f);                  // a one-pole coefficient
         wet.setTimeConstant (sampleRate, kParamTauSeconds);
+        erGain.setTimeConstant (sampleRate, kParamTauSeconds);
 
         // w(k) = sin^2 (pi k / 2N), from the libm-free sine so a render hashes
         // the same on every platform. Its complement is the outgoing share.
@@ -399,9 +422,14 @@ public:
             dirty[k] = true;                                // reset() below clears them all
         }
 
-        active = firstOfClass (classFor (defaults));
-        ringing = -1;
-        dying = -1;
+        for (auto& w : worlds)
+            w = World {};
+
+        activeW = 0;
+        worlds[0].tail = firstOfClass (classFor (defaults));
+        buildErTapSet (worlds[0].er, resolveErProfile (defaults.erProfile), sizeFor (defaults), sampleRate, noiseKey);
+        ringingW = -1;
+        dyingW = -1;
         transitionWanted = false;
 
         setTargets (defaults);
@@ -412,14 +440,17 @@ public:
     void reset() noexcept override
     {
         predelay.reset();
+        erRing.reset();
         toneState = 0.0f;
+        now = 0;
+        lastChange = kLongAgo;
 
         for (int k = 0; k < kNumInstances; ++k)
             clearIfDirty (k);
 
-        ringing = -1;
-        dying = -1;
-        xfadePos = fadeLen;
+        ringingW = -1;
+        dyingW = -1;
+        settle (worlds[activeW]);
 
         // Silent now, so a change still waiting for a voice has nothing left
         // to spill over: it takes effect directly.
@@ -432,6 +463,7 @@ public:
         predelaySamples.snap (predelaySamples.getTarget());
         toneCoef.snap (toneCoef.getTarget());
         wet.snap (wet.getTarget());
+        erGain.snap (erGain.getTarget());
 
         meterDb.store (spatcore::dsp::FastDecibels::kMinDb, std::memory_order_relaxed);
     }
@@ -445,7 +477,7 @@ public:
         if (! needsTransition (r))
         {
             transitionWanted = false;               // a change taken back before it could start
-            instance (active).setParams (r);        // the runtime values
+            instance (worlds[activeW].tail).setParams (r);  // the runtime values
         }
         else if (snapOnNextApply || ! anyDirty())
         {
@@ -467,6 +499,7 @@ public:
             predelaySamples.snap (predelaySamples.getTarget());
             toneCoef.snap (toneCoef.getTarget());
             wet.snap (wet.getTarget());
+            erGain.snap (erGain.getTarget());
             snapOnNextApply = false;
         }
 
@@ -516,21 +549,49 @@ public:
         return meterDb.load (std::memory_order_relaxed);
     }
 
-    /** Instances ringing out or fading under the active one: 0, 1 or 2. */
-    int getSpillVoices() const noexcept      { return (ringing >= 0 ? 1 : 0) + (dying >= 0 ? 1 : 0); }
+    /** Worlds ringing out or fading under the active one: 0, 1 or 2. */
+    int getSpillVoices() const noexcept      { return (ringingW >= 0 ? 1 : 0) + (dyingW >= 0 ? 1 : 0); }
 
     /** True while a change waits for the pool to free a voice. */
     bool isTransitionWaiting() const noexcept { return transitionWanted; }
 
-    /** The Size the ACTIVE instance is built at - what the input is going to. */
-    float getActiveSize() const noexcept     { return instance (active).getBuiltSize(); }
+    /** The Size the ACTIVE tail is built at - what the input is going to. */
+    float getActiveSize() const noexcept     { return instance (worlds[activeW].tail).getBuiltSize(); }
+
+    /** The reflection pattern the input is going to. */
+    const ErTapSet& getActiveReflections() const noexcept { return worlds[activeW].er; }
 
 private:
+    static constexpr std::int64_t kLongAgo = -(static_cast<std::int64_t> (1) << 60);
+    static constexpr std::int64_t kForever = static_cast<std::int64_t> (1) << 60;
+
+    /** One tail instance and the reflections it runs with, and the stretch of
+        input - by write time - that is theirs. */
+    struct World
+    {
+        int tail = 0;                               // pool instance
+        ErTapSet er;                                // Off: no taps, no tail delay
+        std::int64_t start = kLongAgo;              // the input window opens here...
+        std::int64_t end = kForever;                // ...and closes here, each over fadeLen
+        float erGain = 1.0f;                        // frozen once the world stops being active
+        float darkState = 0.0f;                     // the higher-order taps' one-pole
+        int fadePos = 0;                            // dying: the output fade's position
+        int age = 0;                                // ringing: samples since it stopped taking input
+        int quiet = 0;                              // ringing: consecutive quiet samples
+    };
+
+    enum class Feed { Pass, Silence, Window };
+
     static float clampParam (float v, float lo, float hi) noexcept
     {
         if (! (v > lo)) return lo;
         if (v > hi)     return hi;
         return v;
+    }
+
+    static float sizeFor (const ReverbParams& r) noexcept
+    {
+        return FdnReverbModel::quantiseSize (clampParam (r.size, kReverbMinSize, kReverbMaxSize));
     }
 
     /** The tail class a parameter set runs on. */
@@ -548,7 +609,10 @@ private:
 
     bool needsTransition (const ReverbParams& r) const noexcept
     {
-        return classFor (r) != classOfInstance (active) || instance (active).isBuildDifferent (r);
+        const World& a = worlds[activeW];
+        return classFor (r) != classOfInstance (a.tail)
+            || instance (a.tail).isBuildDifferent (r)
+            || ! a.er.matches (resolveErProfile (r.erProfile), sizeFor (r));
     }
 
     bool anyDirty() const noexcept
@@ -570,47 +634,65 @@ private:
         }
     }
 
-    /** No tail to spill: the wanted topology becomes the active one at once. */
-    void switchDirectly (const ReverbParams& r) noexcept
+    /** A world that has always been the only one. */
+    static void settle (World& w) noexcept
     {
-        const int cls = classFor (r);
-        if (classOfInstance (active) != cls)
-        {
-            clearIfDirty (active);
-            active = firstOfClass (cls);
-        }
-
-        IEffectReverbModel& m = instance (active);
-        if (m.setParams (r))
-            m.commitPendingVariant();
+        w.start = kLongAgo;
+        w.end = kForever;
+        w.darkState = 0.0f;
+        w.fadePos = 0;
+        w.age = 0;
+        w.quiet = 0;
     }
 
-    /** Starts a spillover onto an idle instance built at `r`. False while the
-        pool cannot take one yet - a crossfade still running, or the voice it
-        needs still fading out - and the next block tries again. */
+    /** No tail to spill: the wanted world becomes the active one at once. */
+    void switchDirectly (const ReverbParams& r) noexcept
+    {
+        World& a = worlds[activeW];
+        const int cls = classFor (r);
+        if (classOfInstance (a.tail) != cls)
+        {
+            clearIfDirty (a.tail);
+            a.tail = firstOfClass (cls);
+        }
+
+        IEffectReverbModel& m = instance (a.tail);
+        if (m.setParams (r))
+            m.commitPendingVariant();
+
+        buildErTapSet (a.er, resolveErProfile (r.erProfile), sizeFor (r), sampleRate, noiseKey);
+        settle (a);
+    }
+
+    /** Starts a spillover into a new world built at `r`. False while the pool
+        cannot take one yet - a crossfade still running, or the voice it needs
+        still fading out - and the next block tries again. */
     bool tryStartTransition (const ReverbParams& r) noexcept
     {
-        if (xfadePos < fadeLen)
+        if (now < lastChange + fadeLen)
             return false;
 
-        // The active instance is about to ring, so the one ringing now has to
-        // go. Fed silence since its own crossfade ended, only its output needs
-        // the fade.
-        if (ringing >= 0)
+        // The active world is about to ring, so the one ringing now has to go.
+        // Its input window closed at least 5 ms ago; it keeps reading what it
+        // had while its output fades.
+        if (ringingW >= 0)
         {
-            if (dying >= 0)
+            if (dyingW >= 0)
                 return false;
 
-            dying = ringing;
-            dyingPos = 0;
-            ringing = -1;
+            dyingW = ringingW;
+            worlds[dyingW].fadePos = 0;
+            ringingW = -1;
         }
 
         const int cls = classFor (r);
+        const int busyActive = worlds[activeW].tail;
+        const int busyDying = dyingW >= 0 ? worlds[dyingW].tail : -1;
+
         int target = -1;
         for (int k = firstOfClass (cls); k < firstOfClass (cls) + kInstancesPerClass; ++k)
         {
-            if (k != active && k != dying)
+            if (k != busyActive && k != busyDying)
             {
                 target = k;
                 break;
@@ -620,17 +702,97 @@ private:
         if (target < 0)
             return false;                           // its twin is the one fading out
 
+        int slot = 0;
+        while (slot == activeW || slot == dyingW)
+            ++slot;
+
         IEffectReverbModel& m = instance (target);
         if (m.setParams (r))
             m.commitPendingVariant();               // inside the capacity prepare() gave it
         clearIfDirty (target);
 
-        ringing = active;
-        ringAge = 0;
-        ringQuiet = 0;
-        active = target;
-        xfadePos = 0;
+        World& incoming = worlds[slot];
+        incoming.tail = target;
+        buildErTapSet (incoming.er, resolveErProfile (r.erProfile), sizeFor (r), sampleRate, noiseKey);
+        incoming.start = now;
+        incoming.end = kForever;
+        incoming.darkState = 0.0f;
+        incoming.fadePos = 0;
+        incoming.age = 0;
+        incoming.quiet = 0;
+
+        World& outgoing = worlds[activeW];
+        outgoing.end = now;
+        outgoing.erGain = erGain.getCurrent();      // keeps the level it had
+        outgoing.age = 0;
+        outgoing.quiet = 0;
+
+        erGain.snap (erGain.getTarget());           // the incoming window fades it in anyway
+        ringingW = activeW;
+        activeW = slot;
+        lastChange = now;
         return true;
+    }
+
+    /** The share of the sample written at `s` that belongs to `w`. */
+    float windowAt (const World& w, std::int64_t s) const noexcept
+    {
+        const std::int64_t a = s - w.start;
+        if (a < 0)
+            return 0.0f;
+
+        const float in = a < fadeLen ? fadeIn[static_cast<size_t> (a)] : 1.0f;
+
+        const std::int64_t b = s - w.end;
+        if (b < 0)
+            return in;
+        if (b >= fadeLen)
+            return 0.0f;
+
+        return in * (1.0f - fadeIn[static_cast<size_t> (b)]);
+    }
+
+    /** How a world's tail is fed for a chunk starting at write time t0: its
+        own window whole (pass), entirely closed (silence), or partly. */
+    Feed feedFor (const World& w, std::int64_t t0, int n) const noexcept
+    {
+        const std::int64_t first = t0 - w.er.tailDelay;     // the oldest sample it reads
+        if (first >= w.end + fadeLen)
+            return Feed::Silence;
+        if (first >= w.start + fadeLen && first + n <= w.end)
+            return Feed::Pass;
+        return Feed::Window;
+    }
+
+    /** One sample of a world's reflections, the sample at write time `s` just
+        written. `windowed` weighs each tap by the world's share of what it
+        reads; a settled active world skips that. */
+    float reflect (World& w, std::int64_t s, bool windowed) noexcept
+    {
+        const ErTapSet& e = w.er;
+        float first = 0.0f, higher = 0.0f;
+
+        for (int j = 0; j < e.numTaps; ++j)
+        {
+            float g = e.gain[j];
+
+            if (windowed)
+            {
+                const float k = windowAt (w, s - e.delay[j]);
+                if (k == 0.0f)
+                    continue;                       // not its sound: never even read
+                g *= k;
+            }
+
+            const float v = g * erRing.readInteger (e.delay[j] + 1);
+            if (j < e.numFirst)
+                first += v;
+            else
+                higher += v;
+        }
+
+        w.darkState += e.darkCoef * (higher - w.darkState);
+        return first + w.darkState;
     }
 
     /** 1 - exp(-2*pi*f/sr) without libm, so an offline render of the same
@@ -651,103 +813,184 @@ private:
         predelaySamples.setTarget (clampParam (r.predelayMs, 0.0f, kMaxPredelayMs) * msToSamples);
         toneCoef.setTarget (onePoleCoef (clampParam (r.toneHz, 1000.0f, 20000.0f)));
         wet.setTarget (clampParam (r.mix, 0.0f, 100.0f) * 0.01f);
+        erGain.setTarget (spatcore::dsp::FastDecibels::dbToGain (clampParam (r.erLevelDb, kMinErLevelDb, kMaxErLevelDb)));
     }
 
-    /** The tail: the active instance alone when settled, the pool while a
-        change spills over. */
-    void runTail (float* w, int n) noexcept
+    /** The wet before tone: the active world alone when settled, every world
+        while a change spills over. `x` is the predelayed input on entry. */
+    void runWet (float* x, int n) noexcept
     {
-        if (ringing < 0 && dying < 0 && xfadePos >= fadeLen)
+        const std::int64_t t0 = now;
+        World& a = worlds[activeW];
+
+        if (ringingW < 0 && dyingW < 0 && t0 - a.er.maxRead >= a.start + fadeLen)
         {
-            instance (active).process (w, n);
-            dirty[active] = true;
+            if (! a.er.isOn())
+            {
+                instance (a.tail).process (x, n);
+            }
+            else
+            {
+                float* er = erScratch[0].data();
+                for (int i = 0; i < n; ++i)
+                {
+                    erRing.write (x[i]);
+                    er[i] = erGain.next() * reflect (a, t0 + i, false);
+                    x[i] = erRing.readInteger (a.er.tailDelay + 1);
+                }
+
+                instance (a.tail).process (x, n);
+
+                for (int i = 0; i < n; ++i)
+                    x[i] += er[i];
+            }
+
+            dirty[a.tail] = true;
+            now += n;
             return;
         }
 
-        const bool crossfading = xfadePos < fadeLen;
-        float* rs = ringScratch.data();
-        float* ds = dyingScratch.data();
+        // Roles: 0 active (fed in place), 1 ringing, 2 dying.
+        const int roleWorld[3] = { activeW, ringingW, dyingW };
+        float* const roleBuf[3] = { x, ringScratch.data(), dyingScratch.data() };
 
-        // The partition: the incoming instance takes w * fadeIn, the outgoing
-        // one the rest - and silence once the crossfade is over.
-        if (crossfading)
+        Feed feed[3] = { Feed::Silence, Feed::Silence, Feed::Silence };
+        bool windowedEr[3] = { true, true, true };
+        bool ringLive = false;
+
+        for (int r = 0; r < 3; ++r)
         {
-            for (int i = 0; i < n; ++i)
+            if (roleWorld[r] < 0)
+                continue;
+
+            const World& w = worlds[roleWorld[r]];
+            feed[r] = feedFor (w, t0, n);
+            windowedEr[r] = ! (w.end == kForever && t0 - w.er.maxRead >= w.start + fadeLen);
+            ringLive = ringLive || w.er.isOn();
+        }
+
+        for (int i = 0; i < n; ++i)
+        {
+            const float xi = x[i];
+            const std::int64_t s = t0 + i;
+
+            if (ringLive)
+                erRing.write (xi);
+
+            // The active world last: it is fed in place.
+            for (int r = 2; r >= 0; --r)
             {
-                const int k = xfadePos + i;
-                const float g = k < fadeLen ? fadeIn[static_cast<size_t> (k)] : 1.0f;
-                rs[i] = w[i] * (1.0f - g);
-                w[i] = w[i] * g;
+                if (roleWorld[r] < 0)
+                    continue;
+
+                World& w = worlds[roleWorld[r]];
+                const int d = w.er.tailDelay;
+                float in;
+
+                if (feed[r] == Feed::Silence)
+                {
+                    in = 0.0f;
+                }
+                else if (d == 0)
+                {
+                    in = feed[r] == Feed::Pass ? xi : xi * windowAt (w, s);
+                }
+                else if (feed[r] == Feed::Pass)
+                {
+                    in = erRing.readInteger (d + 1);
+                }
+                else
+                {
+                    const float k = windowAt (w, s - d);
+                    in = k == 0.0f ? 0.0f : erRing.readInteger (d + 1) * k;
+                }
+
+                roleBuf[r][i] = in;
+
+                if (w.er.isOn())
+                {
+                    const float g = r == 0 ? erGain.next() : w.erGain;
+                    erScratch[static_cast<size_t> (r)][static_cast<size_t> (i)] = g * reflect (w, s, windowedEr[r]);
+                }
             }
         }
-        else if (ringing >= 0)
+
+        for (int r = 0; r < 3; ++r)
         {
-            std::fill (rs, rs + n, 0.0f);
+            if (roleWorld[r] < 0)
+                continue;
+
+            World& w = worlds[roleWorld[r]];
+            float* b = roleBuf[r];
+            instance (w.tail).process (b, n);
+            dirty[w.tail] = true;
+
+            if (w.er.isOn())
+            {
+                const float* er = erScratch[static_cast<size_t> (r)].data();
+                for (int i = 0; i < n; ++i)
+                    b[i] += er[i];
+            }
         }
 
-        if (ringing >= 0)
+        if (dyingW >= 0)
         {
-            instance (ringing).process (rs, n);
-            dirty[ringing] = true;
-        }
-
-        if (dying >= 0)
-        {
-            std::fill (ds, ds + n, 0.0f);
-            instance (dying).process (ds, n);
-            dirty[dying] = true;
-
+            float* ds = roleBuf[2];
+            const int pos = worlds[dyingW].fadePos;
             for (int i = 0; i < n; ++i)
             {
-                const int k = dyingPos + i;
+                const int k = pos + i;
                 ds[i] *= k < fadeLen ? 1.0f - fadeIn[static_cast<size_t> (k)] : 0.0f;
             }
         }
 
-        instance (active).process (w, n);
-        dirty[active] = true;
-
         float ringPeak = 0.0f;
-        if (ringing >= 0)
+        if (ringingW >= 0)
         {
+            const float* rs = roleBuf[1];
             for (int i = 0; i < n; ++i)
             {
                 const float v = rs[i];
                 const float magnitude = v < 0.0f ? -v : v;
                 if (magnitude > ringPeak)
                     ringPeak = magnitude;
-                w[i] += v;
+                x[i] += v;
             }
         }
 
-        if (dying >= 0)
+        if (dyingW >= 0)
+        {
+            const float* ds = roleBuf[2];
             for (int i = 0; i < n; ++i)
-                w[i] += ds[i];
-
-        if (crossfading)
-            xfadePos = (fadeLen - xfadePos) > n ? xfadePos + n : fadeLen;
-
-        if (dying >= 0)
-        {
-            dyingPos += n;
-            if (dyingPos >= fadeLen)
-                dying = -1;                         // faded out: idle, cleared when next taken
+                x[i] += ds[i];
         }
 
-        if (ringing >= 0)
-        {
-            ringAge += n;
-            ringQuiet = (! crossfading && ringPeak * kWetGain < kQuietGain) ? ringQuiet + n : 0;
+        now += n;
 
-            if (ringQuiet >= quietHoldSamples)
+        if (dyingW >= 0)
+        {
+            worlds[dyingW].fadePos += n;
+            if (worlds[dyingW].fadePos >= fadeLen)
+                dyingW = -1;                        // faded out: its voice is idle
+        }
+
+        if (ringingW >= 0)
+        {
+            World& w = worlds[ringingW];
+            const bool readsDone = t0 - w.er.maxRead >= w.end + fadeLen;
+
+            w.age += n;
+            w.quiet = (readsDone && ringPeak * kWetGain < kQuietGain) ? w.quiet + n : 0;
+
+            if (w.quiet >= quietHoldSamples)
             {
-                ringing = -1;                       // rung out: idle, cleared when next taken
+                ringingW = -1;                      // rung out: its voice is idle
             }
-            else if (ringAge >= maxRingSamples && dying < 0)
+            else if (w.age >= maxRingSamples && dyingW < 0)
             {
-                dying = ringing;
-                dyingPos = 0;
-                ringing = -1;
+                dyingW = ringingW;
+                worlds[dyingW].fadePos = 0;
+                ringingW = -1;
             }
         }
     }
@@ -764,7 +1007,7 @@ private:
             w[i] = predelay.readLinear (predelaySamples.next());
         }
 
-        runTail (w, n);
+        runWet (w, n);
 
         for (int i = 0; i < n; ++i)
         {
@@ -789,23 +1032,25 @@ private:
     FdnReverbModel fdn[kInstancesPerClass];
     bool dirty[kNumInstances] = {};
 
-    int active = 0;
-    int ringing = -1;
-    int dying = -1;
-    int xfadePos = 0;
-    int dyingPos = 0;
-    int ringAge = 0;
-    int ringQuiet = 0;
+    World worlds[3];
+    int activeW = 0;
+    int ringingW = -1;
+    int dyingW = -1;
+    std::int64_t now = 0;                           // the write time of the next sample
+    std::int64_t lastChange = kLongAgo;
     bool transitionWanted = false;
     ReverbParams wanted;
 
     spatcore::dsp::FractionalDelayLine predelay;
+    ReverbDelayLine erRing;
     std::vector<float> wetScratch, ringScratch, dyingScratch;
+    std::array<std::vector<float>, 3> erScratch;
     std::vector<float> fadeIn;
-    spatcore::dsp::OnePoleSmoother predelaySamples, toneCoef, wet;
+    spatcore::dsp::OnePoleSmoother predelaySamples, toneCoef, wet, erGain;
 
     double sampleRate = 48000.0;
     float msToSamples = 48.0f;
+    std::uint32_t noiseKey = 0;
     int maxBlock = 0;
     int fadeLen = 1;
     int quietHoldSamples = 2400;

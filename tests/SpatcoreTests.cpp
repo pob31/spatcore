@@ -140,6 +140,7 @@
 #include "spatcore/effects/modules/ModulationModule.h"
 #include "spatcore/effects/modules/PhaserModule.h"
 #include "spatcore/effects/modules/reverb/ReverbDelayLine.h"
+#include "spatcore/effects/modules/reverb/EarlyReflections.h"
 #include "spatcore/effects/modules/reverb/ReverbLfo.h"
 #include "spatcore/effects/modules/EffectReverbModule.h"
 #include "spatcore/effects/modules/MultitapDelayModule.h"
@@ -9595,6 +9596,532 @@ static void testReverbLfoSine()
 }
 
 //==============================================================================
+// effects/modules/reverb/EarlyReflections - the profiles and their taps
+//==============================================================================
+
+static void testEarlyReflectionProfiles()
+{
+    using namespace spatcore::effects;
+
+    // The tables are generated (tools/reverb/gen_er_profiles.py). Pinned here
+    // is what the module relies on: every room has taps, in arrival order, no
+    // earlier than 2 ms, carrying a quarter of the dry's energy; Off has none;
+    // anything unknown is Off.
+    CHECK (resolveErProfile (-1) == 0 && resolveErProfile (0) == 0);
+    CHECK (resolveErProfile ((int) ErProfile::Cathedral) == (int) ErProfile::Cathedral);
+    CHECK (resolveErProfile ((int) ErProfile::Count) == 0 && resolveErProfile (99) == 0);
+    CHECK (kErProfiles[0].numTaps == 0 && kErProfiles[0].tailDelayMs == 0.0f);
+
+    const int expectTaps[] = { 0, 16, 18, 20, 24 };
+    for (int p = 1; p < (int) ErProfile::Count; ++p)
+    {
+        const ErProfileSpec& spec = kErProfiles[p];
+        CHECK (spec.numTaps == expectTaps[p] && spec.numTaps <= ErTapSet::kMaxTaps);
+
+        double energy = 0.0;
+        bool ordered = true, early = true, hasFirst = false;
+        for (int j = 0; j < spec.numTaps; ++j)
+        {
+            energy += (double) spec.taps[j].gain * (double) spec.taps[j].gain;
+            ordered = ordered && (j == 0 || spec.taps[j].ms >= spec.taps[j - 1].ms);
+            early = early && spec.taps[j].ms >= 2.0f;
+            hasFirst = hasFirst || spec.taps[j].order == 1;
+        }
+        CHECK (std::fabs (energy - 0.25) < 0.0025);
+        CHECK (ordered && early && hasFirst);
+        CHECK (spec.tailDelayMs > 0.0f && spec.darkHz >= 1000.0f);
+    }
+
+    // Bigger rooms, later reflections.
+    CHECK (kErRoom[15].ms < kErChamber[17].ms && kErChamber[17].ms < kErHall[19].ms
+           && kErHall[19].ms < kErCathedral[23].ms);
+
+    // Built for a channel: every tap where the table puts it, scaled by Size
+    // and moved by at most 4 %; first order first and positive, higher orders
+    // with signs drawn; the tail delay scaled but not jittered.
+    const double sr = 48000.0;
+    for (int p = 1; p < (int) ErProfile::Count; ++p)
+    {
+        const ErProfileSpec& spec = kErProfiles[p];
+
+        for (float size : { 0.5f, 1.0f, 2.0f })
+        {
+            ErTapSet set;
+            buildErTapSet (set, p, size, sr, 7u);
+            CHECK (set.profile == p && set.isOn() && set.numTaps == spec.numTaps);
+            CHECK (set.tailDelay == (int) ((double) spec.tailDelayMs * size * 48.0 + 0.5));
+            CHECK (set.darkCoef > 0.0f && set.darkCoef < 1.0f);
+
+            int k = 0, numFirst = 0, negatives = 0, moved = 0, maxRead = set.tailDelay;
+            bool placed = true, firstPositive = true;
+
+            for (int pass = 0; pass < 2; ++pass)
+            {
+                for (int j = 0; j < spec.numTaps; ++j)
+                {
+                    const ErTapSpec& t = spec.taps[j];
+                    if ((t.order == 1) != (pass == 0))
+                        continue;
+
+                    const double nominal = (double) t.ms * size * 48.0;
+                    const int d = set.delay[k];
+                    placed = placed && d >= (int) (nominal * 0.96) - 1 && d <= (int) (nominal * 1.04) + 1
+                                    && std::fabs (set.gain[k]) == t.gain;
+
+                    if (pass == 0)
+                    {
+                        firstPositive = firstPositive && set.gain[k] > 0.0f;
+                        ++numFirst;
+                    }
+                    else if (set.gain[k] < 0.0f)
+                    {
+                        ++negatives;
+                    }
+
+                    moved += d != (int) (nominal + 0.5) ? 1 : 0;
+                    maxRead = d > maxRead ? d : maxRead;
+                    ++k;
+                }
+            }
+
+            CHECK (placed && firstPositive);
+            CHECK (set.numFirst == numFirst);
+            CHECK (negatives > 0 && negatives < spec.numTaps - numFirst);  // drawn, not all one way
+            CHECK (moved > spec.numTaps / 2);                              // jittered, not merely rounded
+            CHECK (set.maxRead == maxRead);
+            CHECK (set.maxRead < erMaxReadSamples (sr));
+        }
+    }
+
+    // Per channel: the same key builds the same pattern, another key another.
+    ErTapSet a, b, c;
+    buildErTapSet (a, 2, 1.0f, sr, 5u);
+    buildErTapSet (b, 2, 1.0f, sr, 5u);
+    buildErTapSet (c, 2, 1.0f, sr, 6u);
+    bool same = true, differs = false;
+    for (int j = 0; j < a.numTaps; ++j)
+    {
+        same = same && a.delay[j] == b.delay[j] && a.gain[j] == b.gain[j];
+        differs = differs || a.delay[j] != c.delay[j] || a.gain[j] != c.gain[j];
+    }
+    CHECK (same && differs);
+
+    // Off has nothing - no taps, no tail delay - at any size, and so does an
+    // id this build does not know.
+    ErTapSet off;
+    buildErTapSet (off, 0, 1.7f, sr, 5u);
+    CHECK (! off.isOn() && off.numTaps == 0 && off.tailDelay == 0 && off.maxRead == 0);
+    buildErTapSet (off, 99, 1.0f, sr, 5u);
+    CHECK (! off.isOn() && off.numTaps == 0 && off.tailDelay == 0);
+
+    // matches(): Off is Off at any size; a room is itself at its own size only.
+    CHECK (off.matches (0, 1.3f) && ! off.matches (1, 1.0f));
+    CHECK (a.matches (2, 1.0f) && ! a.matches (2, 1.01f) && ! a.matches (3, 1.0f) && ! a.matches (0, 1.0f));
+
+    // The ring the module sizes from erMaxReadSamples() holds the longest read
+    // at every rate.
+    ErTapSet big;
+    buildErTapSet (big, (int) ErProfile::Cathedral, 2.0f, 96000.0, 5u);
+    CHECK (big.maxRead < erMaxReadSamples (96000.0) && big.maxRead > erMaxReadSamples (48000.0));
+}
+
+namespace reverb_test
+{
+    /** Mean power over [f0, f1] in dB, from `probes` single-frequency DFTs of
+        the whole buffer - for a response that ends inside it. */
+    inline double meanPowerDb (const std::vector<float>& v, double f0, double f1, double sampleRate, int probes)
+    {
+        double total = 0.0;
+        for (int k = 0; k < probes; ++k)
+        {
+            const double w = 6.283185307179586 * (f0 + (f1 - f0) * (double) k / (double) (probes - 1)) / sampleRate;
+            double re = 0.0, im = 0.0;
+            for (size_t i = 0; i < v.size(); ++i)
+            {
+                re += (double) v[i] * std::cos (w * (double) i);
+                im -= (double) v[i] * std::sin (w * (double) i);
+            }
+            total += re * re + im * im;
+        }
+        return 10.0 * std::log10 (total / (double) probes);
+    }
+
+    /** The reflections alone. With them on, the tail's input is the ring a tail
+        delay late; with them off and the predelay lengthened by exactly that,
+        the tail is the same tail at the same time, so the difference of the
+        two impulse responses is the reflections and nothing else - to the
+        rounding. Sizes whose tail delay is a whole number of samples only. */
+    inline std::vector<float> reflectionsOf (int profile, float size, float levelDb, float toneHz, int n,
+                                             std::uint32_t key, spatcore::effects::ErTapSet& taps)
+    {
+        using namespace spatcore::effects;
+        const ChainConfig cfg = module_test::config (48000.0, 256, key);
+
+        EffectReverbModule on, off;
+        on.prepare (cfg);
+        off.prepare (cfg);
+
+        EffectChannelParams p = params (100.0f, 0.0f);
+        p.reverb.size = size;
+        p.reverb.toneHz = toneHz;
+        p.reverb.erProfile = (std::uint8_t) profile;
+        p.reverb.erLevelDb = levelDb;
+        on.applyParams (p, 0);
+        taps = on.getActiveReflections();
+
+        p.reverb.erProfile = 0;
+        p.reverb.predelayMs = (float) taps.tailDelay / 48.0f;
+        off.applyParams (p, 0);
+
+        const std::vector<float> a = impulseResponse (on, n);
+        const std::vector<float> b = impulseResponse (off, n);
+        std::vector<float> d ((size_t) n);
+        for (int i = 0; i < n; ++i)
+            d[(size_t) i] = a[(size_t) i] - b[(size_t) i];
+        return d;
+    }
+}
+
+static void testEffectReverbEarlyReflections()
+{
+    using namespace spatcore::effects;
+
+    const double sr = 48000.0;
+    const float tone = erOnePoleCoef (20000.0f, sr);
+
+    struct Case { int profile; float size; int n; };
+    for (const Case& c : { Case { (int) ErProfile::Room, 1.0f, 4096 },
+                           Case { (int) ErProfile::Hall, 1.0f, 8192 },
+                           Case { (int) ErProfile::Cathedral, 2.0f, 20480 } })
+    {
+        ErTapSet taps;
+        const std::vector<float> er = reverb_test::reflectionsOf (c.profile, c.size, 0.0f, 20000.0f, c.n, 9u, taps);
+        CHECK (taps.profile == c.profile && taps.numTaps > 0);
+
+        int firstTap = c.n, lastTap = 0;
+        for (int j = 0; j < taps.numTaps; ++j)
+        {
+            firstTap = taps.delay[j] < firstTap ? taps.delay[j] : firstTap;
+            lastTap = taps.delay[j] > lastTap ? taps.delay[j] : lastTap;
+        }
+
+        // Nothing before the first reflection, and after the last nothing but
+        // two filters dying away: so the tail really moved by exactly the tail
+        // delay, and the reflections are all there is between.
+        float before = 0.0f, after = 0.0f;
+        for (int i = 0; i < firstTap; ++i)
+            before = std::fabs (er[(size_t) i]) > before ? std::fabs (er[(size_t) i]) : before;
+        for (int i = lastTap + 64; i < c.n; ++i)
+            after = std::fabs (er[(size_t) i]) > after ? std::fabs (er[(size_t) i]) : after;
+        CHECK (before == 0.0f);
+        CHECK (after < 1.0e-6f);
+
+        // A first-order reflection is one impulse of 2 g (the wet make-up)
+        // through the tone filter, where the table and the jitter put it. A
+        // higher-order one goes through the dark filter first.
+        bool firstLanded = true, higherDarkened = true;
+        for (int j = 0; j < taps.numTaps; ++j)
+        {
+            bool isolated = true;
+            for (int k = 0; k < taps.numTaps; ++k)
+                isolated = isolated && (k == j || std::abs (taps.delay[k] - taps.delay[j]) >= 24);
+            if (! isolated)
+                continue;
+
+            const float expect = 2.0f * tone * taps.gain[j] * (j < taps.numFirst ? 1.0f : taps.darkCoef);
+            const bool ok = std::fabs (er[(size_t) taps.delay[j]] - expect) < 2.0e-3f;
+            if (j < taps.numFirst)
+                firstLanded = firstLanded && ok;
+            else
+                higherDarkened = higherDarkened && ok;
+        }
+        CHECK (firstLanded && higherDarkened);
+
+        // At 0 dB the reflections carry the dry's energy across the band where
+        // music lives (the dry here is an impulse: 0 dB everywhere).
+        const double level = reverb_test::meanPowerDb (er, 200.0, 4000.0, sr, 128);
+        CHECK (std::fabs (level) < 1.5);
+    }
+
+    // ER Level is a gain on the reflections and on nothing else.
+    {
+        ErTapSet t0, t6;
+        const std::vector<float> at0 = reverb_test::reflectionsOf ((int) ErProfile::Chamber, 1.0f, 0.0f, 12000.0f, 4096, 9u, t0);
+        const std::vector<float> at6 = reverb_test::reflectionsOf ((int) ErProfile::Chamber, 1.0f, -6.0f, 12000.0f, 4096, 9u, t6);
+        const float g = spatcore::dsp::FastDecibels::dbToGain (-6.0f);
+        float worst = 0.0f, peak = 0.0f;
+        for (int i = 0; i < 4096; ++i)
+        {
+            worst = std::fabs (at6[(size_t) i] - g * at0[(size_t) i]) > worst ? std::fabs (at6[(size_t) i] - g * at0[(size_t) i]) : worst;
+            peak = std::fabs (at0[(size_t) i]) > peak ? std::fabs (at0[(size_t) i]) : peak;
+        }
+        CHECK (peak > 0.1f && worst < 1.0e-5f);
+    }
+
+    // Each channel its own pattern: the module builds from the chain's key.
+    {
+        EffectReverbModule a, b;
+        a.prepare (module_test::config (48000.0, 256, 5));
+        b.prepare (module_test::config (48000.0, 256, 6));
+        EffectChannelParams p = reverb_test::params (100.0f, 0.0f);
+        p.reverb.erProfile = (std::uint8_t) ErProfile::Hall;
+        a.applyParams (p, 0);
+        b.applyParams (p, 0);
+        bool differs = false;
+        for (int j = 0; j < a.getActiveReflections().numTaps; ++j)
+            differs = differs || a.getActiveReflections().delay[j] != b.getActiveReflections().delay[j];
+        CHECK (differs);
+    }
+
+    // Unknown profile ids are Off, to the bit; a NaN level is the floor.
+    {
+        EffectReverbModule off, unknown, floorLevel, nanLevel;
+        for (EffectReverbModule* m : { &off, &unknown, &floorLevel, &nanLevel })
+            m->prepare (module_test::config (48000.0, 256));
+
+        EffectChannelParams p = reverb_test::params (100.0f, 3.0f);
+        off.applyParams (p, 0);
+        p.reverb.erProfile = 77;
+        unknown.applyParams (p, 0);
+        CHECK (! unknown.getActiveReflections().isOn());
+        CHECK (eqtests::bitEqualBlock (reverb_test::impulseResponse (off, 4096),
+                                       reverb_test::impulseResponse (unknown, 4096)));
+
+        p.reverb.erProfile = (std::uint8_t) ErProfile::Room;
+        p.reverb.erLevelDb = EffectReverbModule::kMinErLevelDb;
+        floorLevel.applyParams (p, 0);
+        p.reverb.erLevelDb = std::numeric_limits<float>::quiet_NaN();
+        nanLevel.applyParams (p, 0);
+        CHECK (eqtests::bitEqualBlock (reverb_test::impulseResponse (floorLevel, 4096),
+                                       reverb_test::impulseResponse (nanLevel, 4096)));
+    }
+
+    // A level change is a runtime value: it glides, it does not spill.
+    {
+        EffectReverbModule m;
+        m.prepare (module_test::config (48000.0, 256));
+        EffectChannelParams p = reverb_test::params (100.0f, 0.0f);
+        p.reverb.erProfile = (std::uint8_t) ErProfile::Room;
+        m.applyParams (p, 0);
+        std::vector<float> excite = module_test::awkwardBlock (2048, 3);
+        module_test::render (m, excite);
+        p.reverb.erLevelDb = 3.0f;
+        m.applyParams (p, 0);
+        CHECK (m.getSpillVoices() == 0 && ! m.isTransitionWaiting());
+    }
+
+    // Settled, the block size is still only a buffer size with reflections on.
+    {
+        auto renderChunked = [] (int maxBlock)
+        {
+            EffectReverbModule m;
+            m.prepare (module_test::config (48000.0, maxBlock));
+            EffectChannelParams p = reverb_test::params (100.0f, 7.3f);
+            p.reverb.erProfile = (std::uint8_t) ErProfile::Cathedral;
+            p.reverb.size = 1.3f;
+            m.applyParams (p, 0);
+
+            std::vector<float> buf = module_test::awkwardBlock (16384, 4);
+            for (int done = 0; done < 16384; )
+            {
+                const int chunk = (16384 - done) < maxBlock ? (16384 - done) : maxBlock;
+                m.process (buf.data() + done, chunk);
+                done += chunk;
+            }
+            return buf;
+        };
+
+        CHECK (eqtests::bitEqualBlock (renderChunked (1), renderChunked (4096)));
+        CHECK (eqtests::bitEqualBlock (renderChunked (64), renderChunked (256)));
+    }
+}
+
+static void testEffectReverbReflectionSpillover()
+{
+    using namespace spatcore::effects;
+
+    // THE PARTITION, with reflections. A world with reflections reads its taps
+    // and its tail input out of a ring, up to a quarter of a second after the
+    // sample was written - so a change can only be an exact partition if the
+    // old world keeps reading after it, weighted by when each sample was
+    // WRITTEN. Room to Hall, Hall to Off, Off to Cathedral at Size 2, and a
+    // size change inside Chamber: each must be the old world fed the input
+    // written before the change plus the new one fed the rest.
+    const ChainConfig cfg = module_test::config (48000.0, 256);
+    const int before = 6000, n = 48000;
+    const int fade = (int) (EffectReverbModule::kSpillFadeSeconds * 48000.0 + 0.5);
+
+    struct Change { int fromEr; float fromSize; int toEr; float toSize; };
+    for (const Change& c : { Change { 1, 1.0f, 3, 1.0f },
+                             Change { 3, 1.0f, 0, 1.0f },
+                             Change { 0, 1.0f, 4, 2.0f },
+                             Change { 2, 0.7f, 2, 1.4f } })
+    {
+        std::vector<float> in = module_test::awkwardBlock (n, 23);
+        for (int i = before + 3000; i < n; ++i)
+            in[(size_t) i] = 0.0f;
+
+        EffectChannelParams from = reverb_test::params (100.0f, 0.0f);
+        from.reverb.rt60 = 2.0f;
+        from.reverb.erLevelDb = 0.0f;
+        from.reverb.erProfile = (std::uint8_t) c.fromEr;
+        from.reverb.size = c.fromSize;
+        EffectChannelParams to = from;
+        to.reverb.erProfile = (std::uint8_t) c.toEr;
+        to.reverb.size = c.toSize;
+
+        EffectReverbModule spill;
+        spill.prepare (cfg);
+        spill.applyParams (from, 0);
+        std::vector<float> out = in;
+        spill.process (out.data(), before);
+        spill.applyParams (to, 0);
+        CHECK (spill.getSpillVoices() == 1);
+        spill.process (out.data() + before, n - before);
+
+        EffectReverbModule oldWorld, newWorld;
+        oldWorld.prepare (cfg);
+        newWorld.prepare (cfg);
+        oldWorld.applyParams (from, 0);
+        newWorld.applyParams (to, 0);
+
+        std::vector<float> outOld = in, outNew ((size_t) n, 0.0f);
+        for (int i = before; i < n; ++i)
+        {
+            const int k = i - before;
+            const double s = k < fade ? std::sin (3.141592653589793 * (double) k / (2.0 * fade)) : 1.0;
+            const float g = (float) (s * s);
+            outOld[(size_t) i] = in[(size_t) i] * (1.0f - g);
+            outNew[(size_t) i] = in[(size_t) i] * g;
+        }
+        module_test::render (oldWorld, outOld);
+        module_test::render (newWorld, outNew);
+
+        float worst = 0.0f, peak = 0.0f;
+        for (int i = 0; i < n; ++i)
+        {
+            const float d = std::fabs (out[(size_t) i] - (outOld[(size_t) i] + outNew[(size_t) i]));
+            worst = d > worst ? d : worst;
+            peak = std::fabs (out[(size_t) i]) > peak ? std::fabs (out[(size_t) i]) : peak;
+        }
+        CHECK (peak > 0.1f);
+        CHECK (worst < 1.0e-4f * peak);
+    }
+}
+
+static void testEffectReverbReflectionStorm()
+{
+    using namespace spatcore::effects;
+
+    // A new profile and size every 64-sample block for 40 blocks, on the
+    // reverb of a low sine: no step anywhere in the pool, nothing allocated,
+    // the same bits twice, and the last change the one that runs.
+    const int block = 64, warm = 48000, changes = 40, n = warm + block * changes + 24000;
+    const ChainConfig cfg = module_test::config (48000.0, block);
+    const int profiles[] = { 3, 0, 4, 1, 2 };
+    const float sizes[] = { 1.6f, 0.7f, 1.0f };
+
+    std::vector<float> sine ((size_t) n);
+    for (int i = 0; i < n; ++i)
+    {
+        const double ramp = i < 4800 ? 0.5 - 0.5 * std::cos (3.141592653589793 * (double) i / 4800.0) : 1.0;
+        sine[(size_t) i] = (float) (0.5 * ramp * std::sin (6.283185307179586 * 80.0 * (double) i / 48000.0));
+    }
+
+    long allocations = -1;
+    int lastProfile = -1;
+
+    // combo -1: the storm, from Room at Size 1. 0..14: one of the fifteen
+    // (profile, size) pairs the storm visits, held from the first sample; 15:
+    // Room at Size 1, held.
+    auto render = [&] (int combo)
+    {
+        const bool fromRoom = combo < 0 || combo == 15;
+
+        EffectReverbModule m;
+        m.prepare (cfg);
+        EffectChannelParams p = reverb_test::params (100.0f, 0.0f);
+        p.reverb.rt60 = 2.0f;
+        p.reverb.erLevelDb = 0.0f;
+        p.reverb.erProfile = (std::uint8_t) (fromRoom ? (int) ErProfile::Room : profiles[(size_t) (combo % 5)]);
+        p.reverb.size = fromRoom ? 1.0f : sizes[(size_t) (combo % 3)];
+        m.applyParams (p, 0);
+
+        std::vector<float> buf = sine;
+        alloc_probe::Scope probe;
+
+        for (int b = 0; b * block < n; ++b)
+        {
+            const int at = b * block;
+            if (combo < 0 && at >= warm && at < warm + block * changes)
+            {
+                p.reverb.erProfile = (std::uint8_t) profiles[(size_t) (b % 5)];
+                p.reverb.size = sizes[(size_t) (b % 3)];
+                m.applyParams (p, 0);
+            }
+            m.process (buf.data() + at, (n - at) < block ? (n - at) : block);
+        }
+
+        allocations = probe.allocations();
+        lastProfile = m.getActiveReflections().profile;
+        return buf;
+    };
+
+    const std::vector<float> busy = render (-1);
+    CHECK (allocations == 0);
+    CHECK (lastProfile == profiles[(size_t) ((warm / block + changes - 1) % 5)]);
+
+    auto curvature = [] (const std::vector<float>& v, int from, int to)
+    {
+        float worst = 0.0f;
+        for (int i = from; i < to; ++i)
+        {
+            const float c = std::fabs (v[(size_t) i] - 2.0f * v[(size_t) (i - 1)] + v[(size_t) (i - 2)]);
+            worst = c > worst ? c : worst;
+        }
+        return worst;
+    };
+
+    auto peakOf = [] (const std::vector<float>& v, int from, int to)
+    {
+        float worst = 0.0f;
+        for (int i = from; i < to; ++i)
+            worst = std::fabs (v[(size_t) i]) > worst ? std::fabs (v[(size_t) i]) : worst;
+        return worst;
+    };
+
+    // Each room answers the sine at its own level - a reflection pattern
+    // summing near-coherently at 80 Hz can double it - so the storm is held
+    // against the loudest and sharpest of the rooms it passes through, not
+    // against the one it started in.
+    const int from = warm, to = warm + block * changes + 20000;
+    float cRef = 0.0f, pRef = 0.0f;
+    for (int combo = 0; combo <= 15; ++combo)
+    {
+        const std::vector<float> held = render (combo);
+        const float c = curvature (held, from, to), pk = peakOf (held, from, to);
+        cRef = c > cRef ? c : cRef;
+        pRef = pk > pRef ? pk : pRef;
+    }
+
+    const float cBusy = curvature (busy, from, to);
+    const float pBusy = peakOf (busy, from, n);
+
+    // Measured: curvature 1.2e-4 against 2.4e-4 for the sharpest held room,
+    // peak 1.17 against 2.14. Taps read unweighted across a change give 0.38,
+    // the tail's input windowed on the output time instead of the write time
+    // 0.027, and the reflection ring left unwritten 1.7e-3 - the smallest.
+    bool finite = true;
+    for (int i = from; i < n; ++i)
+        finite = finite && std::isfinite (busy[(size_t) i]);
+    CHECK (finite);
+    CHECK (pBusy < 2.0f * pRef);
+    CHECK (cBusy < 4.0f * cRef);
+
+    CHECK (eqtests::bitEqualBlock (render (-1), busy));
+}
+
+//==============================================================================
 // effects/modules - Multitap delay (FxDelay)
 //==============================================================================
 
@@ -12819,6 +13346,10 @@ int main()
         testReverbDelayLineReads();
         testReverbDelayLineHermiteIsPassive();
         testReverbLfoSine();
+        testEarlyReflectionProfiles();
+        testEffectReverbEarlyReflections();
+        testEffectReverbReflectionSpillover();
+        testEffectReverbReflectionStorm();
         testMultitapDelayNeutral();
         testMultitapDelayTapPlacement();
         testMultitapDelayTimeModulation();
