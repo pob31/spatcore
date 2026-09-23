@@ -291,9 +291,10 @@ private:
 
     prepare() allocates. Nothing else does: an idle instance is rebuilt inside
     the capacity prepare() gave it - see FdnReverbModel - and a reflection
-    pattern is a fixed-size array. About 560 KiB per module at 48 kHz (two
-    networks sized for 2.5, a quarter-second predelay ring and a 0.4 s
-    reflection ring), doubling with the rate.
+    pattern is a fixed-size array. About 1.7 MiB per module at 48 kHz (the
+    FDN, plate and hall pairs at their largest size, a quarter-second
+    predelay ring and a 0.4 s reflection ring), doubling with the rate - see
+    docs/audio-engine-map.md for the breakdown and the CPU per model.
 */
 class EffectReverbModule final : public IEffectModule
 {
