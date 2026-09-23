@@ -8,6 +8,7 @@
 #include "../../dsp/OnePoleSmoother.h"
 #include "../../reverb/ReverbFDNAlgorithm.h"
 #include "reverb/EarlyReflections.h"
+#include "reverb/ModulatedHallModel.h"
 #include "reverb/PlateReverbModel.h"
 #include "reverb/ReverbDelayLine.h"
 #include "reverb/ReverbLfo.h"
@@ -319,8 +320,9 @@ public:
 
     /** Tail classes, each built twice, so a change inside a class - a size -
         spills over as surely as a change between classes does. 0 is the FDN
-        (models 0, 2 and 3), 1 the plate. */
-    static constexpr int kNumClasses = 2;
+        (models 0, 2 and 3), 1 the plate, 2 the modulated hall (models 4 and
+        5). */
+    static constexpr int kNumClasses = 3;
     static constexpr int kInstancesPerClass = 2;
     static constexpr int kNumInstances = kNumClasses * kInstancesPerClass;
 
@@ -547,7 +549,13 @@ private:
     /** The tail class a parameter set runs on. */
     static int classFor (const ReverbParams& r) noexcept
     {
-        return resolveReverbModel (r.model) == static_cast<int> (ReverbModel::Plate) ? 1 : 0;
+        switch (resolveReverbModel (r.model))
+        {
+            case static_cast<int> (ReverbModel::Plate):          return 1;
+            case static_cast<int> (ReverbModel::ModulatedHall):
+            case static_cast<int> (ReverbModel::Shimmer):        return 2;
+            default:                                             return 0;
+        }
     }
 
     static int firstOfClass (int cls) noexcept      { return cls * kInstancesPerClass; }
@@ -555,16 +563,22 @@ private:
 
     IEffectReverbModel& instance (int k) noexcept
     {
-        if (k >= kInstancesPerClass)
-            return plate[k - kInstancesPerClass];
-        return fdn[k];
+        switch (classOfInstance (k))
+        {
+            case 1:  return plate[k % kInstancesPerClass];
+            case 2:  return hall[k % kInstancesPerClass];
+            default: return fdn[k % kInstancesPerClass];
+        }
     }
 
     const IEffectReverbModel& instance (int k) const noexcept
     {
-        if (k >= kInstancesPerClass)
-            return plate[k - kInstancesPerClass];
-        return fdn[k];
+        switch (classOfInstance (k))
+        {
+            case 1:  return plate[k % kInstancesPerClass];
+            case 2:  return hall[k % kInstancesPerClass];
+            default: return fdn[k % kInstancesPerClass];
+        }
     }
 
     bool needsTransition (const ReverbParams& r) const noexcept
@@ -991,6 +1005,7 @@ private:
 
     FdnReverbModel fdn[kInstancesPerClass];
     PlateReverbModel plate[kInstancesPerClass];
+    ModulatedHallModel hall[kInstancesPerClass];
     bool dirty[kNumInstances] = {};
 
     World worlds[3];

@@ -143,6 +143,7 @@
 #include "spatcore/effects/modules/reverb/EarlyReflections.h"
 #include "spatcore/effects/modules/reverb/ReverbTailModel.h"
 #include "spatcore/effects/modules/reverb/PlateReverbModel.h"
+#include "spatcore/effects/modules/reverb/ModulatedHallModel.h"
 #include "spatcore/effects/modules/reverb/ReverbLfo.h"
 #include "spatcore/effects/modules/EffectReverbModule.h"
 #include "spatcore/effects/modules/MultitapDelayModule.h"
@@ -10470,6 +10471,414 @@ static void testPlateSpillover()
     }
 }
 
+//==============================================================================
+// effects/modules/reverb/ModulatedHallModel - model 4
+//==============================================================================
+
+namespace reverb_test
+{
+    /** Power at one frequency of v[from, to), Hann-windowed. */
+    inline double probePower (const std::vector<float>& v, int from, int to, double f, double sampleRate)
+    {
+        const int n = to - from;
+        const double w = 6.283185307179586 * f / sampleRate;
+        double re = 0.0, im = 0.0;
+        for (int i = 0; i < n; ++i)
+        {
+            const double h = 0.5 - 0.5 * std::cos (6.283185307179586 * (double) i / (double) n);
+            const double x = h * (double) v[(size_t) (from + i)];
+            re += x * std::cos (w * (double) i);
+            im -= x * std::sin (w * (double) i);
+        }
+        return re * re + im * im;
+    }
+}
+
+static void testModulatedHallModel()
+{
+    using namespace spatcore::effects;
+    const int hall = (int) ReverbModel::ModulatedHall;
+
+    // Level with the FDN against the dry, as the plate is (measured -4.89;
+    // without its make-up of a third the hall sits at +4.65).
+    const double level = reverb_test::wetLevelDb (hall, 1.5f);
+    CHECK (level > -6.5 && level < -3.5);
+
+    // RT60, both multipliers and the crossovers: the FDN's decay law per line.
+    // Measured 32.0, 9.0, 31.1 and 31.7 dB, against a nominal 30, 7.5, 30, 30;
+    // bands 12.3 / 16.1 / 22.1 against the FDN's 9.3 / 14.6 / 22.5.
+
+    const double drop1 = reverb_test::decayDropDb (hall, 1.0f, 1.0f, 1.0f, 48000.0);
+    const double drop4 = reverb_test::decayDropDb (hall, 4.0f, 1.0f, 1.0f, 48000.0);
+    const double drop1hi = reverb_test::decayDropDb (hall, 1.0f, 1.0f, 1.0f, 96000.0);
+    const double drop1big = reverb_test::decayDropDb (hall, 1.0f, 1.0f, 1.0f, 48000.0, 0.0, 0.0, 2.0f);
+    CHECK (drop1 > 25.0 && drop1 < 35.0);
+    CHECK (drop4 > 5.5 && drop4 < 10.0);
+    CHECK (std::fabs (drop1hi - drop1) < 4.0);
+    CHECK (drop1big > 25.0 && drop1big < 35.0);
+
+    const double dropLow = reverb_test::decayDropDb (hall, 2.0f, 2.0f, 0.5f, 48000.0, 60.0, 150.0);
+    const double dropMid = reverb_test::decayDropDb (hall, 2.0f, 2.0f, 0.5f, 48000.0, 800.0, 1600.0);
+    const double dropHigh = reverb_test::decayDropDb (hall, 2.0f, 2.0f, 0.5f, 48000.0, 6000.0, 9000.0);
+    const double fdnLow = reverb_test::decayDropDb (0, 2.0f, 2.0f, 0.5f, 48000.0, 60.0, 150.0);
+    const double fdnMid = reverb_test::decayDropDb (0, 2.0f, 2.0f, 0.5f, 48000.0, 800.0, 1600.0);
+    const double fdnHigh = reverb_test::decayDropDb (0, 2.0f, 2.0f, 0.5f, 48000.0, 6000.0, 9000.0);
+    CHECK (dropLow < dropMid && dropMid < dropHigh && dropHigh - dropLow > 8.0);
+    CHECK (std::fabs (dropLow - fdnLow) < 4.0 && std::fabs (dropMid - fdnMid) < 4.0
+           && std::fabs (dropHigh - fdnHigh) < 4.0);
+
+    // Modulation smears a steady sine. Unmodulated the network is linear and
+    // time-invariant, so a 1 kHz sine comes out a 1 kHz sine and the band
+    // either side of it holds only the window's leakage; at full depth the
+    // moving reads spread it into sidebands. Measured: the band 4 to 40 Hz
+    // either side sits 84.5 dB under the sine still, and 1.7 dB OVER it at
+    // full depth - a millisecond of excursion is a lot, which is what the
+    // Lush Hall preset is for.
+    auto spreadDb = [hall] (float depth)
+    {
+        EffectReverbModule m;
+        m.prepare (module_test::config (48000.0, 512));
+        EffectChannelParams p = reverb_test::modelParams (hall, 100.0f, 0.0f);
+        p.reverb.rt60 = 3.0f;
+        p.reverb.modDepth = depth;
+        p.reverb.modRateHz = 1.0f;
+        m.applyParams (p, 0);
+
+        const int n = 48000 * 4;
+        std::vector<float> buf ((size_t) n);
+        for (int i = 0; i < n; ++i)
+        {
+            const double ramp = i < 4800 ? 0.5 - 0.5 * std::cos (3.141592653589793 * (double) i / 4800.0) : 1.0;
+            buf[(size_t) i] = (float) (0.5 * ramp * std::sin (6.283185307179586 * 1000.0 * (double) i / 48000.0));
+        }
+        module_test::render (m, buf);
+
+        const int from = n - 96000;
+        const double centre = reverb_test::probePower (buf, from, n, 1000.0, 48000.0);
+        double side = 0.0;
+        int count = 0;
+        for (double off = 4.0; off <= 40.0; off += 2.0)
+        {
+            side += reverb_test::probePower (buf, from, n, 1000.0 + off, 48000.0)
+                  + reverb_test::probePower (buf, from, n, 1000.0 - off, 48000.0);
+            count += 2;
+        }
+        return 10.0 * std::log10 ((side / count) / centre);
+    };
+    const double still = spreadDb (0.0f), moving = spreadDb (100.0f);
+    CHECK (moving > still + 20.0);
+
+    // Block size, keys, and depth 0 making the rate irrelevant - as for the
+    // plate.
+    auto renderChunked = [hall] (int maxBlock, std::uint32_t key, float depth)
+    {
+        EffectReverbModule m;
+        m.prepare (module_test::config (48000.0, maxBlock, key));
+        EffectChannelParams p = reverb_test::modelParams (hall, 100.0f, 4.1f);
+        p.reverb.modDepth = depth;
+        p.reverb.modRateHz = 1.7f;
+        m.applyParams (p, 0);
+
+        std::vector<float> buf = module_test::awkwardBlock (12000, 5);
+        for (int done = 0; done < 12000; )
+        {
+            const int chunk = (12000 - done) < maxBlock ? (12000 - done) : maxBlock;
+            m.process (buf.data() + done, chunk);
+            done += chunk;
+        }
+        return buf;
+    };
+    const std::vector<float> ref = renderChunked (4096, 1, 80.0f);
+    CHECK (eqtests::bitEqualBlock (renderChunked (1, 1, 80.0f), ref));
+    CHECK (eqtests::bitEqualBlock (renderChunked (64, 1, 80.0f), renderChunked (256, 1, 80.0f)));
+    CHECK (! eqtests::bitEqualBlock (renderChunked (4096, 2, 80.0f), ref));
+    CHECK (! eqtests::bitEqualBlock (renderChunked (4096, 1, 0.0f), renderChunked (4096, 2, 0.0f)));
+
+    // The lines are the channel's own: each within 6.25 % of its prime, another
+    // key moves them, and Size scales them.
+    {
+        const float primes[16] = { 997.0f, 1087.0f, 1171.0f, 1277.0f, 1381.0f, 1499.0f, 1627.0f, 1777.0f,
+                                   1913.0f, 2083.0f, 2267.0f, 2459.0f, 2663.0f, 2887.0f, 3137.0f, 3407.0f };
+        ReverbParams rp;
+        rp.model = (std::uint8_t) hall;
+        ModulatedHallModel a, b, big;
+        a.prepare (module_test::config (48000.0, 256, 1), rp);
+        b.prepare (module_test::config (48000.0, 256, 2), rp);
+        rp.size = 2.0f;
+        big.prepare (module_test::config (48000.0, 256, 1), rp);
+
+        bool inRange = true, differs = false, scaled = true;
+        for (int i = 0; i < 16; ++i)
+        {
+            const int la = a.getLineLength (i);
+            inRange = inRange && la >= (int) (primes[i] * 0.9375f) - 1 && la <= (int) (primes[i] * 1.0625f) + 1;
+            differs = differs || la != b.getLineLength (i);
+            scaled = scaled && std::abs (big.getLineLength (i) - 2 * la) <= 1;
+        }
+        CHECK (inRange && differs && scaled);
+    }
+
+    // Mixed, not sixteen combs. With no diffusion and no modulation the first
+    // pass is sixteen clean echoes; through the Hadamard every pass after it
+    // multiplies them, so 150 to 200 ms in the response is noise-like.
+    // Measured kurtosis 6.1 (a Gaussian's is 3); sixteen separate combs are
+    // still a sparse pattern of spikes there, at 102.
+    auto kurtosis = [hall] ()
+    {
+        EffectReverbModule m;
+        m.prepare (module_test::config (48000.0, 512));
+        EffectChannelParams p = reverb_test::modelParams (hall, 100.0f, 0.0f);
+        p.reverb.diffusion = 0.0f;
+        p.reverb.modDepth = 0.0f;
+        p.reverb.toneHz = 20000.0f;
+        p.reverb.rt60 = 4.0f;
+        m.applyParams (p, 0);
+        const std::vector<float> ir = reverb_test::impulseResponse (m, 9600);
+        double m2 = 0.0, m4 = 0.0;
+        for (int i = 7200; i < 9600; ++i)
+        {
+            const double x2 = (double) ir[(size_t) i] * (double) ir[(size_t) i];
+            m2 += x2;
+            m4 += x2 * x2;
+        }
+        m2 /= 2400.0;
+        m4 /= 2400.0;
+        return m4 / (m2 * m2);
+    };
+    CHECK (kurtosis() < 20.0);
+
+    // The reads glide. A 5 kHz sine at full depth spreads into sidebands next
+    // to itself and nowhere else: 1 to 3 kHz away sits 77 dB under it. Reads
+    // that stepped between whole samples scatter energy there, at -27.
+    auto splatterDb = [hall] ()
+    {
+        EffectReverbModule m;
+        m.prepare (module_test::config (48000.0, 512));
+        EffectChannelParams p = reverb_test::modelParams (hall, 100.0f, 0.0f);
+        p.reverb.rt60 = 2.0f;
+        p.reverb.modDepth = 100.0f;
+        p.reverb.modRateHz = 2.0f;
+        p.reverb.toneHz = 20000.0f;
+        m.applyParams (p, 0);
+
+        const int n = 48000 * 3;
+        std::vector<float> buf ((size_t) n);
+        for (int i = 0; i < n; ++i)
+        {
+            const double ramp = i < 4800 ? 0.5 - 0.5 * std::cos (3.141592653589793 * (double) i / 4800.0) : 1.0;
+            buf[(size_t) i] = (float) (0.5 * ramp * std::sin (6.283185307179586 * 5000.0 * (double) i / 48000.0));
+        }
+        module_test::render (m, buf);
+
+        const int from = n - 96000;
+        double nearBand = 0.0, farBand = 0.0;           // (near and far are macros on Windows)
+        for (double off = -80.0; off <= 80.0; off += 4.0)
+            nearBand += reverb_test::probePower (buf, from, n, 5000.0 + off, 48000.0);
+        for (double off = 1000.0; off <= 3000.0; off += 50.0)
+            farBand += reverb_test::probePower (buf, from, n, 5000.0 + off, 48000.0)
+                     + reverb_test::probePower (buf, from, n, 5000.0 - off, 48000.0);
+        return 10.0 * std::log10 (farBand / nearBand);
+    };
+    CHECK (splatterDb() < -60.0);
+
+    auto rated = [hall] (float depth, float rate)
+    {
+        EffectReverbModule m;
+        m.prepare (module_test::config (48000.0, 512));
+        EffectChannelParams p = reverb_test::modelParams (hall, 100.0f, 0.0f);
+        p.reverb.modDepth = depth;
+        p.reverb.modRateHz = rate;
+        m.applyParams (p, 0);
+        return reverb_test::impulseResponse (m, 24000);
+    };
+    CHECK (eqtests::bitEqualBlock (rated (0.0f, 0.1f), rated (0.0f, 5.0f)));
+
+    // reset() clears; DC stays in; NaN is the minimum corner; the loudest
+    // corner stays bounded and decays.
+    {
+        EffectReverbModule m;
+        m.prepare (module_test::config (48000.0, 256));
+        EffectChannelParams p = reverb_test::modelParams (hall, 100.0f, 10.0f);
+        p.reverb.rt60 = 8.0f;
+        m.applyParams (p, 0);
+        std::vector<float> excite = module_test::awkwardBlock (4096, 7);
+        module_test::render (m, excite);
+        CHECK (reverb_test::windowDb (excite, 2048, 4096) > -60.0);
+
+        m.reset();
+        std::vector<float> silence (8192, 0.0f);
+        module_test::render (m, silence);
+        bool silent = true;
+        for (float x : silence)
+            silent = silent && x == 0.0f;
+        CHECK (silent);
+    }
+
+    {
+        EffectReverbModule m;
+        m.prepare (module_test::config (48000.0, 512));
+        EffectChannelParams p = reverb_test::modelParams (hall, 100.0f, 0.0f);
+        p.reverb.rt60 = 1.0f;
+        m.applyParams (p, 0);
+        std::vector<float> dc (192000, 0.5f);
+        module_test::render (m, dc);
+        double mean = 0.0;
+        for (int i = 168000; i < 192000; ++i)
+            mean += dc[(size_t) i];
+        mean /= 24000.0;
+
+        // Measured 7e-9. The hall's signs cancel most of its own DC - without
+        // the blocker it holds 3e-4 - so the bar is lower than the plate's.
+        CHECK (std::fabs (mean) < 1.0e-5);
+    }
+
+    {
+        auto corner = [hall] (float v)
+        {
+            EffectReverbModule m;
+            m.prepare (module_test::config (48000.0, 256));
+            EffectChannelParams p = reverb_test::modelParams (hall, 100.0f, 0.0f);
+            p.reverb.rt60 = p.reverb.rt60LowMult = p.reverb.rt60HighMult = v;
+            p.reverb.crossoverLow = p.reverb.crossoverHigh = p.reverb.diffusion = v;
+            p.reverb.size = p.reverb.modRateHz = p.reverb.modDepth = v;
+            m.applyParams (p, 0);
+            std::vector<float> buf = module_test::awkwardBlock (4096, 11);
+            buf.resize (16384, 0.0f);
+            module_test::render (m, buf);
+            return buf;
+        };
+        CHECK (eqtests::bitEqualBlock (corner (std::numeric_limits<float>::quiet_NaN()), corner (-1.0e9f)));
+
+        EffectReverbModule m;
+        m.prepare (module_test::config (48000.0, 512));
+        EffectChannelParams p = reverb_test::modelParams (hall, 100.0f, 0.0f);
+        p.reverb.rt60 = 8.0f;
+        p.reverb.rt60LowMult = 9.0f;
+        p.reverb.rt60HighMult = 9.0f;
+        p.reverb.crossoverLow = 500.0f;
+        p.reverb.crossoverHigh = 1000.0f;
+        p.reverb.diffusion = 1.0f;
+        p.reverb.size = 2.0f;
+        p.reverb.modDepth = 100.0f;
+        p.reverb.modRateHz = 5.0f;
+        p.reverb.toneHz = 20000.0f;
+        m.applyParams (p, 0);
+
+        std::vector<float> buf = module_test::awkwardBlock (24000, 13);
+        buf.resize (48000 * 20, 0.0f);
+        module_test::render (m, buf);
+
+        bool finite = true;
+        float peak = 0.0f;
+        for (float x : buf)
+        {
+            finite = finite && std::isfinite (x);
+            peak = std::fabs (x) > peak ? std::fabs (x) : peak;
+        }
+        // Measured: peak 1.95, the second second at -9.4 dB, the twentieth at
+        // -38.3.
+        const double early = reverb_test::windowDb (buf, 48000, 96000);
+        const double late = reverb_test::windowDb (buf, 48000 * 19, 48000 * 20);
+        CHECK (finite && peak < 4.0f);
+        CHECK (late < early - 6.0);
+    }
+}
+
+static void testModulatedHallSpillover()
+{
+    using namespace spatcore::effects;
+
+    // Into the hall from each of the other classes, out of it, and a size
+    // change inside it: exact partitions, the new world's reference started at
+    // the change (the hall's LFOs are time-varying).
+    const ChainConfig cfg = module_test::config (48000.0, 256);
+    const int before = 6000, n = 30000;
+    const int fade = (int) (EffectReverbModule::kSpillFadeSeconds * 48000.0 + 0.5);
+
+    struct Change { int fromModel; float fromSize; int toModel; float toSize; };
+    for (const Change& c : { Change { 0, 1.0f, 4, 1.0f }, Change { 1, 1.0f, 4, 1.0f },
+                             Change { 4, 1.0f, 1, 1.0f }, Change { 4, 0.8f, 4, 1.9f } })
+    {
+        std::vector<float> in = module_test::awkwardBlock (n, 37);
+        for (int i = before + 3000; i < n; ++i)
+            in[(size_t) i] = 0.0f;
+
+        EffectChannelParams from = reverb_test::modelParams (c.fromModel, 100.0f, 0.0f);
+        from.reverb.rt60 = 2.0f;
+        from.reverb.size = c.fromSize;
+        EffectChannelParams to = from;
+        to.reverb.model = (std::uint8_t) c.toModel;
+        to.reverb.size = c.toSize;
+
+        EffectReverbModule spill;
+        spill.prepare (cfg);
+        spill.applyParams (from, 0);
+        std::vector<float> out = in;
+        spill.process (out.data(), before);
+        spill.applyParams (to, 0);
+        CHECK (spill.getSpillVoices() == 1);
+        spill.process (out.data() + before, n - before);
+
+        EffectReverbModule oldWorld, newWorld;
+        oldWorld.prepare (cfg);
+        newWorld.prepare (cfg);
+        oldWorld.applyParams (from, 0);
+        newWorld.applyParams (to, 0);
+
+        std::vector<float> outOld = in, outNew ((size_t) (n - before), 0.0f);
+        for (int i = before; i < n; ++i)
+        {
+            const int k = i - before;
+            const double s = k < fade ? std::sin (3.141592653589793 * (double) k / (2.0 * fade)) : 1.0;
+            const float g = (float) (s * s);
+            outOld[(size_t) i] = in[(size_t) i] * (1.0f - g);
+            outNew[(size_t) k] = in[(size_t) i] * g;
+        }
+        module_test::render (oldWorld, outOld);
+        module_test::render (newWorld, outNew);
+
+        float worst = 0.0f, peak = 0.0f;
+        for (int i = 0; i < n; ++i)
+        {
+            const float fresh = i >= before ? outNew[(size_t) (i - before)] : 0.0f;
+            const float d = std::fabs (out[(size_t) i] - (outOld[(size_t) i] + fresh));
+            worst = d > worst ? d : worst;
+            peak = std::fabs (out[(size_t) i]) > peak ? std::fabs (out[(size_t) i]) : peak;
+        }
+        CHECK (peak > 0.1f);
+        CHECK (worst < 1.0e-4f * peak);
+    }
+
+    // All three classes in turn every block: nothing allocated.
+    {
+        EffectReverbModule m;
+        m.prepare (module_test::config (48000.0, 64));
+        EffectChannelParams p = reverb_test::modelParams (0, 100.0f, 0.0f);
+        m.applyParams (p, 0);
+        std::vector<float> buf = module_test::awkwardBlock (48000, 41);
+
+        const int models[] = { 4, 1, 0, 5, 1 };
+        alloc_probe::Scope probe;
+        for (int b = 0; b < 750; ++b)
+        {
+            if (b >= 100 && b < 160)
+            {
+                p.reverb.model = (std::uint8_t) models[(size_t) (b % 5)];
+                p.reverb.size = b % 3 == 0 ? 1.4f : 0.9f;
+                m.applyParams (p, 0);
+            }
+            m.process (buf.data() + b * 64, 64);
+        }
+        CHECK (probe.allocations() == 0);
+
+        bool finite = true;
+        for (float x : buf)
+            finite = finite && std::isfinite (x);
+        CHECK (finite);
+    }
+}
+
+
 
 //==============================================================================
 // effects/modules - Multitap delay (FxDelay)
@@ -13702,6 +14111,8 @@ int main()
         testEffectReverbReflectionStorm();
         testPlateReverbModel();
         testPlateSpillover();
+        testModulatedHallModel();
+        testModulatedHallSpillover();
         testMultitapDelayNeutral();
         testMultitapDelayTapPlacement();
         testMultitapDelayTimeModulation();
