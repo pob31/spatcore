@@ -141,6 +141,8 @@
 #include "spatcore/effects/modules/PhaserModule.h"
 #include "spatcore/effects/modules/reverb/ReverbDelayLine.h"
 #include "spatcore/effects/modules/reverb/EarlyReflections.h"
+#include "spatcore/effects/modules/reverb/ReverbTailModel.h"
+#include "spatcore/effects/modules/reverb/PlateReverbModel.h"
 #include "spatcore/effects/modules/reverb/ReverbLfo.h"
 #include "spatcore/effects/modules/EffectReverbModule.h"
 #include "spatcore/effects/modules/MultitapDelayModule.h"
@@ -10122,6 +10124,354 @@ static void testEffectReverbReflectionStorm()
 }
 
 //==============================================================================
+// effects/modules/reverb/PlateReverbModel - model 1
+//==============================================================================
+
+namespace reverb_test
+{
+    inline EffectChannelParams modelParams (int model, float mix, float predelayMs)
+    {
+        EffectChannelParams p = params (mix, predelayMs);
+        p.reverb.model = (std::uint8_t) model;
+        return p;
+    }
+
+    /** Fully wet level against the dry on noise, over the last second of 2.5 s. */
+    inline double wetLevelDb (int model, float rt60, double sr = 48000.0)
+    {
+        using namespace spatcore::effects;
+        const int n = (int) (sr * 2.5);
+        const std::vector<float> in = module_test::awkwardBlock (n, 3);
+
+        EffectReverbModule m;
+        m.prepare (module_test::config (sr, 512));
+        EffectChannelParams p = modelParams (model, 100.0f, 0.0f);
+        p.reverb.rt60 = rt60;
+        m.applyParams (p, 0);
+
+        std::vector<float> buf = in;
+        module_test::render (m, buf);
+        return windowDb (buf, (int) (sr * 1.5), n) - windowDb (in, (int) (sr * 1.5), n);
+    }
+
+    /** Level drop over half a second of a tail, one band or broadband (f1 <= 0),
+        by interrupted noise: two seconds of it fill the tank, then silence. An
+        impulse will not do for a tank whose loop is long - the plate's is
+        0.73 s, 1.45 s at Size 2 - because its response stays sparse for a whole
+        pass, and a window then measures where the energy happens to be rather
+        than how fast it goes. */
+    inline double decayDropDb (int model, float rt60, float lowMult, float highMult, double sr,
+                               double f0 = 0.0, double f1 = 0.0, float size = 1.0f, double fillSeconds = 2.0)
+    {
+        using namespace spatcore::effects;
+        EffectReverbModule m;
+        m.prepare (module_test::config (sr, 512));
+        EffectChannelParams p = modelParams (model, 100.0f, 0.0f);
+        p.reverb.rt60 = rt60;
+        p.reverb.rt60LowMult = lowMult;
+        p.reverb.rt60HighMult = highMult;
+        p.reverb.toneHz = 20000.0f;
+        p.reverb.size = size;
+        m.applyParams (p, 0);
+
+        const int cut = (int) (sr * fillSeconds);
+        const int n = cut + (int) sr;
+        std::vector<float> buf = module_test::awkwardBlock (cut, 17);
+        buf.resize ((size_t) n, 0.0f);
+        module_test::render (m, buf);
+
+        const int window = (int) (sr * 0.1);
+        const int a = cut + (int) (sr * 0.1), b = a + (int) (sr * 0.5);
+
+        if (f1 <= 0.0)
+            return windowDb (buf, a, a + window) - windowDb (buf, b, b + window);
+
+        return bandDb (buf, a, a + 2 * window, f0, f1, sr) - bandDb (buf, b, b + 2 * window, f0, f1, sr);
+    }
+}
+
+static void testPlateReverbModel()
+{
+    using namespace spatcore::effects;
+    const int plate = (int) ReverbModel::Plate;
+
+    // Where a plate sits against the dry: where the FDN does (-4.9 dB at
+    // 1.5 s), so the mix control means the same on both. Measured -4.91; the
+    // paper's own output gain gives +1.6. PlateReverbModel::kOutputGain is
+    // pinned here or nowhere.
+    const double level = reverb_test::wetLevelDb (plate, 1.5f);
+    CHECK (level > -6.5 && level < -3.5);
+
+    // RT60 means what it means on the FDN: one band, 60 dB per RT60 - 30 dB
+    // over half a second at 1 s, 7.5 dB at 4 s - at 48 and 96 kHz, and at the
+    // largest size too (Size moves every length; the decay gains follow).
+    const double drop1 = reverb_test::decayDropDb (plate, 1.0f, 1.0f, 1.0f, 48000.0);
+    const double drop4 = reverb_test::decayDropDb (plate, 4.0f, 1.0f, 1.0f, 48000.0);
+    const double drop1hi = reverb_test::decayDropDb (plate, 1.0f, 1.0f, 1.0f, 96000.0);
+    const double drop4big = reverb_test::decayDropDb (plate, 4.0f, 1.0f, 1.0f, 48000.0, 0.0, 0.0, 2.0f, 4.0);
+    //
+    // Measured 27.7, 8.3, 27.3 and 7.7. The plate runs a little slow at short
+    // decays because its tank allpasses are long: the modes where their group
+    // delay peaks outlast the rest. (Size 2 at a 1 s RT60 is not tested: a
+    // 1.45 s loop is longer than the decay, and there is no rate to measure.)
+    CHECK (drop1 > 25.0 && drop1 < 35.0);
+    CHECK (drop4 > 4.5 && drop4 < 10.5);
+    CHECK (std::fabs (drop1hi - drop1) < 4.0);
+    CHECK (drop4big > 5.0 && drop4big < 11.0);
+
+    // Three bands, with the lows at twice the RT60 and the highs at half of it.
+    // The decay filter is the FDN's, and so is its gentle one-pole split - at
+    // 6-9 kHz the mid band's slower gain still leaks through, so neither model
+    // reaches the nominal 30 dB there. The claim is the plate decays as the
+    // FDN does, band by band: measured 9.1 / 11.8 / 20.1 dB against the FDN's
+    // 9.3 / 14.6 / 22.5.
+    const double dropLow = reverb_test::decayDropDb (plate, 2.0f, 2.0f, 0.5f, 48000.0, 60.0, 150.0);
+    const double dropMid = reverb_test::decayDropDb (plate, 2.0f, 2.0f, 0.5f, 48000.0, 800.0, 1600.0);
+    const double dropHigh = reverb_test::decayDropDb (plate, 2.0f, 2.0f, 0.5f, 48000.0, 6000.0, 9000.0);
+    const double fdnLow = reverb_test::decayDropDb (0, 2.0f, 2.0f, 0.5f, 48000.0, 60.0, 150.0);
+    const double fdnMid = reverb_test::decayDropDb (0, 2.0f, 2.0f, 0.5f, 48000.0, 800.0, 1600.0);
+    const double fdnHigh = reverb_test::decayDropDb (0, 2.0f, 2.0f, 0.5f, 48000.0, 6000.0, 9000.0);
+    CHECK (dropLow < dropMid && dropMid < dropHigh && dropHigh - dropLow > 8.0);
+    CHECK (std::fabs (dropLow - fdnLow) < 4.0 && std::fabs (dropMid - fdnMid) < 4.0
+           && std::fabs (dropHigh - fdnHigh) < 4.0);
+
+    // The block size is a buffer size, with the tank modulated.
+    auto renderChunked = [plate] (int maxBlock, std::uint32_t key)
+    {
+        EffectReverbModule m;
+        m.prepare (module_test::config (48000.0, maxBlock, key));
+        EffectChannelParams p = reverb_test::modelParams (plate, 100.0f, 4.1f);
+        p.reverb.modDepth = 80.0f;
+        p.reverb.modRateHz = 1.7f;
+        m.applyParams (p, 0);
+
+        std::vector<float> buf = module_test::awkwardBlock (12000, 5);
+        for (int done = 0; done < 12000; )
+        {
+            const int chunk = (12000 - done) < maxBlock ? (12000 - done) : maxBlock;
+            m.process (buf.data() + done, chunk);
+            done += chunk;
+        }
+        return buf;
+    };
+    const std::vector<float> ref = renderChunked (4096, 1);
+    CHECK (eqtests::bitEqualBlock (renderChunked (1, 1), ref));
+    CHECK (eqtests::bitEqualBlock (renderChunked (64, 1), renderChunked (256, 1)));
+
+    // Same key, same plate; another key, another plate.
+    CHECK (eqtests::bitEqualBlock (renderChunked (4096, 1), ref));
+    CHECK (! eqtests::bitEqualBlock (renderChunked (4096, 2), ref));
+
+    // With no depth there is no modulation, so the rate cannot matter - to the
+    // bit, since a Hermite read at a whole delay returns the stored sample.
+    // With depth, it does. And unmodulated, two keys are still two plates:
+    // the line lengths themselves are the channel's.
+    auto modulated = [plate] (float depth, float rate, std::uint32_t key)
+    {
+        EffectReverbModule m;
+        m.prepare (module_test::config (48000.0, 512, key));
+        EffectChannelParams p = reverb_test::modelParams (plate, 100.0f, 0.0f);
+        p.reverb.modDepth = depth;
+        p.reverb.modRateHz = rate;
+        m.applyParams (p, 0);
+        return reverb_test::impulseResponse (m, 24000);
+    };
+    CHECK (eqtests::bitEqualBlock (modulated (0.0f, 0.1f, 1), modulated (0.0f, 5.0f, 1)));
+    CHECK (! eqtests::bitEqualBlock (modulated (0.0f, 1.0f, 1), modulated (100.0f, 1.0f, 1)));
+    CHECK (! eqtests::bitEqualBlock (modulated (0.0f, 1.0f, 1), modulated (0.0f, 1.0f, 2)));
+
+    // The tank passes DC round and round; the blocker at the output does not
+    // let it out. Four seconds of a DC step at a 1 s decay, long enough for
+    // the tank's own slow modes to settle: the last half second averages to
+    // -8.7e-10, where a plate without its blocker holds 0.15 of the 0.5 step.
+    {
+        EffectReverbModule m;
+        m.prepare (module_test::config (48000.0, 512));
+        EffectChannelParams p = reverb_test::modelParams (plate, 100.0f, 0.0f);
+        p.reverb.rt60 = 1.0f;
+        m.applyParams (p, 0);
+        std::vector<float> dc (192000, 0.5f);
+        module_test::render (m, dc);
+        double mean = 0.0;
+        for (int i = 168000; i < 192000; ++i)
+            mean += dc[(size_t) i];
+        mean /= 24000.0;
+        CHECK (std::fabs (mean) < 2.0e-3);
+    }
+
+    // reset() clears the tank: silence in, exact silence out.
+    {
+        EffectReverbModule m;
+        m.prepare (module_test::config (48000.0, 256));
+        EffectChannelParams p = reverb_test::modelParams (plate, 100.0f, 10.0f);
+        p.reverb.rt60 = 8.0f;
+        m.applyParams (p, 0);
+        std::vector<float> excite = module_test::awkwardBlock (4096, 7);
+        module_test::render (m, excite);
+        CHECK (reverb_test::windowDb (excite, 2048, 4096) > -60.0);
+
+        m.reset();
+        std::vector<float> silence (8192, 0.0f);
+        module_test::render (m, silence);
+        bool silent = true;
+        for (float x : silence)
+            silent = silent && x == 0.0f;
+        CHECK (silent);
+    }
+
+    // A NaN everywhere is the all-minimum corner, bit for bit (every clamp
+    // lands a NaN on its low bound), and the loudest corner stays bounded and
+    // decays over 20 s.
+    {
+        auto corner = [plate] (float v)
+        {
+            EffectReverbModule m;
+            m.prepare (module_test::config (48000.0, 256));
+            EffectChannelParams p = reverb_test::modelParams (plate, 100.0f, 0.0f);
+            p.reverb.rt60 = p.reverb.rt60LowMult = p.reverb.rt60HighMult = v;
+            p.reverb.crossoverLow = p.reverb.crossoverHigh = p.reverb.diffusion = v;
+            p.reverb.size = p.reverb.modRateHz = p.reverb.modDepth = v;
+            m.applyParams (p, 0);
+            std::vector<float> buf = module_test::awkwardBlock (4096, 11);
+            buf.resize (16384, 0.0f);
+            module_test::render (m, buf);
+            return buf;
+        };
+        CHECK (eqtests::bitEqualBlock (corner (std::numeric_limits<float>::quiet_NaN()), corner (-1.0e9f)));
+
+        EffectReverbModule m;
+        m.prepare (module_test::config (48000.0, 512));
+        EffectChannelParams p = reverb_test::modelParams (plate, 100.0f, 0.0f);
+        p.reverb.rt60 = 8.0f;
+        p.reverb.rt60LowMult = 9.0f;
+        p.reverb.rt60HighMult = 9.0f;
+        p.reverb.crossoverLow = 500.0f;
+        p.reverb.crossoverHigh = 1000.0f;
+        p.reverb.diffusion = 1.0f;
+        p.reverb.size = 2.0f;
+        p.reverb.modDepth = 100.0f;
+        p.reverb.modRateHz = 5.0f;
+        p.reverb.toneHz = 20000.0f;
+        m.applyParams (p, 0);
+
+        std::vector<float> buf = module_test::awkwardBlock (24000, 13);
+        buf.resize (48000 * 20, 0.0f);
+        module_test::render (m, buf);
+
+        bool finite = true;
+        float peak = 0.0f;
+        for (float x : buf)
+        {
+            finite = finite && std::isfinite (x);
+            peak = std::fabs (x) > peak ? std::fabs (x) : peak;
+        }
+        // Measured: peak 1.28, the second second at -11.8 dB, the twentieth at
+        // -37.0 - a 72 s tail in two bands, decaying as it should.
+        const double early = reverb_test::windowDb (buf, 48000, 96000);
+        const double late = reverb_test::windowDb (buf, 48000 * 19, 48000 * 20);
+        CHECK (finite && peak < 4.0f);
+        CHECK (late < early - 6.0);
+    }
+}
+
+static void testPlateSpillover()
+{
+    using namespace spatcore::effects;
+
+    // A change of model is a change of world like any other: FDN to plate,
+    // plate to FDN and a plate size change must each be the old world fed the
+    // input before the change plus the new one fed the rest.
+    const ChainConfig cfg = module_test::config (48000.0, 256);
+    const int before = 6000, n = 30000;
+    const int fade = (int) (EffectReverbModule::kSpillFadeSeconds * 48000.0 + 0.5);
+
+    struct Change { int fromModel; float fromSize; int toModel; float toSize; };
+    for (const Change& c : { Change { 0, 1.0f, 1, 1.0f }, Change { 1, 1.0f, 0, 1.0f }, Change { 1, 0.8f, 1, 1.9f } })
+    {
+        std::vector<float> in = module_test::awkwardBlock (n, 29);
+        for (int i = before + 3000; i < n; ++i)
+            in[(size_t) i] = 0.0f;
+
+        EffectChannelParams from = reverb_test::modelParams (c.fromModel, 100.0f, 0.0f);
+        from.reverb.rt60 = 2.0f;
+        from.reverb.size = c.fromSize;
+        EffectChannelParams to = from;
+        to.reverb.model = (std::uint8_t) c.toModel;
+        to.reverb.size = c.toSize;
+
+        EffectReverbModule spill;
+        spill.prepare (cfg);
+        spill.applyParams (from, 0);
+        std::vector<float> out = in;
+        spill.process (out.data(), before);
+        spill.applyParams (to, 0);
+        CHECK (spill.getSpillVoices() == 1);
+        spill.process (out.data() + before, n - before);
+
+        // The plate is time-varying - its LFO - so the new world's reference
+        // starts where the new world does: at the change, not at time zero.
+        EffectReverbModule oldWorld, newWorld;
+        oldWorld.prepare (cfg);
+        newWorld.prepare (cfg);
+        oldWorld.applyParams (from, 0);
+        newWorld.applyParams (to, 0);
+
+        std::vector<float> outOld = in, outNew ((size_t) (n - before), 0.0f);
+        for (int i = before; i < n; ++i)
+        {
+            const int k = i - before;
+            const double s = k < fade ? std::sin (3.141592653589793 * (double) k / (2.0 * fade)) : 1.0;
+            const float g = (float) (s * s);
+            outOld[(size_t) i] = in[(size_t) i] * (1.0f - g);
+            outNew[(size_t) k] = in[(size_t) i] * g;
+        }
+        module_test::render (oldWorld, outOld);
+        module_test::render (newWorld, outNew);
+
+        float worst = 0.0f, peak = 0.0f;
+        for (int i = 0; i < n; ++i)
+        {
+            const float fresh = i >= before ? outNew[(size_t) (i - before)] : 0.0f;
+            const float d = std::fabs (out[(size_t) i] - (outOld[(size_t) i] + fresh));
+            worst = d > worst ? d : worst;
+            peak = std::fabs (out[(size_t) i]) > peak ? std::fabs (out[(size_t) i]) : peak;
+        }
+        CHECK (peak > 0.1f);
+        CHECK (worst < 1.0e-4f * peak);
+    }
+
+    // Model and size flipping every block: nothing allocated, and the storm
+    // lands on the last model asked for.
+    {
+        EffectReverbModule m;
+        m.prepare (module_test::config (48000.0, 64));
+        EffectChannelParams p = reverb_test::modelParams (0, 100.0f, 0.0f);
+        m.applyParams (p, 0);
+        std::vector<float> buf = module_test::awkwardBlock (48000, 31);
+
+        alloc_probe::Scope probe;
+        for (int b = 0; b < 750; ++b)
+        {
+            if (b >= 100 && b < 160)
+            {
+                p.reverb.model = (std::uint8_t) (b % 2 == 0 ? 1 : 0);
+                p.reverb.size = b % 3 == 0 ? 1.4f : 0.9f;
+                m.applyParams (p, 0);
+            }
+            m.process (buf.data() + b * 64, 64);
+        }
+        CHECK (probe.allocations() == 0);
+
+        bool finite = true;
+        for (float x : buf)
+            finite = finite && std::isfinite (x);
+        CHECK (finite);
+        CHECK (std::fabs (m.getActiveSize() - 1.4f) < 1.0e-5f);         // b = 159: odd (the FDN), a multiple of 3
+    }
+}
+
+
+//==============================================================================
 // effects/modules - Multitap delay (FxDelay)
 //==============================================================================
 
@@ -13350,6 +13700,8 @@ int main()
         testEffectReverbEarlyReflections();
         testEffectReverbReflectionSpillover();
         testEffectReverbReflectionStorm();
+        testPlateReverbModel();
+        testPlateSpillover();
         testMultitapDelayNeutral();
         testMultitapDelayTapPlacement();
         testMultitapDelayTimeModulation();

@@ -8,8 +8,10 @@
 #include "../../dsp/OnePoleSmoother.h"
 #include "../../reverb/ReverbFDNAlgorithm.h"
 #include "reverb/EarlyReflections.h"
+#include "reverb/PlateReverbModel.h"
 #include "reverb/ReverbDelayLine.h"
 #include "reverb/ReverbLfo.h"
+#include "reverb/ReverbTailModel.h"
 #include <juce_audio_basics/juce_audio_basics.h>
 #include <algorithm>
 #include <array>
@@ -22,54 +24,6 @@
 
 namespace spatcore::effects
 {
-
-/**
-    The tail generator behind the reverb module.
-
-    The module owns predelay, tone and mix - the parts every algorithm needs in
-    the same shape - and a model owns the tail itself. The plate, the SDN-style
-    model and convolution are then a new class here rather than a second reverb
-    module carrying its own copy of the wet path, and a project that names a
-    model the build does not have still makes a sound.
-
-    setParams RETURNS the variant flag rather than being told it, because only
-    the model knows which of its parameters are build-time. prepare() allocates
-    and is never realtime; everything else, commitPendingVariant() included,
-    runs on the audio thread - the module rebuilds an IDLE instance there when
-    a change needs another topology, so a model must reach its new topology
-    without allocating.
-*/
-class IEffectReverbModel
-{
-public:
-    virtual ~IEffectReverbModel() = default;
-
-    /** Allocates. IEffectModule::prepare carries no parameters, so `initial` is
-        the default set; the module's first applyParams commits any build-time
-        difference immediately rather than through a fade. */
-    virtual void prepare (const ChainConfig& config, const ReverbParams& initial) = 0;
-
-    virtual void reset() noexcept = 0;
-
-    /** True while the model is still running a value other than the one it has
-        just been given, i.e. it needs silence to catch up. A STATE, not an
-        edge: handed the value it is already running, it answers false. */
-    virtual bool setParams (const ReverbParams& params) noexcept = 0;
-
-    virtual void commitPendingVariant() noexcept {}
-
-    /** Mono, in place: the predelayed input goes in, the wet tail comes out. */
-    virtual void process (float* inout, int numSamples) noexcept = 0;
-
-    /** True when `params` asks for a topology this instance is not built at.
-        Asked WITHOUT handing the parameters over: the module turns such a
-        change into a spillover to an idle twin, and the instance that is about
-        to ring out must keep playing with the values it had. */
-    virtual bool isBuildDifferent (const ReverbParams& params) const noexcept = 0;
-
-    /** The Size the instance is built at (what process() runs). */
-    virtual float getBuiltSize() const noexcept = 0;
-};
 
 //==============================================================================
 /**
@@ -220,13 +174,8 @@ public:
         return quantiseSize (clampParam (params.size, kMinSize, kMaxSize)) != builtSize;
     }
 
-    /** Two decimals. A fader that sends 1.0000001 must not rebuild the network,
-        and the shortest line only changes length every 1/337 of a size step
-        anyway. */
-    static float quantiseSize (float v) noexcept
-    {
-        return static_cast<float> (static_cast<int> (v * 100.0f + 0.5f)) * 0.01f;
-    }
+    /** Two decimals - see quantiseReverbSize. */
+    static float quantiseSize (float v) noexcept     { return quantiseReverbSize (v); }
 
 private:
     static float clampParam (float v, float lo, float hi) noexcept
@@ -369,8 +318,9 @@ public:
     static constexpr float kMaxErLevelDb = 6.0f;
 
     /** Tail classes, each built twice, so a change inside a class - a size -
-        spills over as surely as a change between classes does. */
-    static constexpr int kNumClasses = 1;
+        spills over as surely as a change between classes does. 0 is the FDN
+        (models 0, 2 and 3), 1 the plate. */
+    static constexpr int kNumClasses = 2;
     static constexpr int kInstancesPerClass = 2;
     static constexpr int kNumInstances = kNumClasses * kInstancesPerClass;
 
@@ -591,21 +541,31 @@ private:
 
     static float sizeFor (const ReverbParams& r) noexcept
     {
-        return FdnReverbModel::quantiseSize (clampParam (r.size, kReverbMinSize, kReverbMaxSize));
+        return quantiseReverbSize (clampParam (r.size, kReverbMinSize, kReverbMaxSize));
     }
 
     /** The tail class a parameter set runs on. */
     static int classFor (const ReverbParams& r) noexcept
     {
-        juce::ignoreUnused (r);
-        return 0;                                   // the FDN is the only class so far
+        return resolveReverbModel (r.model) == static_cast<int> (ReverbModel::Plate) ? 1 : 0;
     }
 
     static int firstOfClass (int cls) noexcept      { return cls * kInstancesPerClass; }
     static int classOfInstance (int k) noexcept     { return k / kInstancesPerClass; }
 
-    IEffectReverbModel& instance (int k) noexcept              { return fdn[k]; }
-    const IEffectReverbModel& instance (int k) const noexcept  { return fdn[k]; }
+    IEffectReverbModel& instance (int k) noexcept
+    {
+        if (k >= kInstancesPerClass)
+            return plate[k - kInstancesPerClass];
+        return fdn[k];
+    }
+
+    const IEffectReverbModel& instance (int k) const noexcept
+    {
+        if (k >= kInstancesPerClass)
+            return plate[k - kInstancesPerClass];
+        return fdn[k];
+    }
 
     bool needsTransition (const ReverbParams& r) const noexcept
     {
@@ -1030,6 +990,7 @@ private:
     }
 
     FdnReverbModel fdn[kInstancesPerClass];
+    PlateReverbModel plate[kInstancesPerClass];
     bool dirty[kNumInstances] = {};
 
     World worlds[3];
