@@ -144,6 +144,7 @@
 #include "spatcore/effects/modules/reverb/ReverbTailModel.h"
 #include "spatcore/effects/modules/reverb/PlateReverbModel.h"
 #include "spatcore/effects/modules/reverb/ModulatedHallModel.h"
+#include "spatcore/effects/modules/reverb/ShimmerTap.h"
 #include "spatcore/effects/modules/reverb/ReverbLfo.h"
 #include "spatcore/effects/modules/EffectReverbModule.h"
 #include "spatcore/effects/modules/MultitapDelayModule.h"
@@ -10878,6 +10879,347 @@ static void testModulatedHallSpillover()
     }
 }
 
+//==============================================================================
+// effects/modules/reverb/ShimmerTap and the Shimmer model (5)
+//==============================================================================
+
+static void testShimmerTap()
+{
+    using namespace spatcore::effects;
+
+    // One tap reading a line that carries a steady signal, as the hall's
+    // shimmer lines do: written every sample, read before the write.
+    const double sr = 48000.0;
+    const float centre = 3000.0f, window = 2400.0f;
+
+    auto shift = [&] (double ratio, const std::vector<float>& in, bool trimmed)
+    {
+        ReverbDelayLine line;
+        line.prepare (6000);
+        ShimmerTap tap;
+        tap.configure (ratio, window);
+        tap.reset();
+
+        const float trim = trimmed ? spatcore::dsp::FastDecibels::dbToGain (ModulatedHallModel::shimmerTrimDb (ratio)) : 1.0f;
+        std::vector<float> out (in.size(), 0.0f);
+        for (size_t i = 0; i < in.size(); ++i)
+        {
+            out[i] = trim * tap.read (line, centre);
+            line.write (in[i]);
+        }
+        return out;
+    };
+
+    auto sine = [sr] (double f, int n)
+    {
+        std::vector<float> v ((size_t) n);
+        for (int i = 0; i < n; ++i)
+            v[(size_t) i] = (float) (0.5 * std::sin (6.283185307179586 * f * (double) i / sr));
+        return v;
+    };
+
+    auto rms = [] (const std::vector<float>& v, int from)
+    {
+        double s = 0.0;
+        for (size_t i = (size_t) from; i < v.size(); ++i)
+            s += (double) v[i] * (double) v[i];
+        return std::sqrt (s / (double) (v.size() - (size_t) from));
+    };
+
+    // It moves the pitch by the ratio: the shifted 1 kHz has its energy at
+    // r kHz, 20 dB and more above what is left at 1 kHz.
+    const int n = 48000;
+    const std::vector<float> tone = sine (1000.0, n);
+    for (double ratio : { 2.0, 1.4983070768766815, 0.5, 4.0, 2.9966141537533632, 1.3348398541700344 })
+    {
+        const std::vector<float> out = shift (ratio, tone, false);
+        const double atTarget = reverb_test::probePower (out, 8000, n, 1000.0 * ratio, sr);
+        const double atSource = reverb_test::probePower (out, 8000, n, 1000.0, sr);
+        CHECK (10.0 * std::log10 (atTarget / atSource) > 20.0);
+    }
+
+    // Never louder than the line: on a sine, on noise and on clicks, untrimmed
+    // at most unity, and trimmed at least 0.3 dB under it at every interval.
+    std::vector<float> noise = module_test::awkwardBlock (n, 43);
+    std::vector<float> clicks ((size_t) n, 0.0f);
+    for (int i = 0; i < n; i += 997)
+        clicks[(size_t) i] = 0.9f;
+
+    const std::vector<float>* const inputs[] = { &tone, &noise, &clicks };
+    bool bounded = true, trimmedUnder = true;
+    for (int interval = 0; interval < (int) ShimmerInterval::Count; ++interval)
+    {
+        for (int s = 0; s < 4; ++s)
+        {
+            const double ratio = ModulatedHallModel::shimmerRatio (interval, s);
+            for (const std::vector<float>* in : inputs)
+            {
+                const double level = rms (*in, 8000);
+                bounded = bounded && rms (shift (ratio, *in, false), 8000) <= level * 1.0001;
+                trimmedUnder = trimmedUnder && 20.0 * std::log10 (rms (shift (ratio, *in, true), 8000) / level) <= -0.3;
+            }
+        }
+    }
+    CHECK (bounded && trimmedUnder);
+
+    // No click where a head jumps: the crossfade hands over while the jumping
+    // head weighs nothing. A 100 Hz sine an octave up moves at most twice as
+    // fast as it did - a hard switch between heads steps by far more.
+    {
+        const std::vector<float> low = sine (100.0, n);
+        const std::vector<float> out = shift (2.0, low, false);
+        float stepIn = 0.0f, stepOut = 0.0f;
+        for (int i = 8001; i < n; ++i)
+        {
+            stepIn = std::fabs (low[(size_t) i] - low[(size_t) (i - 1)]) > stepIn ? std::fabs (low[(size_t) i] - low[(size_t) (i - 1)]) : stepIn;
+            stepOut = std::fabs (out[(size_t) i] - out[(size_t) (i - 1)]) > stepOut ? std::fabs (out[(size_t) i] - out[(size_t) (i - 1)]) : stepOut;
+        }
+        CHECK (stepOut < 2.5f * stepIn);
+    }
+
+    // The last resort: the identity up to 8, bent towards 16 beyond, and
+    // monotonic and continuous through the bend.
+    CHECK (ModulatedHallModel::softClip (7.5f) == 7.5f && ModulatedHallModel::softClip (-8.0f) == -8.0f);
+    CHECK (ModulatedHallModel::softClip (1.0e9f) <= 16.0f && ModulatedHallModel::softClip (-1.0e9f) >= -16.0f);
+    CHECK (ModulatedHallModel::softClip (8.001f) > 8.0f && ModulatedHallModel::softClip (8.001f) < 8.002f);
+    CHECK (ModulatedHallModel::softClip (20.0f) > ModulatedHallModel::softClip (12.0f));
+}
+
+static void testShimmerModel()
+{
+    using namespace spatcore::effects;
+    const int hallModel = (int) ReverbModel::ModulatedHall;
+    const int shimmerModel = (int) ReverbModel::Shimmer;
+    const double sr = 48000.0;
+
+    // A second of a steady tone, then the tail it leaves.
+    auto tail = [sr] (int model, int interval, float amount, double f)
+    {
+        EffectReverbModule m;
+        m.prepare (module_test::config (sr, 512));
+        EffectChannelParams p = reverb_test::modelParams (model, 100.0f, 0.0f);
+        p.reverb.rt60 = 4.0f;
+        p.reverb.toneHz = 20000.0f;
+        p.reverb.shimmerPitch = (std::uint8_t) interval;
+        p.reverb.shimmerAmount = amount;
+        m.applyParams (p, 0);
+
+        const int n = 48000 * 3;
+        std::vector<float> buf ((size_t) n, 0.0f);
+        for (int i = 0; i < 48000; ++i)
+        {
+            const double ramp = i < 2400 ? 0.5 - 0.5 * std::cos (3.141592653589793 * (double) i / 2400.0)
+                              : (i > 45600 ? 0.5 + 0.5 * std::cos (3.141592653589793 * (double) (i - 45600) / 2400.0) : 1.0);
+            buf[(size_t) i] = (float) (0.5 * ramp * std::sin (6.283185307179586 * f * (double) i / sr));
+        }
+        module_test::render (m, buf);
+        return buf;
+    };
+
+    // Every interval lands: in the tail of a 1 kHz tone the target pitch stands
+    // 20 dB and more above what the plain hall leaves there (80 to 110
+    // measured), and clear of the pitch a semitone above it: 32 to 47 dB for
+    // the single voices, 5.4 for the lower voice of an octave down and up -
+    // two cascades going both ways make a thicker cloud - where leakage from
+    // a missing voice (a fifth-and-octave with no octave) sits at -11.7. The
+    // two-voice intervals, both voices.
+    struct Target { int interval; double f; };
+    for (const Target& t : { Target { 0, 2000.0 }, Target { 1, 1498.3 }, Target { 2, 1498.3 }, Target { 2, 2000.0 },
+                             Target { 3, 2996.6 }, Target { 4, 4000.0 }, Target { 5, 1334.8 },
+                             Target { 6, 500.0 }, Target { 7, 500.0 }, Target { 7, 2000.0 } })
+    {
+        const std::vector<float> shimmering = tail (shimmerModel, t.interval, 60.0f, 1000.0);
+        const std::vector<float> plain = tail (hallModel, t.interval, 60.0f, 1000.0);
+        const double atTarget = reverb_test::probePower (shimmering, 60000, 144000, t.f, sr);
+        const double gain = 10.0 * std::log10 (atTarget / reverb_test::probePower (plain, 60000, 144000, t.f, sr));
+        const double stand = 10.0 * std::log10 (atTarget / reverb_test::probePower (shimmering, 60000, 144000, t.f * 1.0594630943592953, sr));
+        CHECK (gain > 20.0 && stand > 3.0);
+    }
+
+    // Sustain. RT60 is the unshimmered decay; the climbing voices fade faster
+    // by design (the trims), and energy that climbs past the guard filters
+    // leaves. On music - noise under 500 Hz, here - at RT60 5 s the plain hall
+    // drops 11.3 dB a second, a shimmer at 0 % 11.6, at 50 % 18.0: about two
+    // thirds of the tail. A plain (1 - a, a) crossfade of the two reads threw
+    // away half a line's power every pass and got nowhere near.
+    auto sustainDrop = [] (int model, float amt)
+    {
+        EffectReverbModule m;
+        m.prepare (module_test::config (48000.0, 512));
+        EffectChannelParams p = reverb_test::modelParams (model, 100.0f, 0.0f);
+        p.reverb.rt60 = 5.0f;
+        p.reverb.rt60LowMult = 1.0f;
+        p.reverb.rt60HighMult = 1.0f;
+        p.reverb.toneHz = 20000.0f;
+        p.reverb.shimmerAmount = amt;
+        m.applyParams (p, 0);
+
+        std::vector<float> buf = module_test::awkwardBlock (96000, 17);
+        float s1 = 0.0f, s2 = 0.0f;
+        for (float& x : buf)                        // two one-poles at 500 Hz: music, roughly
+        {
+            s1 += 0.0634f * (x - s1);
+            s2 += 0.0634f * (s1 - s2);
+            x = 4.0f * s2;
+        }
+        buf.resize (96000 + 96000, 0.0f);
+        module_test::render (m, buf);
+        return reverb_test::windowDb (buf, 96000 + 4800, 96000 + 9600)
+             - reverb_test::windowDb (buf, 96000 + 52800, 96000 + 57600);
+    };
+    const double hallDrop = sustainDrop (hallModel, 50.0f);
+    const double idleDrop = sustainDrop (shimmerModel, 0.0f);
+    const double halfDrop = sustainDrop (shimmerModel, 50.0f);
+    CHECK (idleDrop < hallDrop + 1.5);
+    CHECK (halfDrop < 1.7 * hallDrop);          // 1.59 measured; without the shifter's make-up 1.77
+
+    // Model 4 is the same hall whatever the shimmer settings say.
+    CHECK (eqtests::bitEqualBlock (tail (hallModel, 0, 0.0f, 440.0), tail (hallModel, 7, 100.0f, 440.0)));
+
+    // A raised voice does not fold past Nyquist: two octaves up, a 9 kHz tone
+    // would land on 36 kHz and alias to 12; the guard filters on the shimmer
+    // writes keep that alias under the tone the other lines carry (-16.7 dB
+    // measured; +3.0 without them).
+    {
+        const std::vector<float> high = tail (shimmerModel, (int) ShimmerInterval::TwoOctaves, 100.0f, 9000.0);
+        const double alias = 10.0 * std::log10 (reverb_test::probePower (high, 60000, 144000, 12000.0, sr)
+                                                / reverb_test::probePower (high, 60000, 144000, 9000.0, sr));
+        CHECK (alias < -10.0);
+    }
+
+    // A lowered voice does not pile up rumble: an octave down, at full amount,
+    // a 160 Hz tone keeps falling - 80, 40, 20 - and the high pass on the
+    // shifted read keeps the bottom octave down against the second (-14.1 dB
+    // measured; -2.6 without it, -9.2 untrimmed).
+    {
+        const std::vector<float> low = tail (shimmerModel, (int) ShimmerInterval::OctaveDown, 100.0f, 160.0);
+        const double rumble = 10.0 * std::log10 (reverb_test::probePower (low, 60000, 144000, 20.0, sr)
+                                                 / reverb_test::probePower (low, 60000, 144000, 80.0, sr));
+        CHECK (rumble < -10.0);
+    }
+
+    // The shimmer and its interval are build-time (they spill over), the
+    // amount is runtime (it glides).
+    {
+        EffectReverbModule m;
+        m.prepare (module_test::config (sr, 256));
+        EffectChannelParams p = reverb_test::modelParams (shimmerModel, 100.0f, 0.0f);
+        m.applyParams (p, 0);
+        std::vector<float> excite = module_test::awkwardBlock (4096, 3);
+        module_test::render (m, excite);
+
+        p.reverb.shimmerAmount = 90.0f;
+        m.applyParams (p, 0);
+        CHECK (m.getSpillVoices() == 0);
+
+        p.reverb.shimmerPitch = (std::uint8_t) ShimmerInterval::FifthUp;
+        m.applyParams (p, 0);
+        CHECK (m.getSpillVoices() == 1);
+    }
+
+    // The loudest corner - every interval's worst: full amount, two octaves up
+    // and an octave down and up, the longest decay, the largest size, full
+    // modulation - stays bounded and dies away over 20 s. Measured peaks 1.50
+    // and 1.73; a shifter running the wrong way reaches the soft clip.
+    for (int interval : { (int) ShimmerInterval::TwoOctaves, (int) ShimmerInterval::OctaveDownAndUp })
+    {
+        EffectReverbModule m;
+        m.prepare (module_test::config (sr, 512));
+        EffectChannelParams p = reverb_test::modelParams (shimmerModel, 100.0f, 0.0f);
+        p.reverb.rt60 = 8.0f;
+        p.reverb.rt60LowMult = 9.0f;
+        p.reverb.rt60HighMult = 9.0f;
+        p.reverb.crossoverLow = 500.0f;
+        p.reverb.crossoverHigh = 1000.0f;
+        p.reverb.diffusion = 1.0f;
+        p.reverb.size = 2.0f;
+        p.reverb.modDepth = 100.0f;
+        p.reverb.modRateHz = 5.0f;
+        p.reverb.toneHz = 20000.0f;
+        p.reverb.shimmerPitch = (std::uint8_t) interval;
+        p.reverb.shimmerAmount = 100.0f;
+        m.applyParams (p, 0);
+
+        std::vector<float> buf = module_test::awkwardBlock (24000, 13);
+        buf.resize (48000 * 20, 0.0f);
+        module_test::render (m, buf);
+
+        bool finite = true;
+        float peak = 0.0f;
+        for (float x : buf)
+        {
+            finite = finite && std::isfinite (x);
+            peak = std::fabs (x) > peak ? std::fabs (x) : peak;
+        }
+        const double early = reverb_test::windowDb (buf, 48000, 96000);
+        const double late = reverb_test::windowDb (buf, 48000 * 19, 48000 * 20);
+        CHECK (finite && peak < 4.0f);
+        CHECK (late < early - 6.0);
+    }
+
+    // Into a shimmer from the plain hall, and from one interval to another:
+    // exact partitions like every other change of world.
+    {
+        const ChainConfig cfg = module_test::config (sr, 256);
+        const int before = 6000, n = 30000;
+        const int fade = (int) (EffectReverbModule::kSpillFadeSeconds * sr + 0.5);
+
+        struct Change { int fromModel; int fromInterval; int toModel; int toInterval; };
+        for (const Change& c : { Change { hallModel, 0, shimmerModel, 0 }, Change { shimmerModel, 0, shimmerModel, 6 } })
+        {
+            std::vector<float> in = module_test::awkwardBlock (n, 47);
+            for (int i = before + 3000; i < n; ++i)
+                in[(size_t) i] = 0.0f;
+
+            EffectChannelParams from = reverb_test::modelParams (c.fromModel, 100.0f, 0.0f);
+            from.reverb.rt60 = 2.0f;
+            from.reverb.shimmerPitch = (std::uint8_t) c.fromInterval;
+            EffectChannelParams to = from;
+            to.reverb.model = (std::uint8_t) c.toModel;
+            to.reverb.shimmerPitch = (std::uint8_t) c.toInterval;
+
+            EffectReverbModule spill;
+            spill.prepare (cfg);
+            spill.applyParams (from, 0);
+            std::vector<float> out = in;
+            spill.process (out.data(), before);
+            spill.applyParams (to, 0);
+            CHECK (spill.getSpillVoices() == 1);
+            spill.process (out.data() + before, n - before);
+
+            EffectReverbModule oldWorld, newWorld;
+            oldWorld.prepare (cfg);
+            newWorld.prepare (cfg);
+            oldWorld.applyParams (from, 0);
+            newWorld.applyParams (to, 0);
+
+            std::vector<float> outOld = in, outNew ((size_t) (n - before), 0.0f);
+            for (int i = before; i < n; ++i)
+            {
+                const int k = i - before;
+                const double s = k < fade ? std::sin (3.141592653589793 * (double) k / (2.0 * fade)) : 1.0;
+                const float g = (float) (s * s);
+                outOld[(size_t) i] = in[(size_t) i] * (1.0f - g);
+                outNew[(size_t) k] = in[(size_t) i] * g;
+            }
+            module_test::render (oldWorld, outOld);
+            module_test::render (newWorld, outNew);
+
+            float worst = 0.0f, peak = 0.0f;
+            for (int i = 0; i < n; ++i)
+            {
+                const float fresh = i >= before ? outNew[(size_t) (i - before)] : 0.0f;
+                const float d = std::fabs (out[(size_t) i] - (outOld[(size_t) i] + fresh));
+                worst = d > worst ? d : worst;
+                peak = std::fabs (out[(size_t) i]) > peak ? std::fabs (out[(size_t) i]) : peak;
+            }
+            CHECK (peak > 0.1f);
+            CHECK (worst < 1.0e-4f * peak);
+        }
+    }
+}
+
+
 
 
 //==============================================================================
@@ -14113,6 +14455,8 @@ int main()
         testPlateSpillover();
         testModulatedHallModel();
         testModulatedHallSpillover();
+        testShimmerTap();
+        testShimmerModel();
         testMultitapDelayNeutral();
         testMultitapDelayTapPlacement();
         testMultitapDelayTimeModulation();

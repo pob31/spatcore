@@ -3,11 +3,13 @@
 #include "ReverbDelayLine.h"
 #include "ReverbLfo.h"
 #include "ReverbTailModel.h"
+#include "ShimmerTap.h"
 #include "../../EffectPresets.h"
 #include "../../../dsp/DcBlocker.h"
 #include "../../../dsp/FastDecibels.h"
 #include "../../../dsp/FrDiffusionModel.h"
 #include "../../../dsp/OnePoleSmoother.h"
+#include <cmath>
 #include <cstdint>
 
 namespace spatcore::effects
@@ -40,6 +42,34 @@ namespace spatcore::effects
     both crossovers mean what they mean on the other models. Unlike the FDN
     there is no fixed 8 kHz low pass inside: Tone owns brightness.
 
+    Model 5, Shimmer, is this hall with its four longest lines shimmering.
+    Each reads itself as usual and through a pitch-shifting tap (ShimmerTap),
+    mixed at EQUAL POWER - sqrt(1 - a) of the one, sqrt(a) of the other,
+    trimmed, for a = ShimmerAmount - so round the loop the tail climbs by the
+    interval every pass and fades as it climbs. The two-voice intervals split
+    the four lines two and two.
+
+    Equal power, not a plain (1 - a, a) crossfade, and for the sustain. The
+    two reads are at different pitches, so they are uncorrelated and their
+    POWERS add: a plain crossfade keeps (1 - a)^2 + a^2 of a line's power per
+    pass - half of it at a = 0.5 - which drained a 5 s shimmer in 1.7 s. At
+    equal power the line keeps (1 - a) + a trim^2. It is also why the loop
+    stays put: the shifter never gives out more power than it reads (a convex
+    pair of heads over a stationary signal), the two reads only correlate at
+    DC, which the high pass below removes, so no line gains power on a pass
+    and the decay gains are all under one. What else keeps it tame:
+    - the trims - -2.0 dB an octave up, -4.5 two octaves up, -2.2 an octave
+      down, -0.5 otherwise - make the higher voices fade faster than the
+      tail, as a shimmer should;
+    - two one-poles on those lines' writes, at min(12 kHz, sr / 4 ratio),
+      keep a raised voice from folding past Nyquist, and a one-pole high pass
+      at 80 Hz on the shifted read stops a lowered one piling up rumble;
+    - past |8| a soft clip, as a last resort only.
+    The shimmer (on or off) and the interval are build-time, so switching
+    them spills over rather than jumping a sweeping head; the amount is
+    runtime. Off, the lines run the exact model-4 arithmetic: a hall is the
+    same hall whatever the shimmer settings say.
+
     Size is build-time (the lengths), everything else runtime; every line is
     allocated in prepare() at the largest size, so a rebuild is new lengths and
     a cleared state. libm-free throughout: a render hashes the same everywhere.
@@ -54,6 +84,22 @@ public:
 
     /** How far a line may move per channel, either way. */
     static constexpr float kLineJitter = 0.0625f;
+
+    /** The shimmer lines: the four longest. */
+    static constexpr int kShimmerLines = 4;
+    static constexpr int kFirstShimmerLine = kLines - kShimmerLines;
+
+    /** A shimmer sweep's window: at most this, and at most 0.8 of the line. */
+    static constexpr float kMaxWindowMs = 50.0f;
+
+    /** The shifter's two triangle-faded heads carry 2/3 of the line's power
+        on average (their weights' squares average 2/3 over a sweep); this
+        makes the shifted read power-neutral. On the rare frequency whose two
+        heads land in phase it lifts a single pass by 1.76 dB - which is what
+        the trims answer for: an octave chain (the one that stays in phase
+        pass after pass) still loses 0.2 dB a pass at -2 dB, and every other
+        interval drifts out of phase on the next. */
+    static constexpr float kShifterMakeup = 1.2247448713915890f;       // sqrt (3/2)
 
     /** Output make-up. Sixteen signed taps of an energy-preserving mix come
         out 9.5 dB louder than the FDN (+4.65 dB against the dry on noise at
@@ -72,10 +118,13 @@ public:
 
         maxExcursion = static_cast<int> (kMaxExcursionMs * 0.001 * sampleRate) + 2;
 
+        const int halfWindow = static_cast<int> (0.5 * kMaxWindowMs * 0.001 * sampleRate) + 2;
+
         for (int i = 0; i < kLines; ++i)
         {
             jitter[i] = 1.0f + kLineJitter * hash (i);
-            lines[i].prepare (lengthOf (kLineBase[i] * jitter[i], kReverbMaxSize) + maxExcursion + 4);
+            lines[i].prepare (lengthOf (kLineBase[i] * jitter[i], kReverbMaxSize) + maxExcursion + 4
+                              + (i >= kFirstShimmerLine ? halfWindow : 0));
             inSign[i] = hash (48 + i) < 0.0f ? -1.0f : 1.0f;
             outSign[i] = hash (64 + i) < 0.0f ? -1.0f : 1.0f;
         }
@@ -94,7 +143,12 @@ public:
 
         depth.setTimeConstant (sampleRate, 0.02f);
         depth.setSnapEpsilon (1.0e-4f);                     // samples
+        amount.setTimeConstant (sampleRate, 0.02f);
         dc.prepare (sampleRate, 5.0f);
+        hpCoef = onePole (80.0f);
+
+        for (int s = 0; s < kShimmerLines; ++s)
+            taps[s].setStartPhase (0.25 * s);
 
         builtSize = -1.0f;                                  // nothing built yet
         setParams (initial);
@@ -111,8 +165,14 @@ public:
             d.lowState = d.highState = 0.0f;
         for (auto& l : lfo)
             l.reset();
+        for (int s = 0; s < kShimmerLines; ++s)
+        {
+            taps[s].reset();
+            lp1[s] = lp2[s] = hpState[s] = 0.0f;
+        }
 
         depth.snap (depth.getTarget());
+        amount.snap (amount.getTarget());
         dc.reset();
         fresh = true;
     }
@@ -145,18 +205,24 @@ public:
         depth.setTarget (clampParam (params.modDepth, 0.0f, 100.0f) * 0.01f
                          * kMaxExcursionMs * 0.001f * static_cast<float> (sampleRate));
 
+        amount.setTarget (clampParam (params.shimmerAmount, 0.0f, 100.0f) * 0.01f);
+
         // An instance that has not run since it was cleared starts at its
         // values rather than gliding in from the last ones it was given.
         if (fresh)
+        {
             depth.snap (depth.getTarget());
+            amount.snap (amount.getTarget());
+        }
 
         pendingSize = quantiseReverbSize (clampParam (params.size, kReverbMinSize, kReverbMaxSize));
-        return pendingSize != builtSize;
+        pendingShimmer = shimmerFor (params);
+        return isPending();
     }
 
     void commitPendingVariant() noexcept override
     {
-        if (pendingSize != builtSize)
+        if (isPending())
             buildAt (pendingSize);
     }
 
@@ -172,13 +238,60 @@ public:
 
     bool isBuildDifferent (const ReverbParams& params) const noexcept override
     {
-        return quantiseReverbSize (clampParam (params.size, kReverbMinSize, kReverbMaxSize)) != builtSize;
+        return quantiseReverbSize (clampParam (params.size, kReverbMinSize, kReverbMaxSize)) != builtSize
+            || shimmerFor (params) != builtShimmer;
     }
 
     float getBuiltSize() const noexcept override { return builtSize; }
 
     /** Line i's length at the built size, in samples - for tests. */
     int getLineLength (int i) const noexcept { return (i >= 0 && i < kLines) ? len[i] : 0; }
+
+    /** The shimmer the lines are built with: -1 off, else the ShimmerInterval. */
+    int getBuiltShimmer() const noexcept { return builtShimmer; }
+
+    /** The pitch ratio of shimmer line s (0..3) for an interval. */
+    static double shimmerRatio (int interval, int s) noexcept
+    {
+        constexpr double fifth = 1.4983070768766815;       // 2^(7/12)
+        constexpr double fourth = 1.3348398541700344;      // 2^(5/12)
+        constexpr double twelfth = 2.9966141537533632;     // 2^(19/12)
+        const bool firstPair = s < 2;
+
+        switch (interval)
+        {
+            case static_cast<int> (ShimmerInterval::FifthUp):         return fifth;
+            case static_cast<int> (ShimmerInterval::FifthAndOctave):  return firstPair ? fifth : 2.0;
+            case static_cast<int> (ShimmerInterval::Twelfth):         return twelfth;
+            case static_cast<int> (ShimmerInterval::TwoOctaves):      return 4.0;
+            case static_cast<int> (ShimmerInterval::FourthUp):        return fourth;
+            case static_cast<int> (ShimmerInterval::OctaveDown):      return 0.5;
+            case static_cast<int> (ShimmerInterval::OctaveDownAndUp): return firstPair ? 0.5 : 2.0;
+            default:                                                  return 2.0;      // an octave up
+        }
+    }
+
+    /** Past |8|, bend towards 16 - a last resort that a sane loop never meets.
+        The identity below it, continuous and monotonic through it. */
+    static float softClip (float x) noexcept
+    {
+        const float m = x < 0.0f ? -x : x;
+        if (m <= 8.0f)
+            return x;
+
+        const float t = m - 8.0f;
+        const float y = 8.0f + 8.0f * t / (8.0f + t);
+        return x < 0.0f ? -y : y;
+    }
+
+    /** The shifted read's trim for a ratio, in dB. */
+    static float shimmerTrimDb (double ratio) noexcept
+    {
+        if (ratio == 2.0) return -2.0f;
+        if (ratio == 4.0) return -4.5f;
+        if (ratio == 0.5) return -2.2f;
+        return -0.5f;
+    }
 
 private:
     /** Primes, log-spaced from 997 to 3407: 21 to 71 ms at 48 kHz. */
@@ -211,6 +324,20 @@ private:
         return v;
     }
 
+    /** -1 for no shimmer (every model but 5), else the interval. */
+    static int shimmerFor (const ReverbParams& params) noexcept
+    {
+        if (resolveReverbModel (params.model) != static_cast<int> (ReverbModel::Shimmer))
+            return -1;
+
+        return params.shimmerPitch < static_cast<std::uint8_t> (ShimmerInterval::Count) ? params.shimmerPitch : 0;
+    }
+
+    bool isPending() const noexcept
+    {
+        return pendingSize != builtSize || pendingShimmer != builtShimmer;
+    }
+
     int lengthOf (float samplesAt48k, float size) const noexcept
     {
         const int n = static_cast<int> (static_cast<double> (samplesAt48k) * rateScale * size + 0.5);
@@ -231,6 +358,23 @@ private:
             len[i] = lengthOf (kLineBase[i] * jitter[i], size);
 
         builtSize = size;
+        builtShimmer = pendingShimmer;
+
+        if (builtShimmer >= 0)
+        {
+            const float maxWindow = static_cast<float> (kMaxWindowMs * 0.001 * sampleRate);
+            for (int s = 0; s < kShimmerLines; ++s)
+            {
+                const double ratio = shimmerRatio (builtShimmer, s);
+                const float lineWindow = 0.8f * static_cast<float> (len[kFirstShimmerLine + s]);
+                taps[s].configure (ratio, lineWindow < maxWindow ? lineWindow : maxWindow);
+                trim[s] = kShifterMakeup * spatcore::dsp::FastDecibels::dbToGain (shimmerTrimDb (ratio));
+
+                const float guard = static_cast<float> (0.25 * sampleRate / ratio);
+                lpCoef[s] = onePole (guard < 12000.0f ? guard : 12000.0f);
+            }
+        }
+
         updateDecay();
         reset();
     }
@@ -291,10 +435,37 @@ private:
             lfo[k].nextSinCos (mod[2 * k], mod[2 * k + 1]);
 
         float y[kLines];
-        for (int i = 0; i < kLines; ++i)
+
+        if (builtShimmer < 0)
         {
-            const float offset = mod[i & 7] * (i < 8 ? e : -e);
-            y[i] = decay[i].process (lines[i].readHermite (static_cast<float> (len[i]) + offset), cLow, cHigh);
+            for (int i = 0; i < kLines; ++i)
+            {
+                const float offset = mod[i & 7] * (i < 8 ? e : -e);
+                y[i] = decay[i].process (lines[i].readHermite (static_cast<float> (len[i]) + offset), cLow, cHigh);
+            }
+        }
+        else
+        {
+            const float a = amount.next();
+            const float keep = std::sqrt (1.0f - a);        // correctly rounded everywhere: no libm drift
+            const float give = std::sqrt (a);
+
+            for (int i = 0; i < kLines; ++i)
+            {
+                const float offset = mod[i & 7] * (i < 8 ? e : -e);
+                float v = lines[i].readHermite (static_cast<float> (len[i]) + offset);
+
+                if (i >= kFirstShimmerLine)
+                {
+                    const int s = i - kFirstShimmerLine;
+                    float shifted = taps[s].read (lines[i], static_cast<float> (len[i]));
+                    hpState[s] += hpCoef * (shifted - hpState[s]);
+                    shifted -= hpState[s];
+                    v = softClip (keep * v + give * trim[s] * shifted);
+                }
+
+                y[i] = decay[i].process (v, cLow, cHigh);
+            }
         }
 
         hadamard (y);
@@ -303,7 +474,17 @@ private:
         for (int i = 0; i < kLines; ++i)
         {
             out += outSign[i] * y[i];
-            lines[i].write (y[i] + inSign[i] * kInputGain * x);
+            float w = y[i] + inSign[i] * kInputGain * x;
+
+            if (builtShimmer >= 0 && i >= kFirstShimmerLine)
+            {
+                const int s = i - kFirstShimmerLine;
+                lp1[s] += lpCoef[s] * (w - lp1[s]);
+                lp2[s] += lpCoef[s] * (lp1[s] - lp2[s]);
+                w = lp2[s];
+            }
+
+            lines[i].write (w);
         }
 
         return kOutputGain * out;
@@ -313,7 +494,8 @@ private:
     ReverbDelayLine diffusers[4];
     DecayPoint decay[kLines];
     ReverbLfo lfo[4];
-    spatcore::dsp::OnePoleSmoother depth;
+    ShimmerTap taps[kShimmerLines];
+    spatcore::dsp::OnePoleSmoother depth, amount;
     spatcore::dsp::DcBlocker dc;
 
     double sampleRate = 48000.0;
@@ -331,6 +513,13 @@ private:
     float cLow = 0.0f, cHigh = 0.0f;
     float builtSize = 1.0f;
     float pendingSize = 1.0f;
+    int builtShimmer = -1;
+    int pendingShimmer = -1;
+
+    float trim[kShimmerLines] = {};
+    float lpCoef[kShimmerLines] = {};
+    float lp1[kShimmerLines] = {}, lp2[kShimmerLines] = {}, hpState[kShimmerLines] = {};
+    float hpCoef = 0.0f;
     bool fresh = true;
 };
 

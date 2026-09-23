@@ -101,6 +101,7 @@
 #include "effects/modules/reverb/ReverbTailModel.h"
 #include "effects/modules/reverb/PlateReverbModel.h"
 #include "effects/modules/reverb/ModulatedHallModel.h"
+#include "effects/modules/reverb/ShimmerTap.h"
 #include "effects/modules/reverb/ReverbLfo.h"
 #include "effects/modules/EffectReverbModule.h"
 #include "effects/modules/MultitapDelayModule.h"
