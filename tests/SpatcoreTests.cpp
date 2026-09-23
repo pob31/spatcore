@@ -143,6 +143,7 @@
 #include "spatcore/effects/modules/reverb/EarlyReflections.h"
 #include "spatcore/effects/modules/reverb/ReverbTailModel.h"
 #include "spatcore/effects/modules/reverb/PlateReverbModel.h"
+#include "spatcore/controllers/streamdeck/StreamDeckGestureTracker.h"
 #include "spatcore/effects/modules/reverb/ModulatedHallModel.h"
 #include "spatcore/effects/modules/reverb/ShimmerTap.h"
 #include "spatcore/effects/modules/reverb/ReverbLfo.h"
@@ -10126,6 +10127,60 @@ static void testEffectReverbReflectionStorm()
 }
 
 //==============================================================================
+// controllers/streamdeck/StreamDeckGestureTracker - one undo step per gesture
+//==============================================================================
+
+static void testStreamDeckGestureTracker()
+{
+    using spatcore::controllers::StreamDeckGestureTracker;
+
+    StreamDeckGestureTracker g;
+    CHECK (g.getIdleMs() == 800);
+
+    // A run of turns of one control is one gesture, up to and including a
+    // pause of exactly the idle time...
+    CHECK (g.turn (3, 1000));
+    CHECK (! g.turn (3, 1100));
+    CHECK (! g.turn (3, 1900));
+    // ...a longer pause starts the next one...
+    CHECK (g.turn (3, 2701));
+    // ...and so does another control - and coming back to the first.
+    CHECK (g.turn (5, 2750));
+    CHECK (g.turn (3, 2760));
+
+    // A press is a gesture of its own and ends the run: the next turn of the
+    // same control starts a new gesture at once.
+    g.press();
+    CHECK (g.turn (3, 2770));
+    CHECK (! g.turn (3, 2780));
+
+    // Navigation ends the run the same way.
+    g.breakRun();
+    CHECK (g.turn (3, 2790));
+
+    // The first turn is always a gesture, whatever its key or time.
+    StreamDeckGestureTracker fresh;
+    CHECK (fresh.turn (0, 0));
+
+    // The millisecond counter wraps every 49.7 days: the gap is taken modulo
+    // 2^32, both ways - 272 ms across the wrap is the same run, 1536 ms is not.
+    StreamDeckGestureTracker wrapSame;
+    CHECK (wrapSame.turn (1, 0xFFFFFF00u));
+    CHECK (! wrapSame.turn (1, 0x00000010u));
+    StreamDeckGestureTracker wrapNew;
+    CHECK (wrapNew.turn (1, 0xFFFFFF00u));
+    CHECK (wrapNew.turn (1, 0x00000500u));
+
+    // The idle time is the caller's.
+    StreamDeckGestureTracker quick (40);
+    CHECK (quick.turn (7, 100));
+    CHECK (! quick.turn (7, 140));
+    CHECK (quick.turn (7, 181));
+    quick.setIdleMs (1000);
+    CHECK (! quick.turn (7, 1100));
+}
+
+//==============================================================================
 // effects/modules/reverb/PlateReverbModel - model 1
 //==============================================================================
 
@@ -14516,6 +14571,7 @@ int main()
         testModulatedHallSpillover();
         testShimmerTap();
         testShimmerModel();
+        testStreamDeckGestureTracker();
         testMultitapDelayNeutral();
         testMultitapDelayTapPlacement();
         testMultitapDelayTimeModulation();
