@@ -96,6 +96,8 @@
 #include "effects/modules/DynamicsModule.h"
 #include "effects/modules/ModulationModule.h"
 #include "effects/modules/PhaserModule.h"
+#include "effects/modules/reverb/ReverbDelayLine.h"
+#include "effects/modules/reverb/ReverbLfo.h"
 #include "effects/modules/EffectReverbModule.h"
 #include "effects/modules/MultitapDelayModule.h"
 #include "effects/EffectPresets.h"

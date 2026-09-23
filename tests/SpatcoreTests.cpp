@@ -139,6 +139,8 @@
 #include "spatcore/effects/modules/DynamicsModule.h"
 #include "spatcore/effects/modules/ModulationModule.h"
 #include "spatcore/effects/modules/PhaserModule.h"
+#include "spatcore/effects/modules/reverb/ReverbDelayLine.h"
+#include "spatcore/effects/modules/reverb/ReverbLfo.h"
 #include "spatcore/effects/modules/EffectReverbModule.h"
 #include "spatcore/effects/modules/MultitapDelayModule.h"
 #include "spatcore/effects/EffectChain.h"
@@ -8995,6 +8997,196 @@ static void testEffectReverbPresets()
 }
 
 //==============================================================================
+// effects/modules/reverb - the tank primitives the reverb models share
+//==============================================================================
+
+static void testReverbDelayLineReads()
+{
+    using namespace spatcore::effects;
+
+    ReverbDelayLine line;
+    line.prepare (100);
+    CHECK (line.isPrepared());
+    CHECK (line.getMaxDelaySamples() == 100);
+
+    // "Written d writes ago", through several wraps of a ring that is not a
+    // power of two (103 slots).
+    for (int i = 0; i < 1000; ++i)
+        line.write ((float) i);
+
+    CHECK (line.readInteger (1) == 999.0f);
+    CHECK (line.readInteger (5) == 995.0f);
+    CHECK (line.readInteger (100) == 900.0f);
+    CHECK (line.readInteger (0) == line.readInteger (1));           // clamped up
+    CHECK (line.readInteger (-7) == line.readInteger (1));
+    CHECK (line.readInteger (5000) == line.readInteger (100));      // clamped down
+
+    // Hermite at an integer delay IS the stored sample: every term but the
+    // constant is multiplied by a zero fraction.
+    std::vector<float> noise = module_test::awkwardBlock (400, 7);
+    for (float x : noise)
+        line.write (x);
+
+    bool exact = true;
+    for (int d = 2; d <= 100; ++d)
+        exact = exact && bitEqualFloat (line.readHermite ((float) d), line.readInteger (d));
+    CHECK (exact);
+
+    // Out-of-range and non-finite delays land on the ends instead of indexing
+    // wildly.
+    CHECK (bitEqualFloat (line.readHermite (std::numeric_limits<float>::quiet_NaN()), line.readHermite (2.0f)));
+    CHECK (bitEqualFloat (line.readHermite (-3.0f), line.readHermite (2.0f)));
+    CHECK (bitEqualFloat (line.readHermite (1.0e9f), line.readHermite (100.0f)));
+
+    // Half way between two samples it interpolates rather than picking one.
+    ReverbDelayLine ramp;
+    ramp.prepare (16);
+    for (int i = 0; i < 16; ++i)
+        ramp.write ((float) i);                     // a straight line: cubic fits it exactly
+    CHECK (std::fabs (ramp.readHermite (4.5f) - 11.5f) < 1.0e-5f);   // 12 at delay 4, 11 at 5
+
+    line.reset();
+    CHECK (line.readInteger (1) == 0.0f && line.readInteger (100) == 0.0f);
+}
+
+static void testReverbDelayLineHermiteIsPassive()
+{
+    using namespace spatcore::effects;
+
+    // A feedback loop multiplies whatever gain its interpolator has at every
+    // frequency on every pass, so a read with |H| > 1 anywhere is a slow
+    // explosion. The kernel's four weights are recovered by reading an impulse,
+    // then |H(w)| is evaluated on a dense grid for fractions across [0, 1).
+    auto weights = [] (float frac, double w[4])
+    {
+        for (int k = 0; k < 4; ++k)
+        {
+            ReverbDelayLine line;
+            line.prepare (32);
+            // Impulse at delay 10 + (k - 1): positions 9, 10, 11, 12 around the
+            // read at 10 + frac.
+            const int impulseDelay = 10 + (k - 1);
+            for (int i = 0; i < 40; ++i)
+                line.write (i == 40 - impulseDelay ? 1.0f : 0.0f);
+            w[k] = (double) line.readHermite (10.0f + frac);
+        }
+    };
+
+    double worst = 0.0;
+    for (int fi = 0; fi < 100; ++fi)
+    {
+        const float frac = (float) fi * 0.01f;
+        double w[4];
+        weights (frac, w);
+
+        for (int g = 0; g <= 400; ++g)
+        {
+            const double omega = 3.141592653589793 * (double) g / 400.0;
+            double re = 0.0, im = 0.0;
+            for (int k = 0; k < 4; ++k)
+            {
+                re += w[k] * std::cos (omega * (double) k);
+                im -= w[k] * std::sin (omega * (double) k);
+            }
+            const double mag = std::sqrt (re * re + im * im);
+            worst = mag > worst ? mag : worst;
+        }
+    }
+    CHECK (worst <= 1.0 + 1.0e-6);
+
+    // And the reason it is here instead of the linear read: at a fraction of
+    // one half, the per-pass loss at fs/8 and fs/4.
+    auto lossDb = [&] (bool hermite, double cyclesPerSample)
+    {
+        double w[4] = { 0.0, 0.5, 0.5, 0.0 };       // linear: the two middle taps
+        if (hermite)
+            weights (0.5f, w);
+
+        const double omega = 6.283185307179586 * cyclesPerSample;
+        double re = 0.0, im = 0.0;
+        for (int k = 0; k < 4; ++k)
+        {
+            re += w[k] * std::cos (omega * (double) k);
+            im -= w[k] * std::sin (omega * (double) k);
+        }
+        return 20.0 * std::log10 (std::sqrt (re * re + im * im));
+    };
+
+    CHECK (lossDb (true, 0.125) > -0.2);            // measures -0.07
+    CHECK (lossDb (true, 0.25) > -1.3);             // measures -1.07
+    CHECK (lossDb (false, 0.125) < -0.5);           // the linear read: -0.69
+    CHECK (lossDb (false, 0.25) < -2.5);            // ...and -3.01
+}
+
+static void testReverbLfoSine()
+{
+    using namespace spatcore::effects;
+
+    // The libm-free sine against the library's, over a cycle and past it.
+    double worst = 0.0;
+    for (int i = -10000; i <= 20000; ++i)
+    {
+        const double p = (double) i / 10000.0;
+        const double err = std::fabs ((double) ReverbLfo::sin2pi (p) - std::sin (6.283185307179586 * p));
+        worst = err > worst ? err : worst;
+    }
+    CHECK (worst < 5.0e-6);
+
+    ReverbLfo lfo;
+    lfo.prepare (48000.0);
+    lfo.setRateHz (1.0f);
+    lfo.setStartPhase (0.0);
+    lfo.reset();
+
+    // A quarter of a cycle at 1 Hz is 12000 samples at 48 kHz: sin 1, cos 0.
+    for (int i = 0; i < 12000; ++i)
+        lfo.nextSin();
+    float s = 0.0f, c = 0.0f;
+    lfo.nextSinCos (s, c);
+    CHECK (std::fabs (s - 1.0f) < 1.0e-5f && std::fabs (c) < 1.0e-5f);
+
+    // Quadrature holds everywhere, and the start phase is where reset() lands.
+    bool unit = true;
+    for (int i = 0; i < 5000; ++i)
+    {
+        lfo.nextSinCos (s, c);
+        unit = unit && std::fabs (s * s + c * c - 1.0f) < 1.0e-5f;
+    }
+    CHECK (unit);
+
+    lfo.setStartPhase (1.25);                       // wraps to a quarter
+    lfo.reset();
+    CHECK (std::fabs (lfo.nextSin() - 1.0f) < 1.0e-5f);
+
+    // Same settings, same stream, to the bit.
+    ReverbLfo a, b;
+    a.prepare (96000.0);  b.prepare (96000.0);
+    a.setRateHz (0.37f);  b.setRateHz (0.37f);
+    a.setStartPhase (0.6); b.setStartPhase (0.6);
+    a.reset();            b.reset();
+    bool same = true;
+    for (int i = 0; i < 20000; ++i)
+        same = same && bitEqualFloat (a.nextSin(), b.nextSin());
+    CHECK (same);
+
+    // A negative rate holds the phase; an absurd one is clamped to 20 Hz.
+    ReverbLfo held;
+    held.prepare (48000.0);
+    held.setRateHz (-3.0f);
+    held.reset();
+    const double before = held.getPhase();
+    for (int i = 0; i < 100; ++i)
+        held.nextSin();
+    CHECK (held.getPhase() == before);
+
+    held.setRateHz (1000.0f);
+    held.reset();
+    for (int i = 0; i < 600; ++i)                   // 12.5 ms: a quarter cycle at 20 Hz
+        held.nextSin();                             // (unclamped, 1000 Hz would be at a half)
+    CHECK (std::fabs (held.getPhase() - 0.25) < 1.0e-9);
+}
+
+//==============================================================================
 // effects/modules - Multitap delay (FxDelay)
 //==============================================================================
 
@@ -12214,6 +12406,9 @@ int main()
         testEffectReverbSizeVariant();
         testEffectReverbExtremesAndDeterminism();
         testEffectReverbPresets();
+        testReverbDelayLineReads();
+        testReverbDelayLineHermiteIsPassive();
+        testReverbLfoSine();
         testMultitapDelayNeutral();
         testMultitapDelayTapPlacement();
         testMultitapDelayTimeModulation();
