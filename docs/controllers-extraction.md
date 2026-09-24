@@ -91,6 +91,35 @@ app call-site churn.
   arg (the stub mirrors the signature); MainComponent passes `"WFS-DIY"` so the
   on-disk settings path is unchanged.
 
+## Stream Deck+ dials: clicks and acceleration (2026-09-24)
+
+What the hardware sends, measured on a Stream Deck+ with its firmware updated
+that day (`tools/streamdeck/dial_capture.py`, read-only, runs beside an app that
+has the deck open): while a dial turns, one rotation report every **50 ms**, its
+byte the **signed number of clicks** in that window - 1-3 on a slow or medium
+turn, up to 16 on a flick - and no reversal inside a flick (twenty single
+flicks, none).
+
+- `StreamDeckDevice` passes that count on (`onDialRotated (dial, ticks)`). It
+  used to pass only the sign, so a turn counted reports, not clicks: a 15-click
+  flick moved 2 steps, 3 slow clicks back moved 3, and a flick followed by a
+  small correction came out the wrong way.
+- `StreamDeckDialAcceleration` (pure, stateless, covered by spatcore-tests)
+  turns the clicks of one report into steps: up to `kSlowClicks` a click is one
+  step, from `kFastClicks` each click is worth the dial's ceiling. The ceiling
+  comes from `DialBinding::maxAcceleration`: **0** (the default) = from the
+  range, so that two full-speed flicks sweep it and a small range never speeds
+  up; **1** = never, for a dial that picks an item (a cell, a preset); **N** = at
+  most N, for a relative dial (its `getValue` is constant and its range only
+  clamps one move).
+- `StreamDeckManager` applies it to unpressed turns only. Press + turn - the
+  fine step, or an `altBinding` - and ComboBox browsing stay one step per click.
+
+A consumer gets all of it by using the manager; its pages only set
+`maxAcceleration = 1` on their pickers and a cap on their relative dials. If a
+firmware update changes the 50 ms cadence, the feel changes with it: re-run the
+capture and retune the helper's constants.
+
 ## Validation status
 
 All automated gates green ×2 (per-commit): app build (v145), dependency lint,

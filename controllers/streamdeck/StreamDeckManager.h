@@ -7,6 +7,9 @@
  * Routes UI navigation events (tab/subtab/channel changes) to page switches.
  * Routes device events (button press, dial rotation) to the active page bindings.
  * Handles bidirectional parameter sync and ComboBox dial interaction mode.
+ * Every click of a dial report counts, and a fast unpressed turn takes bigger
+ * steps (StreamDeckDialAcceleration, capped by each DialBinding's
+ * maxAcceleration); press + turn and combo browsing stay one step per click.
  * Announces each hardware edit gesture (onEditGestureStart) before its first
  * write, so the owner can give it one undo step - StreamDeckGestureTracker
  * says what a gesture is.
@@ -18,6 +21,7 @@
 #include "StreamDeckPage.h"
 #include "StreamDeckRenderer.h"
 #include "StreamDeckGestureTracker.h"
+#include "StreamDeckDialAcceleration.h"
 
 namespace spatcore::controllers {
 
@@ -44,9 +48,9 @@ public:
             OriginTagScope s { OriginTag::Hardware };
             handleButtonReleased (btn);
         };
-        device.onDialRotated    = [this] (int dial, int dir) {
+        device.onDialRotated    = [this] (int dial, int ticks) {
             OriginTagScope s { OriginTag::Hardware };
-            handleDialRotated (dial, dir);
+            handleDialRotated (dial, ticks);
         };
         device.onDialPressed    = [this] (int dial) {
             OriginTagScope s { OriginTag::Hardware };
@@ -448,10 +452,10 @@ private:
         }
     }
 
-    void handleDialRotated (int dialIndex, int direction)
+    void handleDialRotated (int dialIndex, int ticks)
     {
         auto* page = getCurrentPage();
-        if (page == nullptr || dialIndex < 0 || dialIndex >= 4)
+        if (page == nullptr || dialIndex < 0 || dialIndex >= 4 || ticks == 0)
             return;
 
         auto& binding = page->getActiveSection().dials[dialIndex];
@@ -460,8 +464,8 @@ private:
 
         if (comboModeActive && comboDialIndex == dialIndex)
         {
-            // ComboBox browse mode: rotate through options
-            comboSelectedIndex += direction;
+            // ComboBox browse mode: one option per click, never accelerated
+            comboSelectedIndex += ticks;
             comboSelectedIndex = juce::jlimit (0, binding.comboOptions.size() - 1, comboSelectedIndex);
 
             auto img = renderer.renderLcdZoneComboMode (binding, comboSelectedIndex);
@@ -480,6 +484,19 @@ private:
         // Use fine mode only when altBinding is NOT active (alt IS the alternate parameter)
         bool useFine = dialPressed[dialIndex] && ! hasAlt;
 
+        // A pressed turn - fine or the alternate - is one step per click. An
+        // unpressed one takes bigger steps the more clicks its report holds,
+        // up to the dial's ceiling (gate on the press, not on useFine: an
+        // alternate binding is pressed too).
+        int steps = ticks;
+        if (! dialPressed[dialIndex])
+        {
+            using Acceleration = StreamDeckDialAcceleration;
+            steps *= Acceleration::multiplier (ticks, Acceleration::ceilingFor (active.maxAcceleration,
+                                                                                active.minValue, active.maxValue,
+                                                                                active.step, active.isExponential));
+        }
+
         // One undo step per run of turns of this control: the alternate
         // binding is a control of its own.
         const std::int64_t key = (static_cast<std::int64_t> (page->activeSectionIndex) * 4 + dialIndex) * 2 + (hasAlt ? 1 : 0);
@@ -487,7 +504,7 @@ private:
             beginGesture (active.paramName);
 
         isUpdatingFromController = true;
-        float newVal = active.applyStep (direction, useFine);
+        float newVal = active.applyStep (steps, useFine);
         active.setValue (newVal);
         isUpdatingFromController = false;
 
