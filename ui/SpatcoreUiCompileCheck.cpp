@@ -40,6 +40,10 @@
 #include "sends/SendMatrixConfig.h"
 #include "sends/SendMatrixComponent.h"
 
+// ui/TypedValue.h - reading a number typed into a value field the way the
+// field shows it (units, kHz, 1m 30s, 1:2.0). juce_core only.
+#include "TypedValue.h"
+
 namespace spatcore
 {
     // Referenced by nothing at runtime; exists so the archive is never empty.
