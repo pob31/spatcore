@@ -144,6 +144,7 @@
 #include "spatcore/effects/modules/reverb/ReverbTailModel.h"
 #include "spatcore/effects/modules/reverb/PlateReverbModel.h"
 #include "spatcore/controllers/streamdeck/StreamDeckGestureTracker.h"
+#include "spatcore/controllers/streamdeck/StreamDeckDialAcceleration.h"
 #include "spatcore/effects/modules/reverb/ModulatedHallModel.h"
 #include "spatcore/effects/modules/reverb/ShimmerTap.h"
 #include "spatcore/effects/modules/reverb/ReverbLfo.h"
@@ -10181,6 +10182,82 @@ static void testStreamDeckGestureTracker()
 }
 
 //==============================================================================
+// controllers/streamdeck/StreamDeckDialAcceleration - how far one click goes
+//==============================================================================
+
+static void testStreamDeckDialAcceleration()
+{
+    using A = spatcore::controllers::StreamDeckDialAcceleration;
+    const double sweep = A::kSweepClicks;
+
+    // A binding's own cap wins, up to the absolute one; 1 never accelerates.
+    CHECK (A::ceilingFor (1, -1000.0, 1000.0, 0.001, false) == 1);
+    CHECK (A::ceilingFor (5, 0.0, 1.0, 0.5, false) == 5);
+    CHECK (A::ceilingFor (1000, 0.0, 1.0, 0.5, false) == A::kMaxMultiplier);
+
+    // Otherwise the range decides: the ceiling is how many sweeps' worth of
+    // full-speed clicks the range holds, so that they cross it. A range of
+    // fewer clicks than two sweeps never speeds up. (Half-way factors keep
+    // floor() clear of rounding.)
+    CHECK (A::ceilingFor (0, 0.0, sweep * 6.5 * 0.5, 0.5, false) == 6);
+    CHECK (A::ceilingFor (0, -1.0, -1.0 + sweep * 1.5 * 0.25, 0.25, false) == 1);
+    CHECK (A::ceilingFor (0, 0.0, sweep * 0.5 * 2.0, 2.0, false) == 1);
+    CHECK (A::ceilingFor (0, 0.0, 1.0e9, 0.1, false) == A::kMaxMultiplier);
+
+    // An exponential dial steps in normalised space - but only where
+    // applyStep does too (0 < min < max); elsewhere it steps linearly.
+    CHECK (A::ceilingFor (0, 20.0, 20000.0, 1.0 / (sweep * 4.5), true) == 4);
+    CHECK (A::ceilingFor (0, 0.0, sweep * 5.5, 1.0, true) == 5);
+    CHECK (A::ceilingFor (0, 20.0, 20000.0, 1.0 / (sweep * 4.5), false) == A::kMaxMultiplier);
+
+    // Nothing to measure: no acceleration.
+    CHECK (A::ceilingFor (0, 0.0, 1000.0, 0.0, false) == 1);
+    CHECK (A::ceilingFor (0, 0.0, 1000.0, -0.5, false) == 1);
+    CHECK (A::ceilingFor (0, 0.0, 1000.0, std::nan (""), false) == 1);
+    CHECK (A::ceilingFor (0, 0.0, 1000.0, std::numeric_limits<double>::infinity(), false) == 1);
+    CHECK (A::ceilingFor (0, 1000.0, 0.0, 1.0, false) == 1);
+    CHECK (A::ceilingFor (0, 0.0, std::nan (""), 1.0, false) == 1);
+
+    // A report of up to kSlowClicks moves one step per click, whatever the
+    // ceiling; from kFastClicks each click is worth the whole ceiling.
+    for (int n = 0; n <= A::kSlowClicks; ++n)
+    {
+        CHECK (A::multiplier (n, 20) == 1);
+        CHECK (A::multiplier (-n, 20) == 1);
+    }
+    CHECK (A::multiplier (A::kFastClicks, 7) == 7);
+    CHECK (A::multiplier (-A::kFastClicks, 7) == 7);
+    CHECK (A::multiplier (127, 7) == 7);
+    CHECK (A::multiplier (-128, 7) == 7);
+    CHECK (A::multiplier (std::numeric_limits<int>::min(), 7) == 7);
+
+    // In between it climbs, never falls, stays within [1, ceiling], and does
+    // not care about the direction.
+    for (int ceiling : { 2, 3, 6, 13, 33, A::kMaxMultiplier })
+    {
+        int previous = 1;
+        for (int n = 0; n <= A::kFastClicks + 2; ++n)
+        {
+            const int m = A::multiplier (n, ceiling);
+            CHECK (m >= previous);
+            CHECK (m >= 1 && m <= ceiling);
+            CHECK (m == A::multiplier (-n, ceiling));
+            previous = m;
+        }
+    }
+    CHECK (A::multiplier (A::kFastClicks - 1, A::kMaxMultiplier) > 1);
+    CHECK (A::multiplier (A::kFastClicks - 1, A::kMaxMultiplier) < A::kMaxMultiplier);
+
+    // A ceiling of 1 or less is no acceleration at all.
+    for (int n = 0; n <= 20; ++n)
+    {
+        CHECK (A::multiplier (n, 1) == 1);
+        CHECK (A::multiplier (n, 0) == 1);
+        CHECK (A::multiplier (n, -3) == 1);
+    }
+}
+
+//==============================================================================
 // effects/modules/reverb/PlateReverbModel - model 1
 //==============================================================================
 
@@ -14572,6 +14649,7 @@ int main()
         testShimmerTap();
         testShimmerModel();
         testStreamDeckGestureTracker();
+        testStreamDeckDialAcceleration();
         testMultitapDelayNeutral();
         testMultitapDelayTapPlacement();
         testMultitapDelayTimeModulation();

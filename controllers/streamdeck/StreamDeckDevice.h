@@ -11,7 +11,7 @@
  * Usage:
  *   StreamDeckDevice device;
  *   device.onButtonPressed = [](int btn) { ... };
- *   device.onDialRotated = [](int dial, int dir) { ... };
+ *   device.onDialRotated = [](int dial, int ticks) { ... };
  *   device.startMonitoring();  // begins hotplug detection + connection
  */
 
@@ -93,7 +93,7 @@ public:
 
     std::function<void(int buttonIndex)>               onButtonPressed;
     std::function<void(int buttonIndex)>               onButtonReleased;
-    std::function<void(int dialIndex, int direction)>  onDialRotated;   // direction: +1=CW, -1=CCW
+    std::function<void(int dialIndex, int ticks)>      onDialRotated;   // signed clicks since the last report, + = CW
     std::function<void(int dialIndex)>                 onDialPressed;
     std::function<void(int dialIndex)>                 onDialReleased;
     std::function<void(int x, int y)>                  onTouchStripTouched;
@@ -459,15 +459,19 @@ private:
         {
             for (int i = 0; i < NUM_DIALS; ++i)
             {
+                // The signed number of clicks since the last report. The
+                // firmware reports every 50 ms while a dial turns, so a quick
+                // turn puts several clicks in one report (up to 16 on a
+                // flick): each one counts.
                 int8_t value = static_cast<int8_t> (data[5 + i]);
                 if (value == 0)
                     continue;
 
-                int direction = (value > 0) ? 1 : -1;
-                juce::MessageManager::callAsync ([this, i, direction]()
+                const int ticks = value;
+                juce::MessageManager::callAsync ([this, i, ticks]()
                 {
                     if (onDialRotated)
-                        onDialRotated (i, direction);
+                        onDialRotated (i, ticks);
                 });
             }
         }

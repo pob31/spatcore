@@ -28,17 +28,22 @@ struct DialBinding
     DialBinding (DialBinding&&) = default;
     DialBinding& operator= (DialBinding&&) = default;
 
-    // Deep-copy operations (unique_ptr requires explicit deep copy)
+    // Deep-copy operations (unique_ptr requires explicit deep copy).
+    // Every member must be listed in both - a missing one is silently lost
+    // when a page copies a binding it built as a local.
     DialBinding (const DialBinding& other)
         : barColour (other.barColour),
           paramName (other.paramName), paramUnit (other.paramUnit),
           minValue (other.minValue), maxValue (other.maxValue),
           step (other.step), fineStep (other.fineStep),
-          isExponential (other.isExponential), decimalPlaces (other.decimalPlaces),
+          maxAcceleration (other.maxAcceleration),
+          isExponential (other.isExponential), invertDirection (other.invertDirection),
+          decimalPlaces (other.decimalPlaces),
           type (other.type), comboOptions (other.comboOptions),
           getValue (other.getValue), setValue (other.setValue),
           getDynamicName (other.getDynamicName),
-          altBinding (other.altBinding ? std::make_unique<DialBinding> (*other.altBinding) : nullptr)
+          altBinding (other.altBinding ? std::make_unique<DialBinding> (*other.altBinding) : nullptr),
+          onPress (other.onPress)
     {}
 
     DialBinding& operator= (const DialBinding& other)
@@ -52,7 +57,9 @@ struct DialBinding
             maxValue       = other.maxValue;
             step           = other.step;
             fineStep       = other.fineStep;
+            maxAcceleration = other.maxAcceleration;
             isExponential  = other.isExponential;
+            invertDirection = other.invertDirection;
             decimalPlaces  = other.decimalPlaces;
             type           = other.type;
             comboOptions   = other.comboOptions;
@@ -60,6 +67,7 @@ struct DialBinding
             setValue        = other.setValue;
             getDynamicName = other.getDynamicName;
             altBinding     = other.altBinding ? std::make_unique<DialBinding> (*other.altBinding) : nullptr;
+            onPress        = other.onPress;
         }
         return *this;
     }
@@ -84,6 +92,13 @@ struct DialBinding
     /** Fine-mode increment (used when dial is pressed while turning).
         Set to 0 to disable fine mode for this dial. */
     float fineStep = 0.0f;
+
+    /** The most steps one click may take on a fast unpressed turn
+        (StreamDeckDialAcceleration). 0 = from the range: a fast turn sweeps
+        it in about two flicks, and a small range never speeds up. 1 = never,
+        for a dial that picks an item (a cell, a preset, a channel). N = at
+        most N, for a relative dial whose range only clamps one move. */
+    int maxAcceleration = 0;
 
     /** If true, use exponential mapping: value = min * pow(max/min, normalized).
         Good for frequency, RT60, and other perceptually-scaled parameters. */
@@ -168,24 +183,25 @@ struct DialBinding
         return val;
     }
 
-    /** Apply one step of rotation (direction: +1 or -1).
-        @param direction  +1 for clockwise, -1 for counter-clockwise
-        @param fine       If true and fineStep > 0, use fineStep instead of step
-        @return The new value after applying the step
+    /** Apply a turn of a number of steps.
+        @param steps  signed steps, + for clockwise: a report's clicks, which
+                      the manager multiplies on a fast unpressed turn
+        @param fine   If true and fineStep > 0, use fineStep instead of step
+        @return The new value after applying the steps
     */
-    float applyStep (int direction, bool fine = false) const
+    float applyStep (int steps, bool fine = false) const
     {
         if (! isValid())
             return 0.0f;
 
-        int effectiveDir = invertDirection ? -direction : direction;
+        int effectiveSteps = invertDirection ? -steps : steps;
 
         float current = getValue();
         float activeStep = (fine && fineStep > 0.0f) ? fineStep : step;
 
         if (type == ComboBox)
         {
-            int index = juce::roundToInt (current) + effectiveDir;
+            int index = juce::roundToInt (current) + effectiveSteps;
             index = juce::jlimit (0, comboOptions.size() - 1, index);
             return static_cast<float> (index);
         }
@@ -194,11 +210,11 @@ struct DialBinding
         {
             // Convert to normalized 0-1, step in linear space, convert back
             float normalized = std::log (current / minValue) / std::log (maxValue / minValue);
-            normalized = juce::jlimit (0.0f, 1.0f, normalized + activeStep * effectiveDir);
+            normalized = juce::jlimit (0.0f, 1.0f, normalized + activeStep * effectiveSteps);
             return minValue * std::pow (maxValue / minValue, normalized);
         }
 
-        float newVal = current + activeStep * effectiveDir;
+        float newVal = current + activeStep * effectiveSteps;
         return juce::jlimit (minValue, maxValue, newVal);
     }
 };
