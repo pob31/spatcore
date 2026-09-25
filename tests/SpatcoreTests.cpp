@@ -155,6 +155,7 @@
 #include "spatcore/effects/EffectsEngineCore.h"
 #include "spatcore/effects/EffectsEngine.h"
 #include "spatcore/dsp/AcousticTap.h"
+#include "spatcore/ui/TypedValue.h"
 #include "spatcore/reverb/ReverbReturnProcessor.h"
 #include "spatcore/reverb/ReverbSendMatrix.h"
 #include "spatcore/dsp/AcousticSendMatrix.h"
@@ -14504,6 +14505,61 @@ static void testStereoConfigChangeStability()
     checkStereoReconstruction (d, 256, 888);
 }
 
+/*  The typed-value readers: each form a field shows must read back as the
+    value it shows, and a text with no number must read as nothing (a word
+    typed by mistake must not become 0 - full level on an attenuation). The
+    WFS-DIY app's labels used to keep only the digits: 2m 30s read as 230,
+    2.5 kHz as 2.5, 1:2.0 as 12. */
+static void testTypedValueReaders()
+{
+    namespace typed = spatcore::ui::typed;
+    const auto is = [] (std::optional<float> v, float expected)
+    {
+        return v.has_value() && std::abs (*v - expected) < 1.0e-3f;
+    };
+
+    // number(): the first number, past units and words
+    CHECK (is (typed::number ("-6.0 dB"), -6.0f));
+    CHECK (is (typed::number ("Latency 12,5 ms"), 12.5f));
+    CHECK (is (typed::number ("1.20 kHz"), 1200.0f));
+    CHECK (is (typed::number ("1,2k"), 1200.0f));
+    CHECK (is (typed::number ("4.0:1"), 4.0f));
+    CHECK (is (typed::number ("-.5"), -0.5f));
+    CHECK (is (typed::number (juce::String::fromUTF8 ("\xe2\x88\x92" "6 dB")), -6.0f));   // Unicode minus
+    CHECK (! typed::number ("abc").has_value());
+    CHECK (! typed::number ("").has_value());
+
+    // duration(): units, the bare number after a unit, the clock form
+    CHECK (is (typed::duration ("90"), 90.0f));
+    CHECK (is (typed::duration ("5.00 s"), 5.0f));
+    CHECK (is (typed::duration ("500 ms"), 0.5f));
+    CHECK (is (typed::duration ("2m 30s"), 150.0f));
+    CHECK (is (typed::duration ("2 min"), 120.0f));
+    CHECK (is (typed::duration ("2min"), 120.0f));
+    CHECK (is (typed::duration ("2mn30"), 150.0f));
+    CHECK (is (typed::duration ("2m30"), 150.0f));
+    CHECK (is (typed::duration ("1.5 min"), 90.0f));
+    CHECK (is (typed::duration ("1h"), 3600.0f));
+    CHECK (is (typed::duration ("1h30"), 5400.0f));
+    CHECK (is (typed::duration ("1 h 30 min"), 5400.0f));
+    CHECK (is (typed::duration ("2 minutes 5 seconds"), 125.0f));
+    CHECK (is (typed::duration ("2 Std"), 7200.0f));
+    CHECK (is (typed::duration (juce::String::fromUTF8 ("2" "\xe5\x88\x86" "30" "\xe7\xa7\x92")), 150.0f));
+    CHECK (is (typed::duration ("1:30"), 90.0f));
+    CHECK (is (typed::duration ("1:02:03"), 3723.0f));
+    CHECK (is (typed::duration ("0:45.5"), 45.5f));
+    CHECK (! typed::duration ("s").has_value());
+    CHECK (! typed::duration (":").has_value());
+    CHECK (! typed::duration ("1:2:3:4").has_value());
+
+    // ratio(): either way round
+    CHECK (is (typed::ratio ("4.0:1"), 4.0f));
+    CHECK (is (typed::ratio ("1:2.0"), 2.0f));
+    CHECK (is (typed::ratio ("3:2"), 1.5f));
+    CHECK (is (typed::ratio ("3"), 3.0f));
+    CHECK (! typed::ratio ("x:y").has_value());
+}
+
 int main()
 {
     try
@@ -14690,6 +14746,7 @@ int main()
         testEngineSurvivesNonFinitePose();
         testStructuralHrtfItdAndDc();
         testStructuralHrtfRotationContinuity();
+        testTypedValueReaders();
 #ifdef SPATCORE_TEST_SOFA_FIXTURE
         testSofaLoaderAndRenderer();
 #endif
