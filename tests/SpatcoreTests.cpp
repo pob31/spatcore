@@ -112,6 +112,12 @@
                                  it without touching its state, and
                                  TrackingIngestQueue drops the half it spoils
                                  (run last: it drives the MessageManager)
+     20. JSON and the MCP endpoint: network JSON nested past 64 levels is
+                                 refused before juce::JSON recurses into it;
+                                 a real MCPTransport on a loopback port refuses
+                                 a foreign Host, a page's Origin and a body
+                                 that is not application/json before its
+                                 handler runs
 */
 
 // OSCParser.h / OSCSerializer.h use juce::OSC* types but (verbatim-moved,
@@ -176,6 +182,10 @@
 #include "spatcore/control/osc/OSCSerializer.h"
 #include "spatcore/control/osc/OSCParser.h"
 #include "spatcore/control/state/TreeParameterStore.h"
+#include "spatcore/control/osc/NetworkJson.h"
+#include "spatcore/control/mcp/MCPRequestGuards.h"
+#include "spatcore/control/mcp/MCPTransport.h"
+#include "spatcore/control/mcp/MCPDispatcher.h"
 #include "spatcore/reverb/ReverbSDNAlgorithm.h"
 #include "spatcore/reverb/ReverbFDNAlgorithm.h"
 #include "spatcore/io/HardwareIndexMap.h"
@@ -1633,6 +1643,278 @@ static void testTreeParameterStoreInterceptorRefuses()
     store.setParameterWithoutUndo (level, "loudest", 0);
     CHECK (store.node()[level].isDouble());
     CHECK (static_cast<double> (store.node()[level]) == -6.0);
+}
+
+//==============================================================================
+// JSON from the network. juce::JSON recurses once per array or object, so a
+// body of nested brackets overflowed the stack of the thread parsing it (the
+// MCP server's, from any local process or web page). The scan must read
+// strings exactly as the parser does: a quote it misread would hide the
+// brackets after it.
+static void testNetworkJsonNestingScan()
+{
+    using spatcore::control::osc::jsonNestsDeeperThan;
+    using spatcore::control::osc::maxNetworkJsonDepth;
+    using spatcore::control::osc::parseNetworkJson;
+
+    const auto nested = [] (int depth)
+    {
+        return juce::String::repeatedString ("[", depth) + juce::String::repeatedString ("]", depth);
+    };
+
+    // The limit itself parses; one more level is refused.
+    CHECK (! jsonNestsDeeperThan (nested (maxNetworkJsonDepth), maxNetworkJsonDepth));
+    CHECK (parseNetworkJson (nested (maxNetworkJsonDepth)).isArray());
+    CHECK (jsonNestsDeeperThan (nested (maxNetworkJsonDepth + 1), maxNetworkJsonDepth));
+    CHECK (parseNetworkJson (nested (maxNetworkJsonDepth + 1)).isVoid());
+    CHECK (jsonNestsDeeperThan ("{\"a\":" + nested (maxNetworkJsonDepth) + "}", maxNetworkJsonDepth));
+
+    // Levels that close again do not add up.
+    CHECK (! jsonNestsDeeperThan ("[" + nested (40) + "," + nested (40) + "]", maxNetworkJsonDepth));
+
+    // Brackets inside a string are text, in either quote and past escaped quotes.
+    const auto many = juce::String::repeatedString ("[", 200);
+    CHECK (! jsonNestsDeeperThan ("{\"a\":\"" + many + "\"}", maxNetworkJsonDepth));
+    CHECK (! jsonNestsDeeperThan ("['" + many + "']", maxNetworkJsonDepth));
+    CHECK (! jsonNestsDeeperThan ("[\"\\\"" + many + "\"]", maxNetworkJsonDepth));
+    CHECK (parseNetworkJson ("[\"\\\"" + many + "\"]").isArray());
+
+    // A quote of the other kind inside a string does not end it, so the
+    // brackets after the string still count.
+    CHECK (jsonNestsDeeperThan ("['\"'," + many, maxNetworkJsonDepth));
+    CHECK (jsonNestsDeeperThan ("[\"'\"," + many, maxNetworkJsonDepth));
+
+    // A megabyte of brackets is refused without the parser seeing it.
+    CHECK (parseNetworkJson (juce::String::repeatedString ("[", 1 << 20)).isVoid());
+}
+
+//==============================================================================
+// Which HTTP requests the MCP endpoint answers: AI clients on this machine,
+// never a web page (see control/mcp/MCPRequestGuards.h).
+static void testMcpRequestGuards()
+{
+    namespace guards = spatcore::control::mcp::guards;
+
+    CHECK (guards::isAllowedHost ("127.0.0.1:7400", true));
+    CHECK (guards::isAllowedHost ("localhost:7400", true));
+    CHECK (guards::isAllowedHost ("LocalHost", true));
+    CHECK (guards::isAllowedHost ("[::1]:7400", true));
+    CHECK (guards::isAllowedHost ("127.0.0.1:8000", true));         // an SSH tunnel's port
+    CHECK (! guards::isAllowedHost ("evil.example:7400", true));    // DNS rebinding
+    CHECK (! guards::isAllowedHost ("127.0.0.1.evil.example", true));
+    CHECK (! guards::isAllowedHost ("localhost.evil.example:7400", true));
+    CHECK (! guards::isAllowedHost ("127.0.0.1:74a0", true));
+    CHECK (! guards::isAllowedHost ("127.0.0.1:", true));
+    CHECK (! guards::isAllowedHost ("", true));
+    CHECK (! guards::isAllowedHost ("192.168.1.20:7400", true));
+    CHECK (guards::isAllowedHost ("192.168.1.20:7400", false));     // bound to every interface
+    CHECK (guards::isAllowedHost ("[fe80::1]:7400", false));
+    CHECK (! guards::isAllowedHost ("showpc.local:7400", false));
+    CHECK (! guards::isAllowedHost ("300.1.1.1", false));
+
+    CHECK (guards::isAllowedOrigin ("http://localhost:6274"));       // MCP Inspector
+    CHECK (guards::isAllowedOrigin ("http://127.0.0.1"));
+    CHECK (guards::isAllowedOrigin ("https://[::1]:8443"));
+    CHECK (! guards::isAllowedOrigin ("http://evil.example"));
+    CHECK (! guards::isAllowedOrigin ("http://127.0.0.1@evil.example"));
+    CHECK (! guards::isAllowedOrigin ("http://localhost.evil.example"));
+    CHECK (! guards::isAllowedOrigin ("null"));
+    CHECK (! guards::isAllowedOrigin ("file://"));
+    CHECK (! guards::isAllowedOrigin ("http://localhost/path"));
+
+    CHECK (guards::isJsonContentType ("application/json"));
+    CHECK (guards::isJsonContentType ("Application/JSON; charset=utf-8"));
+    CHECK (! guards::isJsonContentType ("text/plain"));
+    CHECK (! guards::isJsonContentType ("application/x-www-form-urlencoded"));
+    CHECK (! guards::isJsonContentType ("multipart/form-data; boundary=x"));
+    CHECK (! guards::isJsonContentType ("application/jsonp"));
+    CHECK (! guards::isJsonContentType (""));
+}
+
+namespace
+{
+    struct QuietMcpLog : spatcore::control::mcp::MCPLogSink
+    {
+        std::atomic<int> errors { 0 };
+        void logInfo (const juce::String&) override {}
+        void logRequest (const juce::String&, const juce::String&, const juce::String&, int) override {}
+        void logResponse (const juce::String&, const juce::String&, const juce::String&, int) override {}
+        void logError (const juce::String&) override { ++errors; }
+    };
+
+    struct NoMcpUndo : spatcore::control::mcp::MCPUndoHooks
+    {
+        void onNewStateModifyingRecord() override {}
+        juce::Array<juce::var> drainPendingNotifications() override { return {}; }
+    };
+
+    struct HttpReply
+    {
+        int status = 0;
+        juce::String head;   // status line and headers
+    };
+
+    /** One HTTP exchange with 127.0.0.1:port/mcp, the header lines sent
+        exactly as given (plus Connection: close and a Content-Length for a
+        body), so a test can send what a browser would. */
+    HttpReply rawHttp (int port, const juce::String& method,
+                       const juce::StringArray& headerLines, const juce::String& body = {})
+    {
+        HttpReply reply;
+        juce::StreamingSocket socket;
+        if (! socket.connect ("127.0.0.1", port, 2000))
+            return reply;
+
+        juce::String request = method + " /mcp HTTP/1.1\r\n";
+        for (const auto& line : headerLines)
+            request << line << "\r\n";
+        request << "Connection: close\r\n";
+        if (body.isNotEmpty())
+            request << "Content-Length: " << (int) body.getNumBytesAsUTF8() << "\r\n";
+        request << "\r\n" << body;
+
+        const std::string bytes = request.toStdString();
+        socket.write (bytes.data(), static_cast<int> (bytes.size()));
+
+        juce::MemoryOutputStream received;
+        char buffer[4096];
+        while (socket.waitUntilReady (true, 3000) == 1)
+        {
+            const int n = socket.read (buffer, sizeof (buffer), false);
+            if (n <= 0)
+                break;
+            received.write (buffer, static_cast<size_t> (n));
+        }
+
+        reply.head = received.toString().upToFirstOccurrenceOf ("\r\n\r\n", false, false);
+        reply.status = reply.head.fromFirstOccurrenceOf (" ", false, false).getIntValue();
+        return reply;
+    }
+}
+
+// A real transport on a loopback port: what only a browser sends is refused
+// before the handler (the dispatcher, in the app) sees it, and the CORS answer
+// names a loopback origin instead of `*`.
+static void testMcpTransportRefusesWhatOnlyABrowserSends()
+{
+    using namespace spatcore::control::mcp;
+
+    QuietMcpLog log;
+    MCPTransport transport (log);
+    std::atomic<int> handled { 0 };
+    transport.setRequestHandler ([&handled] (const juce::String&, const RequestContext&)
+    {
+        ++handled;
+        return juce::String (R"({"jsonrpc":"2.0","id":1,"result":{}})");
+    });
+
+    int port = 0;
+    for (int candidate = 47401; candidate < 47440 && port == 0; ++candidate)
+        if (transport.start (candidate, /*loopbackOnly*/ true))
+            port = candidate;
+    CHECK (port != 0);
+    if (port == 0)
+        return;
+
+    // The server binds on its own thread: wait until it accepts.
+    for (int i = 0; i < 100; ++i)
+    {
+        juce::StreamingSocket probe;
+        if (probe.connect ("127.0.0.1", port, 100))
+            break;
+        juce::Thread::sleep (20);
+    }
+
+    const juce::String p (port);
+    const juce::String host = "Host: 127.0.0.1:" + p;
+    const juce::String json = "Content-Type: application/json";
+    const juce::String body = R"({"jsonrpc":"2.0","id":1,"method":"ping"})";
+
+    // What an AI client sends is answered, whichever loopback name it uses.
+    auto reply = rawHttp (port, "POST", { host, json }, body);
+    CHECK (reply.status == 200 && handled == 1);
+    CHECK (! reply.head.containsIgnoreCase ("Access-Control-Allow-Origin"));
+    CHECK (rawHttp (port, "POST", { "Host: localhost:" + p, json }, body).status == 200);
+    CHECK (rawHttp (port, "POST", { "Host: [::1]:" + p, json }, body).status == 200);
+    CHECK (handled == 3);
+
+    // What only a browser sends never reaches the handler.
+    struct Refused { const char* what; const char* method; juce::StringArray headers; int status; };
+    const Refused refused[] = {
+        { "a rebinding host name",      "POST",    { "Host: evil.example:" + p, json }, 403 },
+        { "a look-alike host name",     "POST",    { "Host: 127.0.0.1.evil.example", json }, 403 },
+        { "no Host",                    "POST",    { json }, 403 },
+        { "a second Host",              "POST",    { host, "Host: evil.example", json }, 403 },
+        { "a page's origin",            "POST",    { host, json, "Origin: http://evil.example" }, 403 },
+        { "a sandboxed page's origin",  "POST",    { host, json, "Origin: null" }, 403 },
+        { "a text/plain body",          "POST",    { host, "Content-Type: text/plain" }, 415 },
+        { "a form body",                "POST",    { host, "Content-Type: application/x-www-form-urlencoded" }, 415 },
+        { "no Content-Type",            "POST",    { host }, 415 },
+        { "a page's preflight",         "OPTIONS", { host, "Origin: http://evil.example",
+                                                     "Access-Control-Request-Method: POST" }, 403 },
+        { "an unknown protocol version","POST",    { host, json, "MCP-Protocol-Version: 2020-01-01" }, 400 },
+    };
+    for (const auto& r : refused)
+    {
+        reply = rawHttp (port, r.method, r.headers, body);
+        if (reply.status != r.status || handled != 3
+            || reply.head.containsIgnoreCase ("Access-Control-Allow-Origin"))
+        {
+            std::fprintf (stderr, "FAIL: MCP transport answered %s with HTTP %d (expected %d)\n",
+                          r.what, reply.status, r.status);
+            ++failures;
+        }
+    }
+    CHECK (log.errors >= 10);
+
+    // A page on a loopback origin (the MCP Inspector's, say) gets its own
+    // origin back, never `*`.
+    reply = rawHttp (port, "OPTIONS", { host, "Origin: http://localhost:6274",
+                                        "Access-Control-Request-Method: POST" });
+    CHECK (reply.status == 204);
+    CHECK (reply.head.containsIgnoreCase ("Access-Control-Allow-Origin: http://localhost:6274"));
+    reply = rawHttp (port, "POST", { host, "Content-Type: application/json; charset=utf-8",
+                                     "Origin: http://127.0.0.1:6274" }, body);
+    CHECK (reply.status == 200 && handled == 4);
+    CHECK (reply.head.containsIgnoreCase ("Access-Control-Allow-Origin: http://127.0.0.1:6274"));
+    CHECK (! reply.head.contains ("Access-Control-Allow-Origin: *"));
+
+    transport.stop();
+}
+
+// The dispatcher refuses a body nested past the limit before juce::JSON
+// recurses into it; without the check this test overflows the stack.
+static void testMcpDispatcherRefusesDeepNesting()
+{
+    using namespace spatcore::control::mcp;
+
+    juce::ScopedJuceInitialiser_GUI messageThread;   // MCPTierEnforcement is a juce::Timer
+
+    QuietMcpLog log;
+    NoMcpUndo undo;
+    MCPToolRegistry tools;
+    MCPChangeRecordBuffer records;
+    MCPResourceRegistry resources (juce::File::getSpecialLocation (juce::File::tempDirectory));
+    MCPPromptRegistry prompts;
+    MCPTierEnforcement tier;
+    MCPDispatcher dispatcher ({ "spatcore-tests", "0", "" },
+                              tools, records, undo, resources, prompts, tier, log);
+    const RequestContext context;
+
+    const auto bomb = juce::String::repeatedString ("[", 200000);
+    auto reply = dispatcher.handleRequest (bomb, context);
+    CHECK (reply.contains ("-32700") && reply.contains ("nests deeper"));
+
+    reply = dispatcher.handleRequest (R"({"jsonrpc":"2.0","id":1,"method":"tools/call",)"
+                                      R"("params":{"name":"x","arguments":{"a":)" + bomb + "}}}",
+                                      context);
+    CHECK (reply.contains ("-32700") && reply.contains ("nests deeper"));
+
+    // Under the limit a request goes on to the method lookup.
+    const auto deepButFine = juce::String::repeatedString ("[", 60) + juce::String::repeatedString ("]", 60);
+    reply = dispatcher.handleRequest (R"({"jsonrpc":"2.0","id":1,"method":"no/such","params":)"
+                                      + deepButFine + "}", context);
+    CHECK (reply.contains ("-32601"));
 }
 
 //==============================================================================
@@ -15069,12 +15351,20 @@ int main()
         testStructuralHrtfRotationContinuity();
         testTypedValueReaders();
         testTrackingPositionFilterRefusesNonFinite();
+        testNetworkJsonNestingScan();
+        testMcpRequestGuards();
+        testMcpTransportRefusesWhatOnlyABrowserSends();
 #ifdef SPATCORE_TEST_SOFA_FIXTURE
         testSofaLoaderAndRenderer();
 #endif
-        // Last: it brings up the MessageManager for the queue's drain timer
-        // and shuts it down again.
-        testTrackingIngestQueueDropsNonFinite();
+        // Last: these need the MessageManager (the tier enforcement and the
+        // queue's drain are juce::Timers). One scope around both brings it up
+        // and shuts it down once; theirs only nest inside it.
+        {
+            juce::ScopedJuceInitialiser_GUI messageThread;
+            testMcpDispatcherRefusesDeepNesting();
+            testTrackingIngestQueueDropsNonFinite();
+        }
     }
     catch (const std::exception& e)
     {

@@ -22,7 +22,12 @@ namespace spatcore::control::mcp
     handleHTTPRequest is invoked on that thread; the registered callback
     runs synchronously there and is expected to be quick. State mutation
     must be marshalled to the message thread by the callback itself
-    (MCPDispatcher does this in Block 4). */
+    (MCPDispatcher does this in Block 4).
+
+    Who gets an answer: there is no authentication. What keeps web pages out
+    is MCPRequestGuards.h: a request with a non-loopback Host (DNS
+    rebinding), a non-loopback Origin (a page) or, for POST, a Content-Type
+    other than application/json is refused before its body is read. */
 class MCPTransport : public SimpleWebSocketServerBase::RequestHandler
 {
 public:
@@ -65,7 +70,8 @@ private:
                     const SimpleWeb::CaseInsensitiveMultimap& extraHeaders = {}) const;
 
     void writeMethodNotAllowed (std::shared_ptr<HttpServer::Response> response,
-                                const juce::String& allowedMethods) const;
+                                const juce::String& allowedMethods,
+                                const SimpleWeb::CaseInsensitiveMultimap& cors) const;
 
     static juce::String resolveClientIP (const std::shared_ptr<HttpServer::Request>& request);
     static int          resolveClientPort (const std::shared_ptr<HttpServer::Request>& request);
@@ -77,7 +83,7 @@ private:
     std::unique_ptr<SimpleWebSocketServer> server;
     std::atomic<bool> running { false };
     int boundPort = 0;
-    bool loopbackOnlyMode = true;  // mirrors the start() argument; drives CORS
+    bool loopbackOnlyMode = true;  // mirrors the start() argument; decides which Host names are answered
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MCPTransport)
 };
