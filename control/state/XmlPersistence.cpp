@@ -41,10 +41,43 @@ XmlPersistence::WriteResult XmlPersistence::writeTreeToFile (const juce::ValueTr
     auto format = juce::XmlElement::TextFormat().withoutHeader();
     juce::String xmlString = header + xml->toString (format);
 
-    if (!file.replaceWithText (xmlString))
+    // The bytes File::replaceWithText used to write (UTF-8, no byte-order
+    // mark, CRLF line ends), so saved files do not change.
+    juce::MemoryOutputStream bytes;
+    bytes.writeText (xmlString, false, false, "\r\n");
+
+    if (!replaceFileContents (file, bytes.getData(), bytes.getDataSize()))
         return WriteResult::fileWriteFailed;
 
     return WriteResult::ok;
+}
+
+bool XmlPersistence::replaceFileContents (const juce::File& file, const void* data, size_t numBytes)
+{
+    juce::TemporaryFile temp (file, juce::TemporaryFile::useHiddenFile);
+
+    {
+        juce::FileOutputStream out (temp.getFile());
+        if (out.failedToOpen())
+            return false;
+
+        if (numBytes > 0 && !out.write (data, numBytes))
+            return false;
+
+        // The stream buffers what it is given; a full disk or a pulled drive
+        // shows up when the buffer goes out and the file is synced, which
+        // flush() does here and the destructor would do without telling us.
+        out.flush();
+        if (out.getStatus().failed())
+            return false;
+    }
+
+    if (temp.getFile().getSize() != static_cast<juce::int64> (numBytes))
+        return false;
+
+    // Only now does the complete file take the old one's place. On failure
+    // TemporaryFile's destructor deletes what was written.
+    return temp.overwriteTargetFileWithTemporary();
 }
 
 XmlPersistence::ReadResult XmlPersistence::readTreeFromFile (const juce::File& file) const
@@ -76,6 +109,10 @@ bool XmlPersistence::createBackup (const juce::File& file, const juce::File& bac
 {
     if (!file.existsAsFile())
         return true;
+
+    // A default File would put the copy at the root of the drive.
+    if (backupFolder == juce::File())
+        return false;
 
     backupFolder.createDirectory();
 
