@@ -57,7 +57,8 @@ public:
      * @param hasX/Y/Z      Whether each axis has new data (false = skip that axis)
      * @param smoothPercent  Smoothing amount 0-100 (from inputTrackingSmooth)
      * @param qualityFactor  Optional quality/confidence 0-1 (1.0 = full confidence)
-     * @return true if the sample was accepted, false if rejected (jump detected)
+     * @return true if the sample was accepted, false if rejected (a jump, or a
+     *         coordinate, smoothing or quality that is not finite)
      */
     bool filterPosition (int inputIndex, int trackingId,
                          float& x, float& y, float& z,
@@ -66,6 +67,15 @@ public:
     {
         if (inputIndex < 0 || inputIndex >= static_cast<int> (states.size()))
             return true; // out of range, pass through
+
+        // A sample that is not a number never reaches the filter state. One NaN
+        // stored in lastRaw or in a 1-Euro stage poisoned that input for good:
+        // a NaN distance never trips the jump test that would reset it, so every
+        // later sample came out NaN until the tag changed. The smoothing and the
+        // quality feed the cutoff, so they are held to the same rule.
+        if ((hasX && ! std::isfinite (x)) || (hasY && ! std::isfinite (y)) || (hasZ && ! std::isfinite (z))
+            || ! std::isfinite (smoothPercent) || ! std::isfinite (qualityFactor))
+            return false;
 
         auto& state = *states[static_cast<size_t> (inputIndex)];
         juce::SpinLock::ScopedLockType lock (state.spinLock);

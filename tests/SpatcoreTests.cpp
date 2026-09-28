@@ -108,6 +108,10 @@
      18. control/state/TreeParameterStore  a write interceptor that returns
                                  var::undefined() refuses the write: the node
                                  keeps its value, or stays without the property
+     19. tracking data that is not a number: TrackingPositionFilter refuses
+                                 it without touching its state, and
+                                 TrackingIngestQueue drops the half it spoils
+                                 (run last: it drives the MessageManager)
 */
 
 // OSCParser.h / OSCSerializer.h use juce::OSC* types but (verbatim-moved,
@@ -183,6 +187,8 @@
 #include "spatcore/binaural/HeadOrientationSource.h"
 #include "spatcore/binaural/StructuralHrtfRenderer.h"
 #include "spatcore/dsp/OneEuroFilter.h"
+#include "spatcore/dsp/TrackingPositionFilter.h"
+#include "spatcore/control/osc/TrackingIngestQueue.h"
 #include "spatcore/wfs/RenderSourceMap.h"
 #include "spatcore/rt/SharedInputRingBuffer.h"
 #include "spatcore/dsp/StereoDecomposer.h"
@@ -1627,6 +1633,99 @@ static void testTreeParameterStoreInterceptorRefuses()
     store.setParameterWithoutUndo (level, "loudest", 0);
     CHECK (store.node()[level].isDouble());
     CHECK (static_cast<double> (store.node()[level]) == -6.0);
+}
+
+//==============================================================================
+// Tracking data that is not a number. One NaN from a tracker used to poison
+// that input's position filter for good (a NaN distance never trips the jump
+// test that would reset it), and was written into the input's offset.
+static void testTrackingPositionFilterRefusesNonFinite()
+{
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float inf = std::numeric_limits<float>::infinity();
+
+    TrackingPositionFilter filter;
+    filter.resize (1);
+
+    float x = 1.0f, y = 2.0f, z = 0.5f;
+    CHECK (filter.filterPosition (0, 7, x, y, z, true, true, true, 50.0f));
+
+    // NaN or infinity on a carried axis is refused...
+    for (int axis = 0; axis < 3; ++axis)
+    {
+        float p[3] = { 1.0f, 2.0f, 0.5f };
+        p[axis] = (axis == 1) ? inf : nan;
+        CHECK (! filter.filterPosition (0, 7, p[0], p[1], p[2], true, true, true, 50.0f));
+    }
+
+    // ...an axis the sample does not carry is not looked at...
+    float ax = 1.0f, ay = 2.0f, az = nan;
+    CHECK (filter.filterPosition (0, 7, ax, ay, az, true, true, false, 50.0f));
+
+    // ...and neither the smoothing nor the quality may be NaN, as both set
+    // the cutoff.
+    float bx = 1.0f, by = 2.0f, bz = 0.5f;
+    CHECK (! filter.filterPosition (0, 7, bx, by, bz, true, true, true, nan));
+    CHECK (! filter.filterPosition (0, 7, bx, by, bz, true, true, true, 50.0f, nan));
+
+    // The state was never touched, so the next samples come out finite.
+    for (int i = 0; i < 5; ++i)
+    {
+        float gx = 1.0f, gy = 2.0f, gz = 0.5f;
+        CHECK (filter.filterPosition (0, 7, gx, gy, gz, true, true, true, 50.0f));
+        CHECK (std::isfinite (gx) && std::isfinite (gy) && std::isfinite (gz));
+    }
+}
+
+static void testTrackingIngestQueueDropsNonFinite()
+{
+    using spatcore::control::osc::TrackingIngestQueue;
+    using spatcore::control::osc::TrackingUpdate;
+
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float inf = std::numeric_limits<float>::infinity();
+
+    juce::ScopedJuceInitialiser_GUI messageThread;   // the drain is a juce::Timer
+
+    std::vector<TrackingUpdate> applied;
+    {
+        TrackingIngestQueue queue;
+        queue.setApply ([&applied] (const TrackingUpdate& u) { applied.push_back (u); });
+
+        TrackingUpdate badPosition;                  // dropped whole
+        badPosition.key = 1;  badPosition.x = nan;  badPosition.hasPos = true;
+
+        TrackingUpdate badOrientation;               // keeps its position
+        badOrientation.key = 2;  badOrientation.x = 1.5f;  badOrientation.y = -2.0f;
+        badOrientation.hasPos = true;
+        badOrientation.rotation = inf;  badOrientation.hasOri = true;
+
+        TrackingUpdate badQuality;                   // the quality belongs to the position
+        badQuality.key = 3;  badQuality.x = 0.5f;  badQuality.hasPos = true;
+        badQuality.quality = nan;
+
+        TrackingUpdate good;
+        good.key = 4;  good.x = 3.0f;  good.hasPos = true;
+        good.rotation = 90.0f;  good.hasOri = true;
+
+        for (const auto& u : { badPosition, badOrientation, badQuality, good })
+            queue.push (u);
+        CHECK (queue.getRejectedNonFiniteTotal() == 3);
+
+        juce::Timer::callAfterDelay (300, [] { juce::MessageManager::getInstance()->stopDispatchLoop(); });
+        juce::MessageManager::getInstance()->runDispatchLoop();
+    }
+
+    CHECK (applied.size() == 2);
+    for (const auto& u : applied)
+    {
+        if (u.key == 2)
+            CHECK (u.hasPos && ! u.hasOri && u.x == 1.5f && u.y == -2.0f);
+        else if (u.key == 4)
+            CHECK (u.hasPos && u.hasOri && u.x == 3.0f && u.rotation == 90.0f);
+        else
+            CHECK (false);   // key 1 or 3 got through
+    }
 }
 
 //==============================================================================
@@ -14969,9 +15068,13 @@ int main()
         testStructuralHrtfItdAndDc();
         testStructuralHrtfRotationContinuity();
         testTypedValueReaders();
+        testTrackingPositionFilterRefusesNonFinite();
 #ifdef SPATCORE_TEST_SOFA_FIXTURE
         testSofaLoaderAndRenderer();
 #endif
+        // Last: it brings up the MessageManager for the queue's drain timer
+        // and shuts it down again.
+        testTrackingIngestQueueDropsNonFinite();
     }
     catch (const std::exception& e)
     {

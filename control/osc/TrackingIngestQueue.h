@@ -70,10 +70,13 @@ public:
     void setApply (ApplyFn fn) { apply = std::move (fn); }
 
     /** Network-thread entry point. Coalesce-merges into the pending set under the
-     *  lock and returns; the Timer does the draining. */
+     *  lock and returns; the Timer does the draining. A position (with its
+     *  quality) or an orientation that is not finite is dropped here and
+     *  counted; the other half of the same update still goes through. */
     void push (const TrackingUpdate& update);
 
     /** Counters for diagnostics. */
+    uint64_t getRejectedNonFiniteTotal() const noexcept { return rejectedNonFiniteTotal.load(); }
     uint64_t getDroppedTotal()    const noexcept { return droppedTotal.load(); }
     uint64_t getCoalescedTotal()  const noexcept { return coalescedTotal.load(); }
     uint64_t getDispatchedTotal() const noexcept { return dispatchedTotal.load(); }
@@ -90,6 +93,7 @@ private:
     juce::CriticalSection                     lock;
     std::unordered_map<int, TrackingUpdate>   coalesced;   // newest-wins per key, pos/ori merged
 
+    std::atomic<uint64_t> rejectedNonFiniteTotal { 0 };
     std::atomic<uint64_t> droppedTotal    { 0 };
     std::atomic<uint64_t> coalescedTotal  { 0 };
     std::atomic<uint64_t> dispatchedTotal { 0 };
