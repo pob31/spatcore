@@ -90,8 +90,19 @@ public:
 
     /** Write a ValueTree to an XML file with the commented header convention
      *  (human-readable, no JUCE XML declaration of its own — the header
-     *  carries it). The header's Type line is the file's base name. */
+     *  carries it). The header's Type line is the file's base name. Lines
+     *  end in CRLF on every platform, as they always have. Either the whole
+     *  file is replaced or it is left as it was (see replaceFileContents). */
     WriteResult writeTreeToFile (const juce::ValueTree& tree, const juce::File& file) const;
+
+    /** Replace `file` with exactly `numBytes` bytes, or leave it as it was.
+     *  The bytes go to a hidden temporary file beside it, which is flushed
+     *  to the disk, checked for its full length and only then renamed over
+     *  the file; on any failure the temporary file is deleted and false is
+     *  returned. juce::File::replaceWithText takes the same steps but never
+     *  checks the write, so a full disk or a pulled drive swapped the file
+     *  for a truncated one and still reported success. */
+    static bool replaceFileContents (const juce::File& file, const void* data, size_t numBytes);
 
     /** Read a ValueTree from an XML file, reporting the failure stage. */
     ReadResult readTreeFromFile (const juce::File& file) const;
@@ -108,7 +119,11 @@ public:
 
     /** Copy a file aside into the backup folder as
      *  `<name>_<timestamp><ext>`. Returns true if the source file does not
-     *  exist (nothing to back up). Creates the backup folder if needed. */
+     *  exist (nothing to back up), false if it exists and the copy could not
+     *  be made (no backup folder given, or the folder or the copy could not
+     *  be created). Creates the backup folder if needed. A caller about to
+     *  overwrite the file should not go ahead on false: the version it would
+     *  lose has no copy. */
     static bool createBackup (const juce::File& file, const juce::File& backupFolder);
 
     /** List backups for a file-name prefix, newest first. */

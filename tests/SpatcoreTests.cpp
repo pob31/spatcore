@@ -118,6 +118,11 @@
                                  a foreign Host, a page's Origin and a body
                                  that is not application/json before its
                                  handler runs
+     21. control/state/XmlPersistence  a save lands whole (same bytes as
+                                 before, no temporary file left) or not at all:
+                                 on Linux and macOS a file-size limit fails it
+                                 half-way and the old file must survive; a
+                                 backup with nowhere to go reports failure
 */
 
 // OSCParser.h / OSCSerializer.h use juce::OSC* types but (verbatim-moved,
@@ -182,6 +187,7 @@
 #include "spatcore/control/osc/OSCSerializer.h"
 #include "spatcore/control/osc/OSCParser.h"
 #include "spatcore/control/state/TreeParameterStore.h"
+#include "spatcore/control/state/XmlPersistence.h"
 #include "spatcore/control/osc/NetworkJson.h"
 #include "spatcore/control/mcp/MCPRequestGuards.h"
 #include "spatcore/control/mcp/MCPTransport.h"
@@ -220,6 +226,11 @@
 #include <thread>
 #include <type_traits>
 #include <vector>
+
+#if JUCE_LINUX || JUCE_MAC
+ #include <csignal>
+ #include <sys/resource.h>
+#endif
 
 static int failures = 0;
 
@@ -1643,6 +1654,124 @@ static void testTreeParameterStoreInterceptorRefuses()
     store.setParameterWithoutUndo (level, "loudest", 0);
     CHECK (store.node()[level].isDouble());
     CHECK (static_cast<double> (store.node()[level]) == -6.0);
+}
+
+//==============================================================================
+// Saving. juce::File::replaceWithText renamed its temporary file over the
+// target without checking the write, so a disk that filled up mid-save swapped
+// a project file for a truncated one and reported success.
+namespace
+{
+    juce::ValueTree persistenceTestTree (int children, const juce::String& tag)
+    {
+        juce::ValueTree root ("Root");
+        root.setProperty ("tag", tag, nullptr);
+        for (int i = 0; i < children; ++i)
+        {
+            juce::ValueTree child ("Child");
+            child.setProperty ("id", i + 1, nullptr);
+            child.setProperty ("text", juce::String::repeatedString ("x", 100), nullptr);
+            root.appendChild (child, nullptr);
+        }
+        return root;
+    }
+
+    int leftoverTempFiles (const juce::File& folder)
+    {
+        return folder.findChildFiles (juce::File::findFiles, false, "*_temp*").size();
+    }
+}
+
+static void testXmlPersistenceSavesWholeFilesOnly()
+{
+    using spatcore::control::state::XmlPersistence;
+    using WriteResult = XmlPersistence::WriteResult;
+
+    XmlPersistence::Options options;
+    options.headerTitle = "spatcore-tests";
+    const XmlPersistence persistence (options);
+
+    const auto folder = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                            .getNonexistentChildFile ("spatcore-xml-save", "", false);
+    CHECK (folder.createDirectory().wasOk());
+    const auto target = folder.getChildFile ("inputs.xml");
+
+    // A save lands whole: it reads back as the tree, in UTF-8 with no
+    // byte-order mark and CRLF line ends (the bytes replaceWithText wrote),
+    // and leaves no temporary file behind.
+    const auto first = persistenceTestTree (3, "first");
+    CHECK (persistence.writeTreeToFile (first, target) == WriteResult::ok);
+    CHECK (persistence.readTreeFromFile (target).tree.isEquivalentTo (first));
+    {
+        juce::MemoryBlock bytes;
+        CHECK (target.loadFileAsData (bytes));
+        const auto* b = static_cast<const unsigned char*> (bytes.getData());
+        CHECK (bytes.getSize() > 3 && ! (b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF));
+        int lineEnds = 0;
+        bool everyLineEndIsCrLf = true;
+        for (size_t i = 0; i < bytes.getSize(); ++i)
+            if (b[i] == '\n')
+            {
+                ++lineEnds;
+                everyLineEndIsCrLf = everyLineEndIsCrLf && i > 0 && b[i - 1] == '\r';
+            }
+        CHECK (lineEnds > 3 && everyLineEndIsCrLf);
+    }
+    CHECK (leftoverTempFiles (folder) == 0);
+
+    // A second save replaces the first.
+    const auto second = persistenceTestTree (40, "second");
+    CHECK (persistence.writeTreeToFile (second, target) == WriteResult::ok);
+    CHECK (persistence.readTreeFromFile (target).tree.isEquivalentTo (second));
+    CHECK (leftoverTempFiles (folder) == 0);
+
+    // Nowhere to write: the save fails and creates nothing.
+    const auto missingFolder = folder.getChildFile ("missing");
+    CHECK (persistence.writeTreeToFile (first, missingFolder.getChildFile ("x.xml"))
+           == WriteResult::fileWriteFailed);
+    CHECK (! missingFolder.exists());
+
+   #if JUCE_LINUX || JUCE_MAC
+    // A disk that fills up in the middle of a save, without root: with
+    // RLIMIT_FSIZE at 4 kB every write past it fails (SIGXFSZ, which would
+    // kill the process, is ignored for the duration). The save must fail and
+    // leave the file as it was; replaceWithText reported success and left a
+    // 4 kB stub.
+    {
+        const auto before = target.loadFileAsString();
+        const auto previousHandler = std::signal (SIGXFSZ, SIG_IGN);
+        rlimit original {};
+        getrlimit (RLIMIT_FSIZE, &original);
+        rlimit capped = original;
+        capped.rlim_cur = 4096;
+        const bool cappedOk = setrlimit (RLIMIT_FSIZE, &capped) == 0;
+
+        const auto result = persistence.writeTreeToFile (persistenceTestTree (500, "too big"), target);
+
+        setrlimit (RLIMIT_FSIZE, &original);
+        std::signal (SIGXFSZ, previousHandler);
+
+        CHECK (cappedOk);
+        CHECK (result == WriteResult::fileWriteFailed);
+        CHECK (target.loadFileAsString() == before);
+        CHECK (leftoverTempFiles (folder) == 0);
+    }
+   #endif
+
+    // Backups: nothing to back up is fine; an existing file backed up nowhere
+    // (no folder given, or the folder's name taken by a file) is a failure
+    // the caller must see; a real backup is a copy.
+    CHECK (XmlPersistence::createBackup (folder.getChildFile ("none.xml"), folder.getChildFile ("backups")));
+    CHECK (! XmlPersistence::createBackup (target, juce::File()));
+    const auto blocked = folder.getChildFile ("blocked");
+    CHECK (blocked.replaceWithText ("a file where the backup folder should be"));
+    CHECK (! XmlPersistence::createBackup (target, blocked));
+    const auto backups = folder.getChildFile ("backups");
+    CHECK (XmlPersistence::createBackup (target, backups));
+    const auto made = XmlPersistence::listBackups (backups, "inputs");
+    CHECK (made.size() == 1 && made[0].hasIdenticalContentTo (target));
+
+    folder.deleteRecursively();
 }
 
 //==============================================================================
@@ -15320,6 +15449,7 @@ int main()
         testOscBundleElementsKeepToTheirOwnBytes();
         testOscBundleDepthCap();
         testTreeParameterStoreInterceptorRefuses();
+        testXmlPersistenceSavesWholeFilesOnly();
         testRtThreadPriority();
         testGpuHostWorkPoolDeterminism();
         testGpuHostWorkPoolCrossGenBarrier();
