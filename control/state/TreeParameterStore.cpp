@@ -73,10 +73,17 @@ void TreeParameterStore::setParameterWithoutUndo (const juce::Identifier& paramI
 void TreeParameterStore::writeProperty (juce::ValueTree& node, const juce::Identifier& property,
                                         const juce::var& value, juce::UndoManager* undoManager)
 {
-    if (writeInterceptor != nullptr)
-        node.setProperty (property, writeInterceptor (property, value, node), undoManager);
-    else
+    if (writeInterceptor == nullptr)
+    {
         node.setProperty (property, value, undoManager);
+        return;
+    }
+
+    // undefined is the interceptor refusing the write. Writing it would store
+    // an undefined property, or give one to a node that never had it.
+    const juce::var accepted = writeInterceptor (property, value, node);
+    if (! accepted.isUndefined())
+        node.setProperty (property, accepted, undoManager);
 }
 
 //==============================================================================

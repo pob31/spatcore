@@ -1,5 +1,6 @@
 #include "TrackingIngestQueue.h"
 
+#include <cmath>
 #include <utility>
 #include <vector>
 
@@ -25,8 +26,28 @@ void TrackingIngestQueue::setDrainIntervalMs (int ms)
     startTimer (juce::jmax (1, ms));
 }
 
-void TrackingIngestQueue::push (const TrackingUpdate& update)
+void TrackingIngestQueue::push (const TrackingUpdate& incoming)
 {
+    // A half that is not a number never gets past here: it would reach the
+    // position filter, where one NaN poisoned that input for good, and then
+    // the tree. Each half is judged on its own, so a bad orientation does not
+    // cost the position it arrived with. The quality belongs to the position.
+    TrackingUpdate update = incoming;
+    if (update.hasPos
+        && ! (std::isfinite (update.x) && std::isfinite (update.y) && std::isfinite (update.z)
+              && std::isfinite (update.quality)))
+    {
+        update.hasPos = false;
+        rejectedNonFiniteTotal.fetch_add (1, std::memory_order_relaxed);
+    }
+    if (update.hasOri && ! std::isfinite (update.rotation))
+    {
+        update.hasOri = false;
+        rejectedNonFiniteTotal.fetch_add (1, std::memory_order_relaxed);
+    }
+    if (! update.hasPos && ! update.hasOri)
+        return;
+
     const juce::ScopedLock sl (lock);
 
     auto it = coalesced.find (update.key);
