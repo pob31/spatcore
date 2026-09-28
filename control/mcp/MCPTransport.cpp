@@ -1,4 +1,6 @@
 #include "MCPTransport.h"
+#include "MCPRequestGuards.h"
+#include "../osc/NetworkStringUtils.h"
 
 namespace spatcore::control::mcp
 {
@@ -7,17 +9,21 @@ namespace
 {
     constexpr const char* kEndpointPath = "/mcp";
 
-    SimpleWeb::CaseInsensitiveMultimap defaultHeaders (bool loopbackOnly)
+    SimpleWeb::CaseInsensitiveMultimap defaultHeaders()
     {
         SimpleWeb::CaseInsensitiveMultimap h;
         h.emplace ("Content-Type", "application/json");
-        // Loopback-bound: a wildcard `*` is acceptable because the socket
-        // itself is bound to 127.0.0.1, so only same-machine origins can
-        // reach this endpoint at all. LAN-bound: restrict to "null" to
-        // refuse browser CORS preflight from arbitrary LAN pages — the
-        // real auth story is still TODO (no token model yet), so the
-        // tightest CORS posture is the only safety we have.
-        h.emplace ("Access-Control-Allow-Origin", loopbackOnly ? "*" : "null");
+        return h;
+    }
+
+    /** The CORS answer for a page on a loopback origin (the only origin let
+        through): that origin by name, never `*`, which would let any page
+        read the replies. */
+    SimpleWeb::CaseInsensitiveMultimap corsHeaders (const juce::String& origin)
+    {
+        SimpleWeb::CaseInsensitiveMultimap h;
+        h.emplace ("Access-Control-Allow-Origin", origin.toStdString());
+        h.emplace ("Vary", "Origin");
         h.emplace ("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
         // MCP-Protocol-Version must be listed: from spec revision 2025-06-18
         // clients send it on every post-initialize request, and a browser
@@ -25,6 +31,33 @@ namespace
         h.emplace ("Access-Control-Allow-Headers",
                    "Content-Type, Authorization, MCP-Protocol-Version");
         return h;
+    }
+
+    /** A header's value read as UTF-8 and trimmed; empty when it is absent
+        or is not UTF-8. */
+    juce::String headerValue (const SimpleWeb::CaseInsensitiveMultimap& headers, const char* name)
+    {
+        const auto it = headers.find (name);
+        if (it == headers.end())
+            return {};
+
+        return osc::safeStringFromBytes (it->second.data(), static_cast<int> (it->second.size())).trim();
+    }
+
+    /** A JSON-RPC error envelope with no id, for a request refused before
+        its body was read. */
+    juce::String refusalBody (int code, const juce::String& message)
+    {
+        auto error = std::make_unique<juce::DynamicObject>();
+        error->setProperty ("code", code);
+        error->setProperty ("message", message);
+
+        auto envelope = std::make_unique<juce::DynamicObject>();
+        envelope->setProperty ("jsonrpc", "2.0");
+        envelope->setProperty ("id", juce::var());
+        envelope->setProperty ("error", juce::var (error.release()));
+
+        return juce::JSON::toString (juce::var (envelope.release()), true);
     }
 
     constexpr const char* kProtocolVersionHeader = "MCP-Protocol-Version";
@@ -154,12 +187,46 @@ bool MCPTransport::handleHTTPRequest (std::shared_ptr<HttpServer::Response> resp
         return false;
     }
 
+    // Whatever the method: refuse what only a browser sends, before anything
+    // else runs (see MCPRequestGuards.h). A second Host or Origin header is
+    // refused too, so no check reads one value while a later reader sees
+    // another.
+    const auto& headers = request->header;
+    const juce::String host = headerValue (headers, "Host");
+    if (headers.count ("Host") != 1 || ! guards::isAllowedHost (host, loopbackOnlyMode))
+    {
+        mcpLogger.logError ("Refused a request addressed to Host \"" + host.substring (0, 80)
+                            + "\": the MCP server answers only " + (loopbackOnlyMode
+                                  ? juce::String ("127.0.0.1, localhost and [::1]")
+                                  : juce::String ("localhost and IP addresses")));
+        writeJson (response, SimpleWeb::StatusCode::client_error_forbidden,
+                   refusalBody (-32600, "Host not allowed: " + host.substring (0, 80)));
+        return true;
+    }
+
+    SimpleWeb::CaseInsensitiveMultimap cors;
+    if (headers.count ("Origin") != 0)
+    {
+        const juce::String origin = headerValue (headers, "Origin");
+        if (headers.count ("Origin") != 1 || ! guards::isAllowedOrigin (origin))
+        {
+            mcpLogger.logError ("Refused a request from the web page origin \""
+                                + origin.substring (0, 80)
+                                + "\": only AI clients on this machine may use the MCP server");
+            writeJson (response, SimpleWeb::StatusCode::client_error_forbidden,
+                       refusalBody (-32600, "Origin not allowed: " + origin.substring (0, 80)));
+            return true;
+        }
+
+        cors = corsHeaders (origin);
+    }
+
     if (method == "OPTIONS")
     {
-        // CORS preflight — answer with empty body and the Allow* headers from
-        // defaultHeaders(). SimpleWeb routes OPTIONS through default_resource
-        // since benkuper/juce_simpleweb#5 merged.
-        writeJson (response, SimpleWeb::StatusCode::success_no_content, juce::String());
+        // CORS preflight — answer with empty body, and with the Allow*
+        // headers only for a loopback origin. SimpleWeb routes OPTIONS
+        // through default_resource since benkuper/juce_simpleweb#5 merged.
+        writeJson (response, SimpleWeb::StatusCode::success_no_content, juce::String(), cors);
         return true;
     }
 
@@ -167,13 +234,25 @@ bool MCPTransport::handleHTTPRequest (std::shared_ptr<HttpServer::Response> resp
     {
         // Streamable-HTTP server-push (SSE) lands in a later phase. For Phase 1
         // we expose request/response only, so GET is explicitly disallowed.
-        writeMethodNotAllowed (response, "POST, OPTIONS");
+        writeMethodNotAllowed (response, "POST, OPTIONS", cors);
         return true;
     }
 
     if (method != "POST")
     {
-        writeMethodNotAllowed (response, "POST, OPTIONS");
+        writeMethodNotAllowed (response, "POST, OPTIONS", cors);
+        return true;
+    }
+
+    // A page can POST text/plain, form data or multipart with no preflight;
+    // application/json it cannot. Every MCP client sends application/json.
+    const juce::String contentType = headerValue (headers, "Content-Type");
+    if (headers.count ("Content-Type") != 1 || ! guards::isJsonContentType (contentType))
+    {
+        mcpLogger.logError ("Refused a request with Content-Type \"" + contentType.substring (0, 80)
+                            + "\": MCP requests are application/json");
+        writeJson (response, SimpleWeb::StatusCode::client_error_unsupported_media_type,
+                   refusalBody (-32600, "Content-Type must be application/json"), cors);
         return true;
     }
 
@@ -198,20 +277,11 @@ bool MCPTransport::handleHTTPRequest (std::shared_ptr<HttpServer::Response> resp
                                 + juce::String (kProtocolVersionHeader) + ": "
                                 + context.protocolVersionHeader);
 
-            auto error = std::make_unique<juce::DynamicObject>();
-            error->setProperty ("code", -32600);
-            error->setProperty ("message",
-                                "Unsupported MCP-Protocol-Version: "
-                                + context.protocolVersionHeader
-                                + ". Supported: " + protocol::supportedList());
-
-            auto envelope = std::make_unique<juce::DynamicObject>();
-            envelope->setProperty ("jsonrpc", "2.0");
-            envelope->setProperty ("id", juce::var());
-            envelope->setProperty ("error", juce::var (error.release()));
-
             writeJson (response, SimpleWeb::StatusCode::client_error_bad_request,
-                       juce::JSON::toString (juce::var (envelope.release()), true));
+                       refusalBody (-32600, "Unsupported MCP-Protocol-Version: "
+                                                + context.protocolVersionHeader
+                                                + ". Supported: " + protocol::supportedList()),
+                       cors);
             return true;
         }
     }
@@ -232,7 +302,7 @@ bool MCPTransport::handleHTTPRequest (std::shared_ptr<HttpServer::Response> resp
         const juce::String err =
             R"({"jsonrpc":"2.0","id":null,"error":{"code":-32603,)"
             R"("message":"MCP dispatcher not initialized"}})";
-        writeJson (response, SimpleWeb::StatusCode::server_error_service_unavailable, err);
+        writeJson (response, SimpleWeb::StatusCode::server_error_service_unavailable, err, cors);
         return true;
     }
 
@@ -247,11 +317,11 @@ bool MCPTransport::handleHTTPRequest (std::shared_ptr<HttpServer::Response> resp
         const juce::String err =
             R"({"jsonrpc":"2.0","id":null,"error":{"code":-32603,)"
             R"("message":"Internal server error"}})";
-        writeJson (response, SimpleWeb::StatusCode::server_error_internal_server_error, err);
+        writeJson (response, SimpleWeb::StatusCode::server_error_internal_server_error, err, cors);
         return true;
     }
 
-    writeJson (response, SimpleWeb::StatusCode::success_ok, responseBody);
+    writeJson (response, SimpleWeb::StatusCode::success_ok, responseBody, cors);
     return true;
 }
 
@@ -260,7 +330,7 @@ void MCPTransport::writeJson (std::shared_ptr<HttpServer::Response> response,
                               const juce::String& body,
                               const SimpleWeb::CaseInsensitiveMultimap& extraHeaders) const
 {
-    auto headers = defaultHeaders (loopbackOnlyMode);
+    auto headers = defaultHeaders();
     for (const auto& kv : extraHeaders)
         headers.emplace (kv.first, kv.second);
 
@@ -268,9 +338,10 @@ void MCPTransport::writeJson (std::shared_ptr<HttpServer::Response> response,
 }
 
 void MCPTransport::writeMethodNotAllowed (std::shared_ptr<HttpServer::Response> response,
-                                          const juce::String& allowedMethods) const
+                                          const juce::String& allowedMethods,
+                                          const SimpleWeb::CaseInsensitiveMultimap& cors) const
 {
-    SimpleWeb::CaseInsensitiveMultimap h;
+    SimpleWeb::CaseInsensitiveMultimap h (cors);
     h.emplace ("Allow", allowedMethods.toStdString());
     const juce::String body = R"({"error":"method_not_allowed"})";
     writeJson (response, SimpleWeb::StatusCode::client_error_method_not_allowed, body, h);
