@@ -17,10 +17,21 @@ namespace OSCParser
     // Align position to 4-byte boundary
     inline int alignTo4(int pos) { return (pos + 3) & ~3; }
 
+    // Deepest bundle nesting accepted, the outermost bundle included. Real
+    // clients nest one or two levels; the cap bounds the recursion here, and
+    // in any listener that walks the parsed tree, for a packet that nests as
+    // deep as its size allows.
+    constexpr int maxBundleDepth = 16;
+
+    // The readers below take a position the caller advanced itself. Every
+    // bounds test is written as "bytes left" (dataSize - pos), never as
+    // pos + n: a size read off the wire can be close to INT_MAX, and the
+    // addition would overflow into a check that passes.
+
     // Read a null-terminated OSC string with 4-byte alignment
     inline juce::String readString(const char* data, int dataSize, int& pos)
     {
-        if (pos >= dataSize)
+        if (pos < 0 || pos >= dataSize)
             return {};
 
         const char* start = data + pos;
@@ -37,7 +48,7 @@ namespace OSCParser
     // Read a 4-byte big-endian int32
     inline int32_t readInt32(const char* data, int dataSize, int& pos)
     {
-        if (pos + 4 > dataSize)
+        if (pos < 0 || dataSize - pos < 4)
             return 0;
 
         uint32_t value = (static_cast<uint8_t>(data[pos]) << 24) |
@@ -51,7 +62,7 @@ namespace OSCParser
     // Read a 4-byte big-endian float
     inline float readFloat32(const char* data, int dataSize, int& pos)
     {
-        if (pos + 4 > dataSize)
+        if (pos < 0 || dataSize - pos < 4)
             return 0.0f;
 
         uint32_t bits = (static_cast<uint8_t>(data[pos]) << 24) |
@@ -68,7 +79,7 @@ namespace OSCParser
     // Read a 8-byte big-endian int64 (for timetag)
     inline int64_t readInt64(const char* data, int dataSize, int& pos)
     {
-        if (pos + 8 > dataSize)
+        if (pos < 0 || dataSize - pos < 8)
             return 0;
 
         uint64_t value = 0;
@@ -142,12 +153,14 @@ namespace OSCParser
         return message;
     }
 
-    // Forward declaration for parseBundle
-    inline juce::OSCBundle parseBundle(const char* data, int dataSize, int& pos);
-
-    // Parse an OSC bundle
-    inline juce::OSCBundle parseBundle(const char* data, int dataSize, int& pos)
+    // Parse an OSC bundle. dataSize is where this bundle's bytes end: the
+    // whole packet at the top level, the element's own end when nested.
+    // depth counts the bundles around this one; the caller starts at 0.
+    inline juce::OSCBundle parseBundle(const char* data, int dataSize, int& pos, int depth = 0)
     {
+        if (depth >= maxBundleDepth)
+            throw juce::OSCFormatError("OSC bundles nested too deeply");
+
         // Skip "#bundle" identifier (should already be confirmed)
         pos += 8;
 
@@ -161,22 +174,25 @@ namespace OSCParser
         {
             // Read element size (4 bytes)
             int elementSize = readInt32(data, dataSize, pos);
-            if (elementSize <= 0 || pos + elementSize > dataSize)
+            if (elementSize <= 0 || elementSize > dataSize - pos)
                 break;
 
             int elementEnd = pos + elementSize;
 
-            // Check if element is a bundle or message
+            // Each element is parsed against its own end. Parsed against the
+            // packet's, a nested bundle would read its later siblings as its
+            // own children, and its parent would then parse them again: the
+            // work doubles with every sibling bundle.
             if (elementSize >= 8 && std::memcmp(data + pos, "#bundle", 7) == 0)
             {
                 // Nested bundle
-                auto nestedBundle = parseBundle(data, dataSize, pos);
+                auto nestedBundle = parseBundle(data, elementEnd, pos, depth + 1);
                 bundle.addElement(nestedBundle);
             }
             else
             {
                 // Message
-                auto message = parseMessage(data, dataSize, pos);
+                auto message = parseMessage(data, elementEnd, pos);
                 bundle.addElement(message);
             }
 

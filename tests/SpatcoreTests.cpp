@@ -14,7 +14,9 @@
                                  can't be expressed in a passing build)
       4. control/osc parser+serializer   OSCSerializer::serializeMessage ->
                                  OSCParser::parseMessage roundtrip + byte-stable
-                                 re-serialization
+                                 re-serialization; malformed bundles: an element
+                                 size near INT_MAX, each element confined to its
+                                 own bytes, the nesting cap
       5. dsp/ shared parametric EQ   MultiChannelEQBank neutrality (bit-exact)
                                  and enable semantics; bank == a hand-rolled
                                  std::array of biquads (bit-exact); the static
@@ -1409,6 +1411,168 @@ static void testOscRoundtrip()
     // Encode(decode(x)) is byte-identical
     const juce::MemoryBlock bytes2 = spatcore::control::osc::OSCSerializer::serializeMessage (parsed);
     CHECK (bytes2 == bytes);
+}
+
+//==============================================================================
+// OSCParser on malformed bundles. Packets reach the parser straight off the
+// network, before any IP allow-list, so a bad one must end as a short or empty
+// bundle or an OSCFormatError, never as a read outside the buffer.
+
+// Raw OSC bytes, for packets the serializer would never produce.
+struct OscBytes
+{
+    std::vector<char> bytes;
+
+    OscBytes& str (const char* s)
+    {
+        bytes.insert (bytes.end(), s, s + std::strlen (s) + 1);
+        while (bytes.size() % 4 != 0)
+            bytes.push_back ('\0');
+        return *this;
+    }
+
+    OscBytes& i32 (uint32_t v)
+    {
+        for (int shift = 24; shift >= 0; shift -= 8)
+            bytes.push_back (static_cast<char> ((v >> shift) & 0xFF));
+        return *this;
+    }
+
+    // "#bundle\0" and the time tag "immediately".
+    OscBytes& bundleHeader() { return str ("#bundle").i32 (0).i32 (1); }
+
+    const char* data() const { return bytes.data(); }
+    int size() const         { return static_cast<int> (bytes.size()); }
+};
+
+static juce::OSCBundle parseOscBundle (const char* data, int size)
+{
+    int pos = 0;
+    return spatcore::control::osc::OSCParser::parseBundle (data, size, pos);
+}
+
+static juce::OSCBundle parseOscBundle (const juce::MemoryBlock& bytes)
+{
+    return parseOscBundle (static_cast<const char*> (bytes.getData()),
+                           static_cast<int> (bytes.getSize()));
+}
+
+static void testOscBundleElementSizeOverflow()
+{
+    namespace P = spatcore::control::osc::OSCParser;
+
+    // The audit's 28-byte packet: one element claiming 0x7FFFFFF0 bytes.
+    // pos + size overflowed, the bounds check passed, pos went negative and
+    // the next read landed about 2 GB before the buffer.
+    OscBytes packet;
+    packet.bundleHeader().i32 (0x7FFFFFF0u).str ("/a").str (",");
+    CHECK (packet.size() == 28);
+    CHECK (parseOscBundle (packet.data(), packet.size()).size() == 0);
+
+    // Every size that doesn't fit ends the bundle, down to one byte too many
+    // (8 bytes follow the size field here)...
+    for (uint32_t claimed : { 0xFFFFFFFFu, 0x80000000u, 0x7FFFFFFFu, 9u })
+    {
+        OscBytes p;
+        p.bundleHeader().i32 (claimed).str ("/a").str (",");
+        CHECK (parseOscBundle (p.data(), p.size()).size() == 0);
+    }
+
+    // ...and the exact fit is read.
+    OscBytes exact;
+    exact.bundleHeader().i32 (8u).str ("/a").str (",");
+    const juce::OSCBundle fits = parseOscBundle (exact.data(), exact.size());
+    CHECK (fits.size() == 1);
+    if (fits.size() == 1)
+        CHECK (fits[0].isMessage() && fits[0].getMessage().getAddressPattern().toString() == "/a");
+
+    // The readers refuse a position before the buffer instead of reading there.
+    const char four[4] = { 0, 0, 0, 42 };
+    int before = -4;
+    CHECK (P::readInt32 (four, 4, before) == 0 && before == -4);
+    before = -1;
+    CHECK (P::readString (four, 4, before).isEmpty() && before == -1);
+}
+
+static void testOscBundleElementsKeepToTheirOwnBytes()
+{
+    // Three empty bundles side by side, then a message. Parsed against the
+    // packet's end instead of its element's, the first nested bundle adopted
+    // its siblings as children and its parent then parsed them again, so the
+    // work doubled with every sibling bundle.
+    juce::OSCBundle outer;
+    for (int i = 0; i < 3; ++i)
+        outer.addElement (juce::OSCBundle());
+    outer.addElement (juce::OSCMessage (juce::OSCAddressPattern ("/last"), 7));
+
+    const juce::OSCBundle parsed = parseOscBundle (
+        spatcore::control::osc::OSCSerializer::serializeBundle (outer));
+    CHECK (parsed.size() == 4);
+    if (parsed.size() == 4)
+    {
+        for (int i = 0; i < 3; ++i)
+            CHECK (parsed[i].isBundle() && parsed[i].getBundle().size() == 0);
+        CHECK (parsed[3].isMessage()
+               && parsed[3].getMessage().getAddressPattern().toString() == "/last");
+    }
+
+    // A message reads only its own element too. This type tag promises two
+    // ints and the element holds one: the second reads as missing (0, as in a
+    // truncated packet), not as the next element's size field (8).
+    OscBytes p;
+    p.bundleHeader()
+     .i32 (12u).str ("/m").str (",ii").i32 (5u)
+     .i32 (8u).str ("/n").str (",");
+    const juce::OSCBundle two = parseOscBundle (p.data(), p.size());
+    CHECK (two.size() == 2);
+    if (two.size() == 2)
+    {
+        const juce::OSCMessage& m = two[0].getMessage();
+        CHECK (m.size() == 2 && m[0].getInt32() == 5 && m[1].getInt32() == 0);
+        CHECK (two[1].isMessage() && two[1].getMessage().getAddressPattern().toString() == "/n");
+    }
+}
+
+// A message wrapped in `bundles` bundles, the outermost included.
+static juce::OSCBundle oscBundleChain (int bundles)
+{
+    juce::OSCBundle b;
+    if (bundles <= 1)
+        b.addElement (juce::OSCMessage (juce::OSCAddressPattern ("/deep")));
+    else
+        b.addElement (oscBundleChain (bundles - 1));
+    return b;
+}
+
+static void testOscBundleDepthCap()
+{
+    namespace S = spatcore::control::osc::OSCSerializer;
+    const int cap = spatcore::control::osc::OSCParser::maxBundleDepth;
+
+    // Exactly the cap parses, down to the message at the bottom...
+    const juce::OSCBundle deepest = parseOscBundle (S::serializeBundle (oscBundleChain (cap)));
+    int depth = 1;
+    const juce::OSCBundle* level = &deepest;
+    while (level->size() == 1 && (*level)[0].isBundle())
+    {
+        level = &(*level)[0].getBundle();
+        ++depth;
+    }
+    CHECK (depth == cap);
+    CHECK (level->size() == 1 && (*level)[0].isMessage()
+           && (*level)[0].getMessage().getAddressPattern().toString() == "/deep");
+
+    // ...and one more level refuses the whole packet.
+    bool refused = false;
+    try
+    {
+        parseOscBundle (S::serializeBundle (oscBundleChain (cap + 1)));
+    }
+    catch (const juce::OSCFormatError&)
+    {
+        refused = true;
+    }
+    CHECK (refused);
 }
 
 //==============================================================================
@@ -14717,6 +14881,9 @@ int main()
         testMultitapDelayInSlot();
         testMultitapDelayExtremesAndRates();
         testOscRoundtrip();
+        testOscBundleElementSizeOverflow();
+        testOscBundleElementsKeepToTheirOwnBytes();
+        testOscBundleDepthCap();
         testRtThreadPriority();
         testGpuHostWorkPoolDeterminism();
         testGpuHostWorkPoolCrossGenBarrier();
