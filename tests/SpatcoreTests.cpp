@@ -112,6 +112,8 @@
                                  it without touching its state, and
                                  TrackingIngestQueue drops the half it spoils
                                  (run last: it drives the MessageManager)
+     20. JSON and the MCP endpoint: network JSON nested past 64 levels is
+                                 refused before juce::JSON recurses into it
 */
 
 // OSCParser.h / OSCSerializer.h use juce::OSC* types but (verbatim-moved,
@@ -176,6 +178,8 @@
 #include "spatcore/control/osc/OSCSerializer.h"
 #include "spatcore/control/osc/OSCParser.h"
 #include "spatcore/control/state/TreeParameterStore.h"
+#include "spatcore/control/osc/NetworkJson.h"
+#include "spatcore/control/mcp/MCPDispatcher.h"
 #include "spatcore/reverb/ReverbSDNAlgorithm.h"
 #include "spatcore/reverb/ReverbFDNAlgorithm.h"
 #include "spatcore/io/HardwareIndexMap.h"
@@ -1633,6 +1637,103 @@ static void testTreeParameterStoreInterceptorRefuses()
     store.setParameterWithoutUndo (level, "loudest", 0);
     CHECK (store.node()[level].isDouble());
     CHECK (static_cast<double> (store.node()[level]) == -6.0);
+}
+
+//==============================================================================
+// JSON from the network. juce::JSON recurses once per array or object, so a
+// body of nested brackets overflowed the stack of the thread parsing it (the
+// MCP server's, from any local process or web page). The scan must read
+// strings exactly as the parser does: a quote it misread would hide the
+// brackets after it.
+static void testNetworkJsonNestingScan()
+{
+    using spatcore::control::osc::jsonNestsDeeperThan;
+    using spatcore::control::osc::maxNetworkJsonDepth;
+    using spatcore::control::osc::parseNetworkJson;
+
+    const auto nested = [] (int depth)
+    {
+        return juce::String::repeatedString ("[", depth) + juce::String::repeatedString ("]", depth);
+    };
+
+    // The limit itself parses; one more level is refused.
+    CHECK (! jsonNestsDeeperThan (nested (maxNetworkJsonDepth), maxNetworkJsonDepth));
+    CHECK (parseNetworkJson (nested (maxNetworkJsonDepth)).isArray());
+    CHECK (jsonNestsDeeperThan (nested (maxNetworkJsonDepth + 1), maxNetworkJsonDepth));
+    CHECK (parseNetworkJson (nested (maxNetworkJsonDepth + 1)).isVoid());
+    CHECK (jsonNestsDeeperThan ("{\"a\":" + nested (maxNetworkJsonDepth) + "}", maxNetworkJsonDepth));
+
+    // Levels that close again do not add up.
+    CHECK (! jsonNestsDeeperThan ("[" + nested (40) + "," + nested (40) + "]", maxNetworkJsonDepth));
+
+    // Brackets inside a string are text, in either quote and past escaped quotes.
+    const auto many = juce::String::repeatedString ("[", 200);
+    CHECK (! jsonNestsDeeperThan ("{\"a\":\"" + many + "\"}", maxNetworkJsonDepth));
+    CHECK (! jsonNestsDeeperThan ("['" + many + "']", maxNetworkJsonDepth));
+    CHECK (! jsonNestsDeeperThan ("[\"\\\"" + many + "\"]", maxNetworkJsonDepth));
+    CHECK (parseNetworkJson ("[\"\\\"" + many + "\"]").isArray());
+
+    // A quote of the other kind inside a string does not end it, so the
+    // brackets after the string still count.
+    CHECK (jsonNestsDeeperThan ("['\"'," + many, maxNetworkJsonDepth));
+    CHECK (jsonNestsDeeperThan ("[\"'\"," + many, maxNetworkJsonDepth));
+
+    // A megabyte of brackets is refused without the parser seeing it.
+    CHECK (parseNetworkJson (juce::String::repeatedString ("[", 1 << 20)).isVoid());
+}
+
+namespace
+{
+    struct QuietMcpLog : spatcore::control::mcp::MCPLogSink
+    {
+        std::atomic<int> errors { 0 };
+        void logInfo (const juce::String&) override {}
+        void logRequest (const juce::String&, const juce::String&, const juce::String&, int) override {}
+        void logResponse (const juce::String&, const juce::String&, const juce::String&, int) override {}
+        void logError (const juce::String&) override { ++errors; }
+    };
+
+    struct NoMcpUndo : spatcore::control::mcp::MCPUndoHooks
+    {
+        void onNewStateModifyingRecord() override {}
+        juce::Array<juce::var> drainPendingNotifications() override { return {}; }
+    };
+
+}
+
+// The dispatcher refuses a body nested past the limit before juce::JSON
+// recurses into it; without the check this test overflows the stack.
+static void testMcpDispatcherRefusesDeepNesting()
+{
+    using namespace spatcore::control::mcp;
+
+    juce::ScopedJuceInitialiser_GUI messageThread;   // MCPTierEnforcement is a juce::Timer
+
+    QuietMcpLog log;
+    NoMcpUndo undo;
+    MCPToolRegistry tools;
+    MCPChangeRecordBuffer records;
+    MCPResourceRegistry resources (juce::File::getSpecialLocation (juce::File::tempDirectory));
+    MCPPromptRegistry prompts;
+    MCPTierEnforcement tier;
+    MCPDispatcher dispatcher ({ "spatcore-tests", "0", "" },
+                              tools, records, undo, resources, prompts, tier, log);
+    const RequestContext context;
+
+    const auto bomb = juce::String::repeatedString ("[", 200000);
+    auto reply = dispatcher.handleRequest (bomb, context);
+    CHECK (reply.contains ("-32700") && reply.contains ("nests deeper"));
+
+    reply = dispatcher.handleRequest (R"({"jsonrpc":"2.0","id":1,"method":"tools/call",)"
+                                      R"("params":{"name":"x","arguments":{"a":)" + bomb + "}}}",
+                                      context);
+    CHECK (reply.contains ("-32700") && reply.contains ("nests deeper"));
+
+    // Under the limit a request goes on to the method lookup.
+    const auto deepButFine = juce::String::repeatedString ("[", 60) + juce::String::repeatedString ("]", 60);
+    reply = dispatcher.handleRequest (R"({"jsonrpc":"2.0","id":1,"method":"no/such","params":)"
+                                      + deepButFine + "}", context);
+    CHECK (reply.contains ("-32601"));
 }
 
 //==============================================================================
@@ -15069,12 +15170,18 @@ int main()
         testStructuralHrtfRotationContinuity();
         testTypedValueReaders();
         testTrackingPositionFilterRefusesNonFinite();
+        testNetworkJsonNestingScan();
 #ifdef SPATCORE_TEST_SOFA_FIXTURE
         testSofaLoaderAndRenderer();
 #endif
-        // Last: it brings up the MessageManager for the queue's drain timer
-        // and shuts it down again.
-        testTrackingIngestQueueDropsNonFinite();
+        // Last: these need the MessageManager (the tier enforcement and the
+        // queue's drain are juce::Timers). One scope around both brings it up
+        // and shuts it down once; theirs only nest inside it.
+        {
+            juce::ScopedJuceInitialiser_GUI messageThread;
+            testMcpDispatcherRefusesDeepNesting();
+            testTrackingIngestQueueDropsNonFinite();
+        }
     }
     catch (const std::exception& e)
     {

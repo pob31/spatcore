@@ -1,4 +1,5 @@
 #include "MCPDispatcher.h"
+#include "../osc/NetworkJson.h"
 #include <juce_events/juce_events.h>
 #include <algorithm>
 
@@ -40,6 +41,18 @@ juce::String MCPDispatcher::handleRequest (const juce::String& body,
 {
     const juce::String& clientIP = context.clientIP;
     const int clientPort = context.clientPort;
+
+    // juce::JSON recurses once per level it opens, so a body of nested
+    // brackets would overflow this worker's stack inside the parse. Count
+    // the levels first; no MCP request nests anywhere near the limit.
+    if (osc::jsonNestsDeeperThan (body, osc::maxNetworkJsonDepth))
+    {
+        mcpLogger.logError ("Parse error: body nests deeper than "
+                            + juce::String (osc::maxNetworkJsonDepth) + " levels");
+        return makeJsonRpcError ({}, kParseError,
+                                 "Parse error: body nests deeper than "
+                                 + juce::String (osc::maxNetworkJsonDepth) + " levels");
+    }
 
     // Parse the body as JSON. Anything that isn't an object → -32700.
     juce::var parsed = juce::JSON::fromString (body);
