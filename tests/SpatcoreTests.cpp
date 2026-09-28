@@ -105,6 +105,9 @@
                                  bit (module state survives it), latency is the
                                  sum over live slots, and chain bypass and mute
                                  land on exactly dry and exactly silence
+     18. control/state/TreeParameterStore  a write interceptor that returns
+                                 var::undefined() refuses the write: the node
+                                 keeps its value, or stays without the property
 */
 
 // OSCParser.h / OSCSerializer.h use juce::OSC* types but (verbatim-moved,
@@ -168,6 +171,7 @@
 #include "spatcore/dsp/OutputEQProcessor.h"
 #include "spatcore/control/osc/OSCSerializer.h"
 #include "spatcore/control/osc/OSCParser.h"
+#include "spatcore/control/state/TreeParameterStore.h"
 #include "spatcore/reverb/ReverbSDNAlgorithm.h"
 #include "spatcore/reverb/ReverbFDNAlgorithm.h"
 #include "spatcore/io/HardwareIndexMap.h"
@@ -1573,6 +1577,56 @@ static void testOscBundleDepthCap()
         refused = true;
     }
     CHECK (refused);
+}
+
+//==============================================================================
+// TreeParameterStore: the write interceptor can refuse a write outright.
+// Returning the stored value instead (the older idiom) cannot express "leave
+// it alone" for a property the node does not have yet: it writes a void one.
+namespace
+{
+    struct InterceptorProbeStore : spatcore::control::state::TreeParameterStore
+    {
+        InterceptorProbeStore() : TreeParameterStore (1, { "Probe" })
+        {
+            state = juce::ValueTree ("Root");
+            state.appendChild (juce::ValueTree ("Node"), nullptr);
+        }
+
+        juce::ValueTree node() const { return state.getChild (0); }
+
+    protected:
+        juce::ValueTree getTreeForParameter (const juce::Identifier&, int) const override
+        {
+            return state.getChild (0);
+        }
+    };
+}
+
+static void testTreeParameterStoreInterceptorRefuses()
+{
+    const juce::Identifier level ("level");
+    InterceptorProbeStore store;
+    store.setWriteInterceptor ([] (const juce::Identifier&, const juce::var& proposed,
+                                   const juce::ValueTree&)
+    {
+        return proposed.isString() ? juce::var::undefined() : proposed;
+    });
+
+    // Refused on a node without the property: it stays without it...
+    store.setParameter (level, "loud", 0);
+    CHECK (! store.node().hasProperty (level));
+
+    // ...accepted: the value lands...
+    store.setParameter (level, -6.0, 0);
+    CHECK (store.node().hasProperty (level));
+    CHECK (static_cast<double> (store.node()[level]) == -6.0);
+
+    // ...refused again: the stored value is kept, through either setter.
+    store.setParameter (level, "louder", 0);
+    store.setParameterWithoutUndo (level, "loudest", 0);
+    CHECK (store.node()[level].isDouble());
+    CHECK (static_cast<double> (store.node()[level]) == -6.0);
 }
 
 //==============================================================================
@@ -14884,6 +14938,7 @@ int main()
         testOscBundleElementSizeOverflow();
         testOscBundleElementsKeepToTheirOwnBytes();
         testOscBundleDepthCap();
+        testTreeParameterStoreInterceptorRefuses();
         testRtThreadPriority();
         testGpuHostWorkPoolDeterminism();
         testGpuHostWorkPoolCrossGenBarrier();

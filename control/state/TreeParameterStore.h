@@ -97,12 +97,15 @@ public:
      *  path routed through the store can bypass it. The interceptor returns
      *  the value to write: return `proposed` untouched (same var object) to
      *  accept a write verbatim — already-validated callers then produce
-     *  byte-identical results.
+     *  byte-identical results. Return `juce::var::undefined()` to refuse the
+     *  write: the node is left exactly as it was, including a property it
+     *  does not have yet, and no listener hears anything.
      *
      *  @param property  the property being written
      *  @param proposed  the value the caller asked for
      *  @param node      the node the write lands on (read-only context)
-     *  @returns         the value that will actually be written             */
+     *  @returns         the value that will actually be written, or
+     *                   juce::var::undefined() to refuse it                 */
     using WriteInterceptor = std::function<juce::var (const juce::Identifier& property,
                                                       const juce::var& proposed,
                                                       const juce::ValueTree& node)>;
@@ -248,8 +251,9 @@ protected:
     void notifyParameterListeners (const juce::Identifier& id, const juce::var& value, int channelIndex);
 
     /** Single write choke point: consults the write interceptor (when
-     *  registered), then performs the property write. Every setter path
-     *  through the store — core and subclass — must funnel through this. */
+     *  registered), then performs the property write unless the interceptor
+     *  refused it. Every setter path through the store — core and subclass —
+     *  must funnel through this. */
     void writeProperty (juce::ValueTree& node, const juce::Identifier& property,
                         const juce::var& value, juce::UndoManager* undoManager);
 
