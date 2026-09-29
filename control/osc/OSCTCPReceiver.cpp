@@ -290,10 +290,19 @@ bool OSCTCPReceiver::ClientHandler::readExactly(void* buffer, int numBytes)
 
         if (bytesRead == 0)
         {
-            // Check if socket is still ready
+            // Nothing yet: wait for the socket, then read once more. A socket
+            // that reports readable and still gives 0 bytes has been closed by
+            // the peer. JUCE's non-blocking read returns 0 for end of stream
+            // (and for an error), never -1, and a closed socket stays
+            // readable, so going round again here spun this thread at 100%
+            // CPU for as long as the app ran, and the handler never went
+            // inactive: after 16 such peers every new client was refused.
             if (socket->waitUntilReady(true, 100) <= 0)
                 return false;
-            continue;
+
+            bytesRead = socket->read(dest, remaining, false);
+            if (bytesRead <= 0)
+                return false;
         }
 
         dest += bytesRead;
