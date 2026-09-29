@@ -114,16 +114,26 @@ public:
     // Rolling Backups
     //==========================================================================
 
-    /** Timestamp suffix used for backup file names (yyyymmdd_hhmmss). */
+    /** Timestamp suffix used for backup file names (yyyymmdd_hhmmss_mmm). */
     static juce::String backupTimestamp();
 
+    /** What a backup did: `ok` is false when the file exists and no copy
+     *  could be made; `copy` is the copy made, or a default File when the
+     *  source did not exist (nothing to back up, and `ok`). */
+    struct BackupResult
+    {
+        bool ok = false;
+        juce::File copy;
+    };
+
     /** Copy a file aside into the backup folder as
-     *  `<name>_<timestamp><ext>`. Returns true if the source file does not
-     *  exist (nothing to back up), false if it exists and the copy could not
-     *  be made (no backup folder given, or the folder or the copy could not
-     *  be created). Creates the backup folder if needed. A caller about to
-     *  overwrite the file should not go ahead on false: the version it would
-     *  lose has no copy. */
+     *  `<name>_<timestamp><ext>`, never onto an existing backup: a name
+     *  already taken gets a numbered sibling. Creates the backup folder if
+     *  needed. A caller about to overwrite the file should not go ahead when
+     *  `ok` is false: the version it would lose has no copy. */
+    static BackupResult backUpFile (const juce::File& file, const juce::File& backupFolder);
+
+    /** backUpFile, reduced to its `ok`. */
     static bool createBackup (const juce::File& file, const juce::File& backupFolder);
 
     /** List backups for a file-name prefix, newest first. */
