@@ -1771,6 +1771,37 @@ static void testXmlPersistenceSavesWholeFilesOnly()
     const auto made = XmlPersistence::listBackups (backups, "inputs");
     CHECK (made.size() == 1 && made[0].hasIdenticalContentTo (target));
 
+    // Backups in quick succession each keep their copy. Names had one-second
+    // resolution and copyFileTo deletes its target, so a second save within
+    // the second replaced the first one's backup. Five in a row, then one
+    // whose name is already taken (the next timestamp is not predictable, so
+    // every name the next few milliseconds could produce is taken first).
+    for (int i = 0; i < 5; ++i)
+        CHECK (XmlPersistence::createBackup (target, backups));
+    CHECK (XmlPersistence::listBackups (backups, "inputs").size() == 6);
+
+    const auto nothing = XmlPersistence::backUpFile (folder.getChildFile ("none.xml"), backups);
+    CHECK (nothing.ok && nothing.copy == juce::File());
+
+    const auto stamp = XmlPersistence::backupTimestamp();
+    CHECK (stamp.length() == 19 && stamp[15] == '_');   // yyyymmdd_hhmmss_mmm
+
+    // A name already taken is never copied onto. The clock is read again
+    // inside, so take the name the next backup will want and retry until the
+    // two readings share a millisecond; the older file must survive.
+    bool clashed = false;
+    for (int tries = 0; tries < 200 && ! clashed; ++tries)
+    {
+        // Taken now, whether it was free or held one of the copies above.
+        const auto squatter = backups.getChildFile ("inputs_" + XmlPersistence::backupTimestamp() + ".xml");
+        CHECK (squatter.replaceWithText ("an older backup"));
+        const auto result = XmlPersistence::backUpFile (target, backups);
+        CHECK (result.ok && result.copy.hasIdenticalContentTo (target));
+        CHECK (squatter.loadFileAsString() == "an older backup");
+        clashed = result.copy.getFileName().contains ("(");
+    }
+    CHECK (clashed);
+
     folder.deleteRecursively();
 }
 

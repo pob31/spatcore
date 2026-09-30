@@ -102,25 +102,41 @@ XmlPersistence::ReadResult XmlPersistence::readTreeFromFile (const juce::File& f
 
 juce::String XmlPersistence::backupTimestamp()
 {
-    return juce::Time::getCurrentTime().formatted ("%Y%m%d_%H%M%S");
+    const auto now = juce::Time::getCurrentTime();
+    return now.formatted ("%Y%m%d_%H%M%S") + "_" + juce::String (now.getMilliseconds()).paddedLeft ('0', 3);
+}
+
+XmlPersistence::BackupResult XmlPersistence::backUpFile (const juce::File& file, const juce::File& backupFolder)
+{
+    if (!file.existsAsFile())
+        return { true, {} };
+
+    // A default File would put the copy at the root of the drive.
+    if (backupFolder == juce::File() || backupFolder.createDirectory().failed())
+        return {};
+
+    // Never onto an existing backup. File::copyFileTo deletes its target
+    // first, and names had one-second resolution: two saves of one file in
+    // the same second silently replaced the first save's backup (the only
+    // copy of the version before it), and with that backup held open by a
+    // sync client or an antivirus the delete failed and the save was
+    // refused (re-audit 2026-09-29, R5). Milliseconds make a clash rare, and
+    // a clash that still happens gets a numbered sibling, which the
+    // `<prefix>_*.*` listing still finds.
+    auto backupFile = backupFolder.getChildFile (
+        file.getFileNameWithoutExtension() + "_" + backupTimestamp() + file.getFileExtension());
+    if (backupFile.exists())
+        backupFile = backupFile.getNonexistentSibling (true);
+
+    if (! file.copyFileTo (backupFile))
+        return {};
+
+    return { true, backupFile };
 }
 
 bool XmlPersistence::createBackup (const juce::File& file, const juce::File& backupFolder)
 {
-    if (!file.existsAsFile())
-        return true;
-
-    // A default File would put the copy at the root of the drive.
-    if (backupFolder == juce::File())
-        return false;
-
-    backupFolder.createDirectory();
-
-    auto timestamp = backupTimestamp();
-    auto backupFile = backupFolder.getChildFile (
-        file.getFileNameWithoutExtension() + "_" + timestamp + file.getFileExtension());
-
-    return file.copyFileTo (backupFile);
+    return backUpFile (file, backupFolder).ok;
 }
 
 juce::Array<juce::File> XmlPersistence::listBackups (const juce::File& backupFolder,
