@@ -121,6 +121,23 @@ public:
     void setDrainIntervalMs (int ms);
     int  getMaxItemsPerTick() const    { return maxItemsPerTick.load(); }
 
+    /** How many non-coalesceable items may wait. 256 by default; a
+     *  queue that takes whole snapshots - a show controller firing a
+     *  cue of thousands of messages, paced at its device's limit - wants
+     *  more. Never less than one. */
+    void   setFifoCap (size_t n)       { fifoCap.store (juce::jmax<size_t> (1, n)); }
+    size_t getFifoCap() const          { return fifoCap.load(); }
+
+    /** How long one drain tick may dispatch for, in milliseconds, on
+     *  top of the item cap: the drain stops at whichever comes first,
+     *  so a high item cap cannot hold the message thread. 0 (the
+     *  default) is no time bound - the item cap alone, as before. */
+    void   setDrainBudgetMs (double ms) { drainBudgetMs.store (juce::jmax (0.0, ms)); }
+
+    /** One drain tick, now, on the calling thread - what the timer does
+     *  every interval. For a test, which has no message loop to run. */
+    void drainNow() { drainBatch(); }
+
 private:
     struct IngestItem
     {
@@ -164,10 +181,13 @@ private:
     std::atomic<uint64_t> dispatchedTotal  { 0 };
     uint64_t              droppedSinceLastReport = 0;
     ConnectionMode        lastDropTransport      = ConnectionMode::UDP;
+    double                lastDropReportMs       = 0.0;
 
     DispatchFn   dispatch;
     DropReportFn dropReport;
     std::atomic<int> maxItemsPerTick { 32 };
+    std::atomic<size_t> fifoCap { 256 };
+    std::atomic<double> drainBudgetMs { 0.0 };
 
     // Caps tuned for WFS-DIY's parameter cardinality:
     //  - ~50 user-visible per-channel parameters x 64 channels = 3200
@@ -175,8 +195,13 @@ private:
     //  - 256 FIFO slots cover bundle/handshake/cluster traffic for
     //    ~1 s at the rates we've observed in normal use.
     static constexpr size_t   kCoalesceCap    = 4096;
-    static constexpr size_t   kFifoCap        = 256;
     static constexpr uint64_t kDropLogEvery   = 1000;
+
+    // A drop is reported at once, then at most once a second while drops
+    // continue - or every kDropLogEvery, whichever is sooner. Reported only
+    // every thousand, a burst that lost a few hundred messages left no
+    // trace anywhere.
+    static constexpr double   kDropReportIntervalMs = 1000.0;
 
     // Drain cadence: 60 Hz gives the GUI thread ~16 ms idle slices
     // between batches. At realistic OSC traffic rates this is well

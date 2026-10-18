@@ -181,7 +181,7 @@ void OSCIngestQueue::push (juce::MemoryBlock data,
         }
         else
         {
-            if (fifo.size() >= kFifoCap)
+            if (fifo.size() >= fifoCap.load (std::memory_order_relaxed))
             {
                 droppedTotal.fetch_add (1, std::memory_order_relaxed);
                 ++droppedSinceLastReport;
@@ -204,14 +204,15 @@ void OSCIngestQueue::push (juce::MemoryBlock data,
 
 void OSCIngestQueue::drainBatch()
 {
-    // Move at most kMaxItemsPerTick items out of the queues into a
-    // local batch under the lock, then dispatch outside the lock so
-    // the receiver thread can keep pushing. Capping the per-tick work
-    // is essential — without it, a flood drains for >16 ms and starves
-    // the GUI.
-    const int cap = maxItemsPerTick.load();
-    std::vector<IngestItem> batch;
-    batch.reserve (static_cast<size_t> (cap));
+    // At most maxItemsPerTick items a tick, and - when a budget is set -
+    // no longer than drainBudgetMs: whichever comes first. Each item is
+    // taken under the lock and dispatched outside it, so the receiver
+    // thread keeps pushing and nothing taken is ever put back. Capping the
+    // per-tick work is essential - without it, a flood drains for >16 ms
+    // and starves the GUI.
+    const int    cap     = maxItemsPerTick.load();
+    const double budget  = drainBudgetMs.load();
+    const double started = juce::Time::getMillisecondCounterHiRes();
 
     uint64_t       dropsToReport = 0;
     ConnectionMode dropTransport = ConnectionMode::UDP;
@@ -219,37 +220,53 @@ void OSCIngestQueue::drainBatch()
     {
         const juce::ScopedLock sl (lock);
 
-        // FIFO first (events / bundles are order-sensitive).
-        while (static_cast<int> (batch.size()) < cap && ! fifo.empty())
-        {
-            batch.push_back (std::move (fifo.front()));
-            fifo.pop_front();
-        }
-
-        // Then coalesced items (latest-value snapshots; order doesn't
-        // matter — different keys are independent).
-        while (static_cast<int> (batch.size()) < cap && ! coalesced.empty())
-        {
-            auto it = coalesced.begin();
-            batch.push_back (std::move (it->second));
-            coalesced.erase (it);
-        }
-
-        if (droppedSinceLastReport >= kDropLogEvery)
+        // The first drop at once, then once a second while they go on.
+        if (droppedSinceLastReport > 0
+            && (lastDropReportMs <= 0.0
+                || started - lastDropReportMs >= kDropReportIntervalMs
+                || droppedSinceLastReport >= kDropLogEvery))
         {
             dropsToReport = droppedSinceLastReport;
             dropTransport = lastDropTransport;
             droppedSinceLastReport = 0;
+            lastDropReportMs = started;
         }
     }
 
-    if (dispatch)
+    for (int taken = 0; taken < cap; ++taken)
     {
-        for (auto& item : batch)
+        IngestItem item;
+
+        {
+            const juce::ScopedLock sl (lock);
+
+            // FIFO first (events / bundles are order-sensitive), then the
+            // coalesced latest values, whose order does not matter.
+            if (! fifo.empty())
+            {
+                item = std::move (fifo.front());
+                fifo.pop_front();
+            }
+            else if (! coalesced.empty())
+            {
+                auto it = coalesced.begin();
+                item = std::move (it->second);
+                coalesced.erase (it);
+            }
+            else
+            {
+                break;
+            }
+        }
+
+        if (dispatch)
         {
             dispatch (item.data, item.senderIP, item.port, item.transport);
             dispatchedTotal.fetch_add (1, std::memory_order_relaxed);
         }
+
+        if (budget > 0.0 && juce::Time::getMillisecondCounterHiRes() - started >= budget)
+            break;
     }
 
     if (dropsToReport > 0 && dropReport)

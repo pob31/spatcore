@@ -1,8 +1,52 @@
+// The system's socket headers first, before JUCE's, for the one socket
+// option JUCE does not set: the receive buffer's size.
+#if defined (_WIN32)
+ #ifndef NOMINMAX
+  #define NOMINMAX
+ #endif
+ #ifndef WIN32_LEAN_AND_MEAN
+  #define WIN32_LEAN_AND_MEAN
+ #endif
+ #include <winsock2.h>
+#else
+ #include <sys/socket.h>
+#endif
+
 #include "OSCReceiverWithSenderIP.h"
 #include "OSCParser.h"
 
 namespace spatcore::control::osc
 {
+
+namespace
+{
+    // Asks for `bytes` of receive buffer and answers what the socket has
+    // afterwards; the system may give less (Linux caps it at rmem_max).
+    int askForReceiveBuffer (int handle, int bytes)
+    {
+        if (handle < 0)
+            return 0;
+
+       #if defined (_WIN32)
+        const auto socketHandle = static_cast<SOCKET> (handle);
+        using Length = int;
+       #else
+        const auto socketHandle = handle;
+        using Length = socklen_t;
+       #endif
+
+        (void) setsockopt (socketHandle, SOL_SOCKET, SO_RCVBUF,
+                           reinterpret_cast<const char*> (&bytes), static_cast<Length> (sizeof (bytes)));
+
+        int granted = 0;
+        auto length = static_cast<Length> (sizeof (granted));
+
+        if (getsockopt (socketHandle, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<char*> (&granted), &length) != 0)
+            return 0;
+
+        return granted;
+    }
+}
 
 //==============================================================================
 // OSCReceiverWithSenderIP
@@ -32,6 +76,9 @@ bool OSCReceiverWithSenderIP::connect(int port)
         return false;
     }
 
+    // Room for a burst, before anything arrives.
+    receiveBufferBytes = askForReceiveBuffer (socket->getRawSocketHandle(), kReceiveBufferWanted);
+
     portNumber = port;
     shouldStop = false;
     connected = true;
@@ -55,6 +102,7 @@ bool OSCReceiverWithSenderIP::disconnect()
     socket.reset();
     connected = false;
     portNumber = 0;
+    receiveBufferBytes = 0;
 
     return true;
 }

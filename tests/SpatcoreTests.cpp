@@ -205,6 +205,8 @@
 #include "spatcore/dsp/OneEuroFilter.h"
 #include "spatcore/dsp/TrackingPositionFilter.h"
 #include "spatcore/control/osc/TrackingIngestQueue.h"
+#include "spatcore/control/osc/OSCIngestQueue.h"
+#include "spatcore/control/osc/OSCReceiverWithSenderIP.h"
 #include "spatcore/wfs/RenderSourceMap.h"
 #include "spatcore/rt/SharedInputRingBuffer.h"
 #include "spatcore/dsp/StereoDecomposer.h"
@@ -2168,6 +2170,91 @@ static void testTrackingIngestQueueDropsNonFinite()
         else
             CHECK (false);   // key 1 or 3 got through
     }
+}
+
+//==============================================================================
+// OSCIngestQueue under a burst - a show controller firing a snapshot cue of
+// thousands of messages (Go.dot, namespace draft 88): a FIFO cap the app sets,
+// a drop told at once rather than after a thousand, and a drain that stops at
+// its time budget whatever its item cap allows.
+static void testOscIngestQueueTakesABurst()
+{
+    using spatcore::control::osc::OSCIngestQueue;
+    using spatcore::control::osc::ConnectionMode;
+
+    juce::ScopedJuceInitialiser_GUI messageThread;   // the drain is a juce::Timer
+
+    // A bundle: never coalesced, always the FIFO.
+    const auto bundle = []
+    {
+        juce::MemoryBlock bytes;
+        const char head[16] = { '#', 'b', 'u', 'n', 'd', 'l', 'e', 0, 0, 0, 0, 0, 0, 0, 0, 1 };
+        bytes.append (head, sizeof (head));
+        return bytes;
+    };
+
+    int dispatched = 0;
+    int reports = 0;
+    uint64_t reported = 0;
+
+    {
+        OSCIngestQueue queue ({});
+        queue.setFifoCap (1000);
+        CHECK (queue.getFifoCap() == 1000);
+
+        queue.setDispatch ([&dispatched] (const juce::MemoryBlock&, const juce::String&, int, ConnectionMode)
+                           {
+                               ++dispatched;
+                               juce::Thread::sleep (2);
+                           });
+        queue.setDropReport ([&reports, &reported] (uint64_t total, ConnectionMode)
+                             {
+                                 ++reports;
+                                 reported = total;
+                             });
+        queue.setMaxItemsPerTick (100000);
+        queue.setDrainBudgetMs (5.0);
+
+        for (int n = 0; n < 1500; ++n)
+            queue.push (bundle(), "127.0.0.1", 9000, ConnectionMode::UDP);
+
+        CHECK (queue.getDroppedTotal() == 500);
+
+        // One tick, as the timer would run it (a test runs no message loop:
+        // the tracking test before this one has already ended the only one).
+        queue.drainNow();
+
+        // Told at once, all five hundred of them.
+        CHECK (reports == 1);
+        CHECK (reported == 500);
+
+        // The tick stopped at its budget - a few items of 2 ms - and did not
+        // run the thousand its item cap allowed, which would have held the
+        // message thread for two seconds.
+        CHECK (dispatched > 0);
+        CHECK (dispatched < 20);
+
+        // The next tick tells nothing more: no new drop, and a second has not passed.
+        queue.drainNow();
+        CHECK (reports == 1);
+    }
+}
+
+// The receiver asks its system for room for a burst: at least the 64 KB JUCE
+// gives a socket, and the 4 MB asked for where the system grants it.
+static void testOscReceiverAsksForRoom()
+{
+    spatcore::control::osc::OSCReceiverWithSenderIP receiver;
+    CHECK (receiver.getReceiveBufferBytes() == 0);
+
+    CHECK (receiver.connect (0));
+    CHECK (receiver.getReceiveBufferBytes() >= 65536);
+   #if defined (_WIN32)
+    CHECK (receiver.getReceiveBufferBytes() >= spatcore::control::osc::OSCReceiverWithSenderIP::kReceiveBufferWanted);
+   #endif
+
+    receiver.disconnect();
+    CHECK (receiver.getReceiveBufferBytes() == 0);
 }
 
 //==============================================================================
@@ -15525,6 +15612,8 @@ int main()
             juce::ScopedJuceInitialiser_GUI messageThread;
             testMcpDispatcherRefusesDeepNesting();
             testTrackingIngestQueueDropsNonFinite();
+            testOscIngestQueueTakesABurst();
+            testOscReceiverAsksForRoom();
         }
     }
     catch (const std::exception& e)
