@@ -4,6 +4,7 @@
 #include <juce_events/juce_events.h>
 #include "OscTransportTypes.h"
 
+#include <algorithm>
 #include <atomic>
 #include <deque>
 #include <functional>
@@ -125,7 +126,7 @@ public:
      *  queue that takes whole snapshots - a show controller firing a
      *  cue of thousands of messages, paced at its device's limit - wants
      *  more. Never less than one. */
-    void   setFifoCap (size_t n)       { fifoCap.store (juce::jmax<size_t> (1, n)); }
+    void   setFifoCap (size_t n)       { fifoCap.store (std::max (size_t { 1 }, n)); }
     size_t getFifoCap() const          { return fifoCap.load(); }
 
     /** How long one drain tick may dispatch for, in milliseconds, on
