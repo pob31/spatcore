@@ -58,6 +58,18 @@ public:
     int getPortNumber() const { return portNumber; }
 
     /**
+     * The receive buffer the system gave the socket, in bytes, after
+     * connect() asked it for kReceiveBufferWanted - nought before. A
+     * burst (a show controller firing a snapshot cue of thousands of
+     * messages, or a capture of hundreds of datagrams) needs more room
+     * than the 64 KB a socket is given; a datagram with no room is
+     * dropped by the system before this thread can read it.
+     */
+    int getReceiveBufferBytes() const { return receiveBufferBytes.load(); }
+
+    static constexpr int kReceiveBufferWanted = 4 * 1024 * 1024;
+
+    /**
      * Add a listener to receive OSC messages.
      */
     void addListener(Listener* listener);
@@ -88,6 +100,7 @@ private:
     void notifyBundle(const juce::OSCBundle& bundle, const juce::String& senderIP);
 
     std::unique_ptr<juce::DatagramSocket> socket;
+    std::atomic<int> receiveBufferBytes { 0 };
     juce::ListenerList<Listener> listeners;
     RawDataCallback rawDataCallback;
     std::atomic<bool> connected { false };
