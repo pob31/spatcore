@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <mutex>
 #include <thread>
@@ -111,11 +112,17 @@ public:
             return;
         }
 
-        // Set up the work
+        // Set up the work. The claim word is published LAST: a worker can still
+        // be looping in executeItems() from the previous dispatch, and it claims
+        // an item the moment the word is reset, so the function and the zeroed
+        // doneCount must already be visible to it. doneCount used to be reset
+        // after the index, and a worker that finished an item in between had its
+        // increment wiped - the dispatch then waited forever (the reverb thread
+        // hung holding its algorithm lock, and the UI froze behind it).
+        jassert (count <= 0xFFFF);
         currentFunc = [&func](int i) { func (i); };
-        totalItems.store (count, std::memory_order_relaxed);
-        nextItem.store (0, std::memory_order_relaxed);
-        doneCount.store (0, std::memory_order_release);
+        doneCount.store (0, std::memory_order_relaxed);
+        nextClaim.store (static_cast<uint64_t> (count) << 32, std::memory_order_release);
 
         // Wake workers
         {
@@ -192,11 +199,16 @@ private:
 
     void executeItems()
     {
-        int total = totalItems.load (std::memory_order_relaxed);
-
         while (true)
         {
-            int idx = nextItem.fetch_add (1, std::memory_order_relaxed);
+            // Index and count come from one atomic read, so a worker left over
+            // from the previous dispatch can never pair a new index with an old
+            // count (or the reverse); a claim it wins belongs to the dispatch
+            // that published the word, and the acquire makes that dispatch's
+            // function and doneCount reset visible before the item runs.
+            const uint64_t claim = nextClaim.fetch_add (1, std::memory_order_acquire);
+            const int idx   = static_cast<int> (claim & 0xFFFFFFFFu);
+            const int total = static_cast<int> (claim >> 32);
             if (idx >= total)
                 break;
 
@@ -233,10 +245,10 @@ private:
     std::mutex doneMutex;
     std::condition_variable doneCV;
 
-    // Work items
+    // Work items. nextClaim packs the dispatch's item count (high 32 bits) with
+    // the next unclaimed index (low 32 bits).
     std::function<void (int)> currentFunc;
-    std::atomic<int> totalItems { 0 };
-    std::atomic<int> nextItem { 0 };
+    std::atomic<uint64_t> nextClaim { 0 };
     std::atomic<int> doneCount { 0 };
 };
 
