@@ -380,11 +380,19 @@ public:
         can be bound to DIFFERENT GPUs, so without it a reverb pump overrun
         cannot be attributed (GPU co-tenancy with the direct path vs host-side
         contention) — exactly the ambiguity that blocked the 2026-07-25 SDN
-        investigation. */
+        investigation.
+
+        tryEnter, like sampleReverbGpuLive(): the engine thread holds this lock
+        for a whole algorithm block, and a blocking wait here once spun the
+        message thread forever behind a reverb thread that never let go
+        (2026-10-29, both freezes on the Mac). A contended second just reports
+        nothing. */
     bool getReverbGpuPumpStats (uint32_t& underruns, float& peakPumpMs, float& budgetMs,
                                 juce::String& deviceName)
     {
-        juce::SpinLock::ScopedLockType lock (algorithmLock);
+        const juce::SpinLock::ScopedTryLockType lock (algorithmLock);
+        if (! lock.isLocked())
+            return false;
         budgetMs = sampleRate > 0.0 ? (float) (internalBlockSize / sampleRate * 1000.0) : 0.0f;
         auto* a = algorithm.get();
         if (auto* s = dynamic_cast<ReverbSDNAlgorithmGPU*> (a))

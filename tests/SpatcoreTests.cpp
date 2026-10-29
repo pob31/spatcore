@@ -141,6 +141,7 @@
 #include "spatcore/rt/RtTripleBuffer.h"
 #include "spatcore/rt/RtThreadPriority.h"
 #include "spatcore/gpu/GpuHostWorkPool.h"
+#include "spatcore/rt/AudioParallelFor.h"
 #include "spatcore/dsp/DelayTargetSmoother.h"
 #include "spatcore/dsp/OnePoleSmoother.h"
 #include "spatcore/dsp/FastDecibels.h"
@@ -2380,6 +2381,39 @@ static void testGpuHostWorkPoolCrossGenBarrier()
             for (int i = 0; i < count; ++i)
                 CHECK (out[(size_t) i] == base + i);
         }
+    }
+
+    pool.shutdown();
+}
+
+// AudioParallelFor (the CPU reverb/effects pool) across back-to-back
+// dispatches. A worker can still be looping in executeItems() when the next
+// dispatch resets the item counter, and it claims an item of the new dispatch
+// straight away. doneCount used to be reset AFTER the counter, so that
+// worker's increment could be wiped and the caller waited forever: the reverb
+// thread hung inside SDN holding its algorithm lock and the UI froze behind it
+// (2026-10-29, macOS). The counts vary per round so a straggler that paired
+// one dispatch's index with another's count would run an item twice or out of
+// range. Probabilistic like the test above; the deterministic repro widened
+// the reset window with a sleep and hung the old pool within 2.5 s.
+static void testAudioParallelForBackToBackDispatches()
+{
+    const unsigned hw = std::thread::hardware_concurrency();
+    const int workers = (int) (hw > 0 ? hw * 2u : 8u);   // oversubscribed
+
+    AudioParallelFor pool;
+    pool.prepare (workers);
+
+    std::vector<int> hits (64, 0);
+    for (int round = 0; round < 100000; ++round)
+    {
+        const int count = 2 + (round * 7) % 23;
+        std::fill (hits.begin(), hits.begin() + count, 0);
+
+        pool.parallelFor (count, [&hits] (int i) { ++hits[(size_t) i]; });
+
+        for (int i = 0; i < count; ++i)
+            CHECK (hits[(size_t) i] == 1);
     }
 
     pool.shutdown();
@@ -15571,6 +15605,7 @@ int main()
         testRtThreadPriority();
         testGpuHostWorkPoolDeterminism();
         testGpuHostWorkPoolCrossGenBarrier();
+        testAudioParallelForBackToBackDispatches();
         testSdnLevelVsNodeCount();
         testMultiChannelEQBankNeutrality();
         testMultiChannelEQBankEnableSemantics();
