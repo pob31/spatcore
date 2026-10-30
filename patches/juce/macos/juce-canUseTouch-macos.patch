@@ -1,0 +1,18 @@
+diff --git a/modules/juce_gui_basics/native/juce_NSViewComponentPeer_mac.mm b/modules/juce_gui_basics/native/juce_NSViewComponentPeer_mac.mm
+index 0436364e90..3d535cf568 100644
+--- a/modules/juce_gui_basics/native/juce_NSViewComponentPeer_mac.mm
++++ b/modules/juce_gui_basics/native/juce_NSViewComponentPeer_mac.mm
+@@ -3041,7 +3041,12 @@ static NSDragOperation draggingUpdated (id self, SEL, id<NSDraggingInfo> sender)
+ 
+ bool detail::MouseInputSourceList::canUseTouch() const
+ {
+-    return false;
++    // WFS-DIY patch: let touch sources exist on macOS, so the app's USB touch
++    // panel backend can inject one finger per touchIndex through
++    // ComponentPeer::handleMouseEvent. AppKit never sends touch-type events
++    // itself, so nothing else changes. Without this every injected event is
++    // dropped without a trace.
++    return true;
+ }
+ 
+ //==============================================================================
