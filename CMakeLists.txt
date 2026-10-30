@@ -10,7 +10,8 @@
 #                                 carries real code on Apple)
 #   spatcore-control      STATIC  control/{osc,state,mcp}
 #   spatcore-controllers  STATIC  controllers/ (SpaceMouse / Stream Deck+ /
-#                                 Lightpad / Linux evdev touch)
+#                                 Lightpad / touch panels: Linux evdev,
+#                                 macOS HID)
 #   spatcore-ui           STATIC  ui/ (shared GUI widgets; header-only, kept
 #                                 apart from spatcore-audio so the audio layer
 #                                 never links juce_gui_basics)
@@ -357,7 +358,21 @@ if(SPATCORE_CONTROLLERS)
         controllers/SpatcoreControllersCompileCheck.cpp
         controllers/touch/linux/EvdevTouchDevice.cpp
         controllers/touch/linux/EvdevTouchManager.cpp
+        controllers/touch/TouchInjector.cpp
     )
+
+    # macOS USB touch panels: IOHIDManager reader + AppKit window lookup.
+    # Needs spatcore/patches/juce/macos applied to the consumer's JUCE
+    # (tools/juce-patches/apply-juce-patches.sh), or every finger is dropped.
+    if(APPLE)
+        target_sources(spatcore-controllers PRIVATE
+            controllers/touch/macos/MacHidTouchManager.mm)
+        target_link_libraries(spatcore-controllers PUBLIC
+            "-framework IOKit"
+            "-framework CoreFoundation"
+            "-framework ApplicationServices"
+            "-framework AppKit")
+    endif()
 
     # Stage the hidapi headers into a private include tree rather than putting
     # the consumer's directory itself on the include path. An official
@@ -379,10 +394,10 @@ if(SPATCORE_CONTROLLERS)
     # JUCE module deps as measured from spatcore/controllers includes (2026-07):
     #   juce_graphics         streamdeck button/LCD rendering + JPEG packing,
     #                         page/binding colours, lightpad LED colours
-    #   juce_gui_basics       touch/linux/EvdevTouchManager (Desktop /
-    #                         ComponentPeer touch injection; Linux-only code
-    #                         but the dependency is declared unconditionally)
-    #   juce_data_structures  touch/linux/EvdevTouchManager settings
+    #   juce_gui_basics       touch/TouchInjector (Desktop / ComponentPeer
+    #                         touch injection, every platform), and the
+    #                         Linux evdev and macOS HID touch managers
+    #   juce_data_structures  touch managers' per-panel settings
     #                         (PropertiesFile)
     #   juce_events           device drivers' MessageManager::callAsync + Timer
     #   juce_core             threads, strings, everything

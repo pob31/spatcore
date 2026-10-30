@@ -123,6 +123,15 @@
                                  on Linux and macOS a file-size limit fails it
                                  half-way and the old file must survive; a
                                  backup with nowhere to go reports failure
+     22. controllers/touch       HID multitouch: the real 16" ILITEK report
+                                 descriptor parses to its bench-measured
+                                 layout (10 fingers, count at byte 54, the
+                                 Contact Count Max feature that switches it out
+                                 of mouse mode); the contact tracker keys by
+                                 Contact ID through slot shifts, lifts on
+                                 Tip = 0 and on disappearance, waits for a
+                                 hybrid frame to complete; the calibration fit
+                                 recovers a known affine map
 */
 
 // OSCParser.h / OSCSerializer.h use juce::OSC* types but (verbatim-moved,
@@ -211,6 +220,8 @@
 #include "spatcore/wfs/RenderSourceMap.h"
 #include "spatcore/rt/SharedInputRingBuffer.h"
 #include "spatcore/dsp/StereoDecomposer.h"
+#include "spatcore/controllers/touch/hid/HidContactTracker.h"
+#include "spatcore/controllers/touch/TouchCalibration.h"
 #ifdef SPATCORE_TEST_SOFA_FIXTURE
 #include "spatcore/binaural/SofaLoader.h"
 #include "spatcore/binaural/SofaHrtfRenderer.h"
@@ -226,6 +237,7 @@
 #include <limits>
 #include <memory>
 #include <new>
+#include <string>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -540,6 +552,192 @@ static void testRtTripleBuffer()
 //==============================================================================
 // dsp/ - the shared primitives the effects modules are built from.
 //==============================================================================
+
+//==============================================================================
+// controllers/touch: HID multitouch parsing, contact tracking, calibration.
+
+// Report descriptor of the 16" ILITEK panel (222a:0001), digitizer interface,
+// as read from the IORegistry on the bench (2026-10-30).
+static const char* const ilitekDescriptorHex =
+    "050d0904a10185040922a102050d9501750609511500253f81020942250175019501810275019501810305017510550e65110930268025350046150c8142093126802546cb068142c0050d0922a102050d9501750609511500253f81020942250175019501810275019501810305017510550e65110930268025350046150c8142093126802546cb068142c0050d0922a102050d9501750609511500253f81020942250175019501810275019501810305017510550e65110930268025350046150c8142093126802546cb068142c0050d0922a102050d9501750609511500253f81020942250175019501810275019501810305017510550e65110930268025350046150c8142093126802546cb068142c0050d0922a102050d9501750609511500253f81020942250175019501810275019501810305017510550e65110930268025350046150c8142093126802546cb068142c0050d0922a102050d9501750609511500253f81020942250175019501810275019501810305017510550e65110930268025350046150c8142093126802546cb068142c0050d0922a102050d9501750609511500253f81020942250175019501810275019501810305017510550e65110930268025350046150c8142093126802546cb068142c0050d0922a102050d9501750609511500253f81020942250175019501810275019501810305017510550e65110930268025350046150c8142093126802546cb068142c0050d0922a102050d9501750609511500253f81020942250175019501810275019501810305017510550e65110930268025350046150c8142093126802546cb068142c0050d0922a102050d9501750609511500253f81020942250175019501810275019501810305017510550e65110930268025350046150c8142093126802546cb068142c0050d09565500650027ffffff7f9501752081020954257f95017508810275089508810385060955250a75089501b1020600ff09c58506150026ff007508960001b102c0";
+
+static std::vector<uint8_t> bytesFromHex (const char* hex)
+{
+    std::vector<uint8_t> out;
+    for (size_t i = 0; hex[i] != 0 && hex[i + 1] != 0; i += 2)
+        out.push_back ((uint8_t) std::strtoul (std::string (hex + i, 2).c_str(), nullptr, 16));
+    return out;
+}
+
+struct TestContact { int id; bool tip; int x; int y; };
+
+// Builds the 63-byte body of an ILITEK report 4 (the bytes after the ID).
+static std::vector<uint8_t> ilitekReport (const std::vector<TestContact>& slots, int contactCount)
+{
+    std::vector<uint8_t> body (63, 0);
+    for (size_t i = 0; i < slots.size() && i < 10; ++i)
+    {
+        auto* b = &body[i * 5];
+        b[0] = (uint8_t) ((slots[i].id & 0x3F) | (slots[i].tip ? 0x40 : 0));
+        b[1] = (uint8_t) (slots[i].x & 0xFF); b[2] = (uint8_t) (slots[i].x >> 8);
+        b[3] = (uint8_t) (slots[i].y & 0xFF); b[4] = (uint8_t) (slots[i].y >> 8);
+    }
+    body[54] = (uint8_t) contactCount;
+    return body;
+}
+
+static void testHidDigitizerDescriptorIlitek()
+{
+    using namespace spatcore::controllers::hid;
+    const auto desc = bytesFromHex (ilitekDescriptorHex);
+    CHECK (desc.size() == 743);
+
+    const auto layout = parseDigitizerDescriptor (desc.data(), desc.size());
+    CHECK (layout.usesReportIds);
+    CHECK (layout.reports.size() == 1);
+    if (layout.reports.size() != 1) return;
+
+    const auto& r = layout.reports[0];
+    CHECK (r.reportId == 4);
+    CHECK (r.bodyBits == 63 * 8);
+    CHECK (r.fingers.size() == 10);
+    CHECK (r.contactCount.bitOffset == 54 * 8 && r.contactCount.bitSize == 8);
+    CHECK (r.scanTime.bitOffset == 50 * 8 && r.scanTime.bitSize == 32);
+
+    for (size_t i = 0; i < r.fingers.size(); ++i)
+    {
+        const auto& f = r.fingers[i];
+        const uint32_t base = (uint32_t) i * 40;
+        CHECK (f.contactId.bitOffset == base     && f.contactId.bitSize == 6);
+        CHECK (f.tipSwitch.bitOffset == base + 6 && f.tipSwitch.bitSize == 1);
+        CHECK (f.x.bitOffset == base + 8  && f.x.bitSize == 16 && f.x.logicalMin == 0 && f.x.logicalMax == 9600);
+        CHECK (f.y.bitOffset == base + 24 && f.y.bitSize == 16 && f.y.logicalMin == 0 && f.y.logicalMax == 9600);
+        CHECK (! f.confidence.isPresent());
+    }
+
+    CHECK (layout.contactCountMax.isPresent());
+    CHECK (layout.contactCountMax.reportId == 6);
+    CHECK (layout.contactCountMax.field.bitOffset == 0 && layout.contactCountMax.field.bitSize == 8);
+    CHECK (layout.contactCountMax.reportBits == 257 * 8);   // count max + the 256-byte vendor blob
+    CHECK (! layout.inputMode.isPresent());
+
+    // A truncated descriptor yields no fault, only less.
+    const auto cut = parseDigitizerDescriptor (desc.data(), 100);
+    CHECK (cut.reports.size() <= 1);
+
+    // Sign extension for a field whose logical range goes negative.
+    ReportField s { 0, 8, -100, 100 };
+    const uint8_t neg = 0xF6;
+    CHECK (s.read (&neg, 1) == -10);
+}
+
+static void testHidContactTracker()
+{
+    using namespace spatcore::controllers::hid;
+    using Phase = ContactEvent::Phase;
+    const auto desc = bytesFromHex (ilitekDescriptorHex);
+    const auto layout = parseDigitizerDescriptor (desc.data(), desc.size());
+    if (layout.reports.empty()) { CHECK (false); return; }
+
+    ContactTracker tracker (layout.reports[0]);
+    std::vector<ContactEvent> ev;
+    auto feed = [&] (const std::vector<TestContact>& slots, int count)
+    {
+        ev.clear();
+        const auto body = ilitekReport (slots, count);
+        tracker.processReport (body.data(), body.size(), ev);
+    };
+
+    feed ({ { 0, true, 4800, 0 } }, 1);
+    CHECK (ev.size() == 1 && ev[0].phase == Phase::down && ev[0].contactId == 0);
+    CHECK (ev.size() == 1 && std::fabs (ev[0].x - 0.5f) < 1e-6f && ev[0].y == 0.0f);
+
+    feed ({ { 0, true, 4800, 0 } }, 1);   // the panel repeats a still finger
+    CHECK (ev.empty());
+
+    feed ({ { 0, true, 9600, 9600 } }, 1);
+    CHECK (ev.size() == 1 && ev[0].phase == Phase::move && ev[0].x == 1.0f && ev[0].y == 1.0f);
+
+    feed ({ { 0, true, 9600, 9600 }, { 1, true, 100, 200 } }, 2);
+    CHECK (ev.size() == 1 && ev[0].phase == Phase::down && ev[0].contactId == 1);
+    CHECK (tracker.getNumActiveContacts() == 2);
+
+    // Finger 0 lifts: reported once with Tip = 0, counted in the frame.
+    feed ({ { 0, false, 9600, 9600 }, { 1, true, 100, 200 } }, 2);
+    CHECK (ev.size() == 1 && ev[0].phase == Phase::up && ev[0].contactId == 0);
+
+    // Finger 1 shifts down to slot 0 and moves: still contact 1, no new down.
+    feed ({ { 1, true, 150, 200 } }, 1);
+    CHECK (ev.size() == 1 && ev[0].phase == Phase::move && ev[0].contactId == 1);
+
+    // Unused slots hold stale bytes beyond the count: ignored.
+    feed ({ { 1, true, 150, 200 }, { 5, true, 1, 1 } }, 1);
+    CHECK (ev.empty());
+
+    // A frame with nothing in it: finger 1 vanished without a Tip = 0.
+    feed ({}, 0);
+    CHECK (ev.size() == 1 && ev[0].phase == Phase::up && ev[0].contactId == 1);
+    CHECK (tracker.getNumActiveContacts() == 0);
+
+    // Ten at once.
+    std::vector<TestContact> ten;
+    for (int i = 0; i < 10; ++i) ten.push_back ({ i, true, 900 * i, 500 });
+    feed (ten, 10);
+    CHECK (ev.size() == 10 && tracker.getMaxContactsSeen() == 10);
+
+    // Hybrid mode: 12 contacts over two reports, the second with count 0.
+    ContactTracker hybrid (layout.reports[0]);
+    std::vector<ContactEvent> hev;
+    std::vector<TestContact> first, second;
+    for (int i = 0; i < 10; ++i) first.push_back ({ i, true, 10 * i, 10 });
+    second.push_back ({ 10, true, 1, 1 });
+    second.push_back ({ 11, true, 2, 2 });
+    auto b1 = ilitekReport (first, 12), b2 = ilitekReport (second, 0);
+    hybrid.processReport (b1.data(), b1.size(), hev);
+    CHECK (hev.empty());   // frame incomplete
+    hybrid.processReport (b2.data(), b2.size(), hev);
+    CHECK (hev.size() == 12);
+
+    // A device going away lifts everything still down.
+    hev.clear();
+    hybrid.releaseAll (hev);
+    CHECK (hev.size() == 12 && hybrid.getNumActiveContacts() == 0);
+    bool allUp = true;
+    for (auto& e : hev) allUp = allUp && e.phase == Phase::up;
+    CHECK (allUp);
+}
+
+static void testTouchCalibration()
+{
+    using spatcore::controllers::TouchCalibration;
+
+    TouchCalibration identity;
+    float x = 0, y = 0;
+    identity.apply (0.25f, 0.75f, x, y);
+    CHECK (identity.isIdentity() && x == 0.25f && y == 0.75f);
+
+    // A known map: slight rotation, 0.9 scale, offset. Fit from corners + centre.
+    TouchCalibration truth;
+    truth.a = 0.9 * std::cos (0.02); truth.b = -0.9 * std::sin (0.02); truth.c = 0.05;
+    truth.d = 0.9 * std::sin (0.02); truth.e =  0.9 * std::cos (0.02); truth.f = 0.04;
+
+    const float panel[5][2] = { { 0.05f, 0.05f }, { 0.95f, 0.05f }, { 0.95f, 0.95f }, { 0.05f, 0.95f }, { 0.5f, 0.5f } };
+    float display[5][2];
+    for (int i = 0; i < 5; ++i)
+        truth.apply (panel[i][0], panel[i][1], display[i][0], display[i][1]);
+
+    TouchCalibration fitted;
+    CHECK (fitted.fit (panel, display, 5));
+    CHECK (std::fabs (fitted.a - truth.a) < 1e-5 && std::fabs (fitted.b - truth.b) < 1e-5);
+    CHECK (std::fabs (fitted.c - truth.c) < 1e-5 && std::fabs (fitted.d - truth.d) < 1e-5);
+    CHECK (std::fabs (fitted.e - truth.e) < 1e-5 && std::fabs (fitted.f - truth.f) < 1e-5);
+
+    // Collinear points cannot fix a 2D map: refused, calibration unchanged.
+    const float line[3][2] = { { 0.1f, 0.1f }, { 0.5f, 0.5f }, { 0.9f, 0.9f } };
+    TouchCalibration untouched;
+    CHECK (! untouched.fit (line, line, 3));
+    CHECK (untouched.isIdentity());
+}
 
 static void testOnePoleSmoother()
 {
@@ -15471,6 +15669,9 @@ int main()
         testRtSnapshot();
         testRtTripleBuffer();
         testOnePoleSmoother();
+        testHidDigitizerDescriptorIlitek();
+        testHidContactTracker();
+        testTouchCalibration();
         testFastDecibels();
         testLfoPhasor();
         testFractionalDelayLine();
