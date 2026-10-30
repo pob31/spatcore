@@ -16,7 +16,7 @@ submodule by multiple apps (WFS-DIY, and the planned XOA and Tight-WFS).
 | `effects/` | Per-channel effects chain: the module contract (`IEffectModule` plus a `ModuleSlot` whose bypass and variant switches are click-free and whose NaN guard is not optional), the POD parameter set that crosses to the realtime side, and `EffectChain` - eleven slots in a user-chosen order, where reordering moves audio and never module state. `modules/` holds all nine: distortion, EQ, dynamics, chorus/flanger, phaser, tremolo, reverb, multitap delay and bitcrusher; `modules/reverb/` the reverb's tail models (FDN, Dattorro plate, modulated hall, shimmer), its early-reflection profiles and the pieces they share - a change of room spills the old tail over the new one rather than fading |
 | `gpu/` | Multi-vendor GPU compute: CUDA / HIP / Metal backends for 5 kernel families, runtime kernel compilation (NVRTC/hipRTC), async pipeline, device manager, vendor-plugin factory, JUCE-free host work pool |
 | `control/` | `osc/` wire codec + transports + ingest queues, `state/` ValueTree parameter store + XML persistence, `mcp/` MCP server core (JSON-RPC transport, dispatcher, tool registry, tier enforcement) |
-| `controllers/` | Hardware controller device layer: SpaceMouse, Stream Deck+, ROLI Lightpad, evdev touch |
+| `controllers/` | Hardware controller device layer: SpaceMouse, Stream Deck+, ROLI Lightpad, and multitouch panels - `touch/hid/` reads any Windows-style HID digitizer from its own report descriptor (std-only, unit tested), `touch/TouchInjector` hands each finger to JUCE as a touch `MouseInputSource`, `touch/macos/` reads USB panels with IOHIDManager (macOS flattens them to one pointer otherwise), `touch/linux/` the older evdev reader |
 | `ui/` | Shared GUI widgets: the interactive EQ curve display (ValueTree-backed, undoable), the per-band toggle, the audio-interface patch matrix (`ui/patch/`) and the dB send matrix (`ui/sends/`, schema-free: sources x destinations with a level and a switch per cell)), and `ui/TypedValue.h`, which reads a number typed into a value field the way the field shows it (units, "2.5 kHz", "1m 30s", "1:2.0"; juce_core only). Palette and localised strings are injected by the consuming app through provider callbacks, so spatcore stays app-agnostic |
 | `io/` | Audio device layer: open/restore policy that makes explicit channel masks stick, a device callback with no channel cap whose buffer is indexed by hardware channel, and the output test-signal generator (500 ms protective ramp) |
 | `tools/` | `gpu/` per-vendor plugin build scripts, `codegen/` CSV→MCP tool generator core |
@@ -48,6 +48,12 @@ dependencies — each contract fails loudly if unmet:
   shadow libc++'s `<version>` on macOS) never reach the include path.
 - **roli_blocks_basics**: `juce_add_module()` — Lightpad support, also under
   `SPATCORE_CONTROLLERS`.
+- **macOS touch panels: a patched JUCE.** JUCE's `canUseTouch()` returns false
+  on macOS, so JUCE drops every touch event the panel reader injects. Run
+  `tools/juce-patches/apply-juce-patches.sh <path/to/JUCE> macos` after every
+  JUCE checkout (and in CI, before the build); the patches live in
+  `patches/juce/macos/`. Reading a panel needs the Input Monitoring permission;
+  moving the cursor from touches outside the app also needs Accessibility.
 
 `spatcore-ui` needs no extra dependency (its JUCE modules ship with JUCE), but
 it does link `juce_gui_basics` — which `spatcore-audio` deliberately never does,
