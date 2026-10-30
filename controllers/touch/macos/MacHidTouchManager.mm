@@ -7,6 +7,8 @@
 #include <IOKit/hid/IOHIDManager.h>
 #include <IOKit/hid/IOHIDKeys.h>
 #include <IOKit/hidsystem/IOHIDLib.h>
+#include <IOKit/IOCFPlugIn.h>
+#include <IOKit/usb/IOUSBLib.h>
 
 #include <mutex>
 #include <thread>
@@ -39,6 +41,50 @@ namespace
         return juce::String::toHexString ((int) rc).paddedLeft ('0', 8);
     }
 
+    // Re-enumerates the USB device a HID device belongs to: a software replug,
+    // after which a panel comes back in its power-on (mouse emulation) mode.
+    // Bench, 2026-10-30: open and re-enumerate succeed with no permission and
+    // the HID interfaces return at once.
+    bool reenumerateUsbDevice (IOHIDDeviceRef ref)
+    {
+        io_registry_entry_t entry = IOHIDDeviceGetService (ref);
+        if (entry == MACH_PORT_NULL)
+            return false;
+        IOObjectRetain (entry);
+
+        // Up the service plane from the HID interface to its USB device.
+        while (entry != MACH_PORT_NULL && ! IOObjectConformsTo (entry, "IOUSBHostDevice"))
+        {
+            io_registry_entry_t parent = MACH_PORT_NULL;
+            const kern_return_t kr = IORegistryEntryGetParentEntry (entry, kIOServicePlane, &parent);
+            IOObjectRelease (entry);
+            entry = kr == KERN_SUCCESS ? parent : MACH_PORT_NULL;
+        }
+        if (entry == MACH_PORT_NULL)
+            return false;
+
+        bool ok = false;
+        IOCFPlugInInterface** plug = nullptr;
+        SInt32 score = 0;
+        if (IOCreatePlugInInterfaceForService (entry, kIOUSBDeviceUserClientTypeID, kIOCFPlugInInterfaceID,
+                                               &plug, &score) == KERN_SUCCESS && plug != nullptr)
+        {
+            IOUSBDeviceInterface187** usb = nullptr;
+            if ((*plug)->QueryInterface (plug, CFUUIDGetUUIDBytes (kIOUSBDeviceInterfaceID187),
+                                         (LPVOID*) &usb) == S_OK && usb != nullptr)
+            {
+                const bool opened = (*usb)->USBDeviceOpen (usb) == kIOReturnSuccess;
+                ok = (*usb)->USBDeviceReEnumerate (usb, 0) == kIOReturnSuccess;
+                if (opened)
+                    (*usb)->USBDeviceClose (usb);
+                (*usb)->Release (usb);
+            }
+            (*plug)->Release (plug);
+        }
+        IOObjectRelease (entry);
+        return ok;
+    }
+
     // Writes `value` into a field of a report buffer (body starts after the ID).
     void writeBits (uint8_t* body, size_t bodySize, const hid::ReportField& f, uint32_t value)
     {
@@ -69,15 +115,36 @@ public:
 
     ~HidThread()
     {
+        shutdown();
+    }
+
+    /** Closes every panel, re-enumerates the ones that were switched to
+        multitouch, and stops the thread. Idempotent. */
+    void shutdown()
+    {
+        if (stopped)
+            return;
+        stopped = true;
+
         post ([this]
         {
             for (auto& d : devices)
+            {
                 closeDevice (*d);
+
+                // Back to mouse mode for the next application, or for none.
+                if (d->switched && reenumerateUsbDevice (d->ref))
+                    restoredToMouse.add (d->name.isNotEmpty() ? d->name : d->key);
+            }
             devices.clear();
             CFRunLoopStop (CFRunLoopGetCurrent());
         });
         thread.join();
     }
+
+    /** The panels re-enumerated back to mouse mode; read after shutdown(). */
+    juce::StringArray restoredToMouse;
+    bool stopped = false;
 
     void post (std::function<void()> fn)
     {
@@ -484,6 +551,7 @@ private:
 juce::var MacHidTouchManager::PanelSettings::toVar() const
 {
     auto* obj = new juce::DynamicObject();
+    obj->setProperty ("displayId", displayId);
     obj->setProperty ("displayIndex", displayIndex);
     obj->setProperty ("seize", seize);
     obj->setProperty ("drivePointer", drivePointer);
@@ -498,6 +566,7 @@ MacHidTouchManager::PanelSettings MacHidTouchManager::PanelSettings::fromVar (co
     PanelSettings s;
     if (auto* obj = v.getDynamicObject())
     {
+        s.displayId    = obj->getProperty ("displayId").toString();
         s.displayIndex = obj->hasProperty ("displayIndex") ? (int) obj->getProperty ("displayIndex") : -1;
         s.seize        = (bool) obj->getProperty ("seize");
         s.drivePointer = obj->hasProperty ("drivePointer") ? (bool) obj->getProperty ("drivePointer") : true;
@@ -531,7 +600,15 @@ MacHidTouchManager::MacHidTouchManager (const juce::String& settingsAppName)
 
 MacHidTouchManager::~MacHidTouchManager()
 {
-    hidThread.reset();   // closes (and un-seizes) every panel
+    if (hidThread != nullptr)
+    {
+        // Closes (and un-seizes) every panel and re-enumerates the ones it
+        // switched; shutdown() joins the HID thread, so its list is final.
+        hidThread->shutdown();
+        if (! hidThread->restoredToMouse.isEmpty())
+            log ("back in mouse mode for macOS: " + hidThread->restoredToMouse.joinIntoString (", "));
+        hidThread.reset();
+    }
     injector.releaseAll();
     if (pointerFingerDown)
         pointerUp (lastPointerPos);
@@ -670,9 +747,61 @@ void MacHidTouchManager::handlePanelGone (const juce::String& key, int maxContac
 }
 
 //==============================================================================
-bool MacHidTouchManager::desktopPosition (const PanelSettings& s, const hid::ContactEvent& e,
-                                          juce::Point<float>& out) const
+std::vector<MacHidTouchManager::DisplayInfo> MacHidTouchManager::getDisplays()
 {
+    std::vector<DisplayInfo> result;
+    const auto scale = juce::Desktop::getInstance().getGlobalScaleFactor();
+
+    for (NSScreen* screen in [NSScreen screens])
+    {
+        NSNumber* number = screen.deviceDescription[@"NSScreenNumber"];
+        if (number == nil)
+            continue;
+
+        const auto did = (CGDirectDisplayID) number.unsignedIntValue;
+        const auto serial = CGDisplaySerialNumber (did);
+
+        DisplayInfo d;
+        d.id = juce::String::toHexString ((int) CGDisplayVendorNumber (did)) + ":"
+             + juce::String::toHexString ((int) CGDisplayModelNumber (did)) + ":"
+             + (serial != 0 ? juce::String::toHexString ((int) serial)
+                            : "u" + juce::String ((int) CGDisplayUnitNumber (did)));
+        if (@available (macOS 10.15, *))
+            d.name = juce::String::fromCFString ((__bridge CFStringRef) screen.localizedName);
+
+        // CG global space: top-left of the main display, in points - JUCE's
+        // desktop space once its global scale is applied.
+        const CGRect r = CGDisplayBounds (did);
+        d.bounds = juce::Rectangle<double> (r.origin.x, r.origin.y, r.size.width, r.size.height)
+                       .transformedBy (juce::AffineTransform::scale (1.0 / scale))
+                       .toNearestInt();
+        d.isMain = CGDisplayIsMain (did) != 0;
+        result.push_back (d);
+    }
+
+    return result;
+}
+
+bool MacHidTouchManager::displayArea (const PanelSettings& s, juce::Rectangle<float>& out) const
+{
+    if (s.displayId.isNotEmpty())
+    {
+        const auto now = juce::Time::getMillisecondCounter();
+        if (cachedDisplays.empty() || now - cachedDisplaysTime > 500)
+        {
+            cachedDisplays = getDisplays();
+            cachedDisplaysTime = now;
+        }
+
+        for (const auto& d : cachedDisplays)
+            if (d.id == s.displayId)
+            {
+                out = d.bounds.toFloat();
+                return true;
+            }
+        return false;   // its display is not connected
+    }
+
     const auto& displays = juce::Desktop::getInstance().getDisplays().displays;
 
     int index = s.displayIndex;
@@ -681,9 +810,24 @@ bool MacHidTouchManager::desktopPosition (const PanelSettings& s, const hid::Con
     if (! juce::isPositiveAndBelow (index, displays.size()))
         return false;
 
-    // Logical points, never native pixels; re-read at every event, so a change
-    // of resolution or scaling is followed at once.
-    const auto area = displays.getReference (index).totalArea.toFloat();
+    out = displays.getReference (index).totalArea.toFloat();
+    return true;
+}
+
+bool MacHidTouchManager::hasDisplay (const PanelSettings& s) const
+{
+    juce::Rectangle<float> unused;
+    return displayArea (s, unused);
+}
+
+bool MacHidTouchManager::desktopPosition (const PanelSettings& s, const hid::ContactEvent& e,
+                                          juce::Point<float>& out) const
+{
+    // Logical points, never native pixels; re-read as the arrangement
+    // changes, so a change of resolution or scaling is followed.
+    juce::Rectangle<float> area;
+    if (! displayArea (s, area))
+        return false;
 
     float dx = 0, dy = 0;
     s.calibration.apply (e.x, e.y, dx, dy);
@@ -750,6 +894,14 @@ void MacHidTouchManager::handleContacts (const juce::String& key, const std::vec
         const std::pair<juce::String, int> finger { key, e.contactId };
         juce::Point<float> pos;
         const bool mapped = desktopPosition (s, e, pos);
+
+        if (e.phase == hid::ContactEvent::Phase::down && onIdentifyTouch)
+        {
+            routes[finger] = Route::ignored;
+            auto identify = onIdentifyTouch;   // the callback may clear itself
+            identify (key, e.x, e.y);
+            continue;
+        }
 
         if (e.phase == hid::ContactEvent::Phase::down)
         {

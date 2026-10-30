@@ -20,7 +20,10 @@
       The switch waits until no mouse button is down: switching mid-press
       leaves the emulated left button stuck down in macOS.
     - In multitouch mode macOS stops using the panel as a pointer, and the
-      panel stays in that mode until it is replugged. Fingers that land on one
+      panel would stay in that mode until it is replugged: on quit, every
+      panel that was switched is re-enumerated on USB (a software replug), so
+      it comes back as the touchscreen-mouse it was. Not after a crash or a
+      force-quit; a replug does it then. Fingers that land on one
       of the app's windows (the frontmost window at that point) go to JUCE as
       touches; with drivePointer, the first finger elsewhere moves and clicks
       the system cursor, so the rest of the desktop stays usable.
@@ -74,9 +77,14 @@ public:
 
     struct PanelSettings
     {
-        /** Index into Desktop::getDisplays().displays, or -1 for automatic:
-            the only display when there is exactly one, otherwise none (the
-            panel is read but its touches go nowhere until it is assigned). */
+        /** The display the panel covers, as DisplayInfo::id. Empty for
+            automatic: the only display when there is exactly one, otherwise
+            none - the panel is read but its touches go nowhere until it is
+            assigned (identifyDisplays(), or a display picker). */
+        juce::String displayId;
+
+        /** Settings saved before displayId existed: an index into
+            Desktop::getDisplays().displays, used while displayId is empty. */
         int  displayIndex = -1;
         bool seize = false;
 
@@ -109,6 +117,29 @@ public:
 
     /** Connected panels first, then panels known only from settings. */
     std::vector<PanelInfo> getPanels() const;
+
+    /** One display, as a panel is assigned to it. The id survives a change of
+        arrangement, resolution or the order macOS lists displays in: vendor,
+        model and serial number from the display's EDID, plus its unit number
+        when it has no serial (two identical monitors). */
+    struct DisplayInfo
+    {
+        juce::String id;
+        juce::String name;              // as macOS names it, e.g. "PLT2236"
+        juce::Rectangle<int> bounds;    // JUCE desktop coordinates, logical points
+        bool isMain = false;
+    };
+    static std::vector<DisplayInfo> getDisplays();
+
+    /** True when touches of a panel with these settings land somewhere now. */
+    bool hasDisplay (const PanelSettings&) const;
+
+    /** While set, a finger that lands is not routed anywhere: it is reported
+        here instead, with its panel and its position as a fraction of the
+        panel (before calibration), and ignored until it lifts. The app shows
+        a target in a different place on each display; where the finger lands
+        on its panel says which display that panel covers. */
+    std::function<void (const juce::String& panelKey, float x, float y)> onIdentifyTouch;
 
     void setPanelSettings (const juce::String& key, const PanelSettings&);
 
@@ -145,6 +176,12 @@ private:
     void handlePanelGone (const juce::String& key, int maxContactsSeen);
 
     bool desktopPosition (const PanelSettings&, const hid::ContactEvent&, juce::Point<float>& out) const;
+    bool displayArea (const PanelSettings&, juce::Rectangle<float>& out) const;
+
+    // getDisplays() asks AppKit; touch events come 100 times a second, so the
+    // list is cached and re-read at most every half second.
+    mutable std::vector<DisplayInfo> cachedDisplays;
+    mutable juce::uint32 cachedDisplaysTime = 0;
     /** What is frontmost at a desktop position: one of the app's JUCE views,
         the frame of one of its windows (the macOS title bar, its buttons,
         the resize edges - drawn by AppKit, not JUCE), or anything else. */
