@@ -119,21 +119,22 @@ public:
     }
 
     /** Closes every panel, re-enumerates the ones that were switched to
-        multitouch, and stops the thread. Idempotent. */
-    void shutdown()
+        multitouch - unless `restore` is false: another reader still uses
+        them - and stops the thread. Idempotent. */
+    void shutdown (bool restore = true)
     {
         if (stopped)
             return;
         stopped = true;
 
-        post ([this]
+        post ([this, restore]
         {
             for (auto& d : devices)
             {
                 closeDevice (*d);
 
                 // Back to mouse mode for the next application, or for none.
-                if (d->switched && reenumerateUsbDevice (d->ref))
+                if (restore && d->switched && reenumerateUsbDevice (d->ref))
                     restoredToMouse.add (d->name.isNotEmpty() ? d->name : d->key);
             }
             devices.clear();
@@ -581,6 +582,11 @@ MacHidTouchManager::PanelSettings MacHidTouchManager::PanelSettings::fromVar (co
 
 //==============================================================================
 MacHidTouchManager::MacHidTouchManager (const juce::String& settingsAppName)
+    : MacHidTouchManager (settingsAppName, true)
+{
+}
+
+MacHidTouchManager::MacHidTouchManager (const juce::String& settingsAppName, bool sharePanels)
 {
     juce::PropertiesFile::Options options;
     options.applicationName     = settingsAppName;
@@ -588,7 +594,43 @@ MacHidTouchManager::MacHidTouchManager (const juce::String& settingsAppName)
     options.osxLibrarySubFolder = "Application Support";
     options.folderName          = juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
                                        .getChildFile (settingsAppName).getFullPathName();
-    settingsFile = std::make_unique<juce::PropertiesFile> (options);
+
+    if (sharePanels)
+    {
+        registry = std::make_unique<TouchPanelRegistry>();
+
+        if (! registry->isReading())
+        {
+            log ("the shared touch folder cannot be used (" + juce::String (registry->folder()) + "): reading alone");
+            registry.reset();
+        }
+    }
+
+    if (registry != nullptr)
+    {
+        /*  ONE FILE FOR EVERY READER, and this application's own file read once
+            into it when it has nothing yet: what was placed here before
+            sharing is not lost. */
+        auto own = std::make_unique<juce::PropertiesFile> (options);
+
+        juce::PropertiesFile::Options shared;
+        shared.storageFormat = juce::PropertiesFile::storeAsXML;
+        const juce::File where (juce::String (registry->settingsPath()));
+
+        const TouchPanelRegistry::SettingsLock held (*registry);
+        settingsFile = std::make_unique<juce::PropertiesFile> (where, shared);
+
+        if (! settingsFile->containsKey (kSettingsKey) && own->containsKey (kSettingsKey))
+        {
+            settingsFile->setValue (kSettingsKey, own->getValue (kSettingsKey));
+            settingsFile->saveIfNeeded();
+        }
+    }
+    else
+    {
+        settingsFile = std::make_unique<juce::PropertiesFile> (options);
+    }
+
     loadSettings();
 
     std::map<juce::String, bool> seizeByKey;
@@ -603,10 +645,14 @@ MacHidTouchManager::~MacHidTouchManager()
     if (hidThread != nullptr)
     {
         // Closes (and un-seizes) every panel and re-enumerates the ones it
-        // switched; shutdown() joins the HID thread, so its list is final.
-        hidThread->shutdown();
+        // switched - when no other reader still uses them; shutdown() joins
+        // the HID thread, so its list is final.
+        const bool restore = registry == nullptr || registry->lastToLeave();
+        hidThread->shutdown (restore);
         if (! hidThread->restoredToMouse.isEmpty())
             log ("back in mouse mode for macOS: " + hidThread->restoredToMouse.joinIntoString (", "));
+        else if (! restore)
+            log ("left in multitouch mode: another application still reads the panels");
         hidThread.reset();
     }
     injector.releaseAll();
@@ -653,7 +699,7 @@ void MacHidTouchManager::setPanelSettings (const juce::String& key, const PanelS
     JUCE_ASSERT_MESSAGE_THREAD
 
     settings[key] = s;
-    saveSettings();
+    saveSettings (key);
 
     if (auto it = panels.find (key); it != panels.end())
         it->second.settings = s;
@@ -858,6 +904,27 @@ MacHidTouchManager::Hit MacHidTouchManager::hitTest (juce::Point<float> desktopP
                     return NSPointInRect (p, onScreen) ? Hit::appContent : Hit::appFrame;
                 }
 
+    /*  ANOTHER READER'S WINDOW: whose process owns it (the window list's owner
+        PID, which needs no screen-recording permission), and whether that
+        process reads the panels too - then the finger is its own. */
+    if (registry != nullptr && number > 0)
+    {
+        int owner = 0;
+
+        if (CFArrayRef info = CGWindowListCopyWindowInfo (kCGWindowListOptionIncludingWindow, (CGWindowID) number))
+        {
+            if (CFArrayGetCount (info) > 0)
+                if (auto entry = (CFDictionaryRef) CFArrayGetValueAtIndex (info, 0))
+                    if (auto pid = (CFNumberRef) CFDictionaryGetValue (entry, kCGWindowOwnerPID))
+                        CFNumberGetValue (pid, kCFNumberIntType, &owner);
+
+            CFRelease (info);
+        }
+
+        if (owner > 0 && registry->isOtherReader (std::to_string (owner)))
+            return Hit::otherApp;
+    }
+
     return Hit::elsewhere;
 }
 
@@ -918,7 +985,9 @@ void MacHidTouchManager::handleContacts (const juce::String& key, const std::vec
                     route = Route::injector;
                 else if (hit == Hit::appFrame && frameDown (finger, pos))
                     route = Route::frame;
-                else if (s.drivePointer && ! pointerFingerDown)
+                else if (hit == Hit::otherApp)
+                    route = Route::ignored;     // that reader takes it
+                else if (s.drivePointer && ! pointerFingerDown && drivesPointer())
                     route = Route::pointer;
             }
 
@@ -1212,13 +1281,76 @@ void MacHidTouchManager::loadSettings()
             settings[prop.name.toString()] = PanelSettings::fromVar (prop.value);
 }
 
-void MacHidTouchManager::saveSettings()
+void MacHidTouchManager::saveSettings (const juce::String& changedKey)
 {
+    if (registry != nullptr)
+    {
+        /*  SHARED: the file as the other readers left it, read again under the
+            lock, and only the panel this one changed written over it - so a
+            panel placed in another application at the same time is kept. */
+        const TouchPanelRegistry::SettingsLock held (*registry);
+        settingsFile->reload();
+
+        auto parsed = juce::JSON::parse (settingsFile->getValue (kSettingsKey, ""));
+        auto* obj = parsed.getDynamicObject();
+
+        if (obj == nullptr)
+        {
+            parsed = juce::var (new juce::DynamicObject());
+            obj = parsed.getDynamicObject();
+        }
+
+        if (auto it = settings.find (changedKey); it != settings.end())
+            obj->setProperty (changedKey, it->second.toVar());
+
+        settingsFile->setValue (kSettingsKey, juce::JSON::toString (parsed, true));
+        settingsFile->saveIfNeeded();
+        return;
+    }
+
     auto* obj = new juce::DynamicObject();
     for (auto& [key, s] : settings)
         obj->setProperty (key, s.toVar());
     settingsFile->setValue (kSettingsKey, juce::JSON::toString (juce::var (obj), true));
     settingsFile->saveIfNeeded();
+}
+
+void MacHidTouchManager::reloadSettings()
+{
+    JUCE_ASSERT_MESSAGE_THREAD
+
+    if (registry == nullptr)
+        return;
+
+    {
+        const TouchPanelRegistry::SettingsLock held (*registry);
+        settingsFile->reload();
+    }
+
+    const auto before = settings;
+    loadSettings();
+
+    //  Told only when a panel's settings really moved: a listener may ask again.
+    auto moved = before.size() != settings.size();
+
+    for (auto& [key, now] : settings)
+        if (auto was = before.find (key); was == before.end()
+              || juce::JSON::toString (was->second.toVar()) != juce::JSON::toString (now.toVar()))
+            moved = true;
+
+    if (! moved)
+        return;
+
+    for (auto& [key, info] : panels)
+        if (auto it = settings.find (key); it != settings.end())
+            info.settings = it->second;
+
+    fireChange();
+}
+
+bool MacHidTouchManager::drivesPointer()
+{
+    return registry == nullptr || registry->drivesPointer();
 }
 
 } // namespace spatcore::controllers

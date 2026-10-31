@@ -55,6 +55,7 @@
 
 #include "../TouchCalibration.h"
 #include "../TouchInjector.h"
+#include "../TouchPanelRegistry.h"
 #include "../hid/HidContactTracker.h"
 
 #include <functional>
@@ -70,6 +71,16 @@ public:
     /** @param settingsAppName  Application name for the per-panel settings
         file (PropertiesFile app and folder name), as for EvdevTouchManager. */
     explicit MacHidTouchManager (const juce::String& settingsAppName);
+
+    /** @param sharePanels  Whether this reader agrees with the other spatcore
+        applications reading the same panels on this computer
+        (TouchPanelRegistry): one of them moves the cursor for fingers outside
+        every reader's windows, a finger on another reader's window is left to
+        it, the last to quit puts the panels back in mouse mode, and the panel
+        settings are one file for all of them - so a screen placed in one
+        application is placed for the others. On by default; off, a reader
+        behaves alone, as it did before. */
+    MacHidTouchManager (const juce::String& settingsAppName, bool sharePanels);
     ~MacHidTouchManager();
 
     MacHidTouchManager (const MacHidTouchManager&) = delete;
@@ -134,6 +145,16 @@ public:
     /** True when touches of a panel with these settings land somewhere now. */
     bool hasDisplay (const PanelSettings&) const;
 
+    /** The shared panel settings read again: another application may have
+        placed a panel since (identify it there, and it is placed here too).
+        Asked before offering to identify. Changes nothing when not sharing. */
+    void reloadSettings();
+
+    /** Whether this reader moves the cursor for fingers outside the readers'
+        windows - the first reader to ask, until it quits (TouchPanelRegistry).
+        Always true when not sharing. */
+    bool drivesPointer();
+
     /** While set, a finger that lands is not routed anywhere: it is reported
         here instead, with its panel and its position as a fraction of the
         panel (before calibration), and ignored until it lifts. The app shows
@@ -185,8 +206,10 @@ private:
     /** What is frontmost at a desktop position: one of the app's JUCE views,
         the frame of one of its windows (the macOS title bar, its buttons,
         the resize edges - drawn by AppKit, not JUCE), or anything else. */
-    enum class Hit { appContent, appFrame, elsewhere };
-    static Hit hitTest (juce::Point<float> desktopPos);
+    /*  otherApp: a window of another spatcore reader, whose fingers it takes
+        itself - never routed here, never moving the cursor. */
+    enum class Hit { appContent, appFrame, otherApp, elsewhere };
+    Hit hitTest (juce::Point<float> desktopPos);
 
     // The system cursor, driven by one finger outside the app's windows.
     void pointerDown (juce::Point<float>);
@@ -229,7 +252,10 @@ private:
     bool askedForAccessibility = false;
     bool warnedTouchDropped = false;
     void loadSettings();
-    void saveSettings();
+    void saveSettings (const juce::String& changedKey);
+
+    /** The other spatcore readers, by process; null when not sharing. */
+    std::unique_ptr<TouchPanelRegistry> registry;
     void fireChange();
     void log (const juce::String&);
 
