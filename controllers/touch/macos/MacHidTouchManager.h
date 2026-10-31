@@ -131,16 +131,32 @@ public:
 
     /** One display, as a panel is assigned to it. The id survives a change of
         arrangement, resolution or the order macOS lists displays in: vendor,
-        model and serial number from the display's EDID, plus its unit number
-        when it has no serial (two identical monitors). */
+        model and serial number from the display's EDID, plus its unit number,
+        which is all that tells two identical monitors apart. */
     struct DisplayInfo
     {
-        juce::String id;
+        juce::String id;                // "vendor:model:serial@u<unit>", hex but the unit
+        juce::String legacyId;          // the form saved before the unit was added
         juce::String name;              // as macOS names it, e.g. "PLT2236"
         juce::Rectangle<int> bounds;    // JUCE desktop coordinates, logical points
         bool isMain = false;
     };
     static std::vector<DisplayInfo> getDisplays();
+
+    /** The display a saved id names, as an index into `displays`, or -1.
+        An id matches exactly; an id saved in the older form (no unit number)
+        matches when exactly one connected display fits it. Two identical
+        monitors can share vendor, model and serial - two 16" ILITEK panels
+        both report serial 0x01010101 - so only the unit number tells them
+        apart, and an older id that fits both names neither. */
+    static int findDisplay (const juce::String& savedId, const std::vector<DisplayInfo>& displays);
+
+    /** Whether a panel should be identified (the "touch this screen" pass):
+        it was never placed on a display, or the display it was placed on now
+        fits more than one connected display. Not when that display is merely
+        unplugged - identifying would not bring it back, and the panel finds
+        it again when it returns. */
+    static bool needsIdentify (const PanelSettings&, const std::vector<DisplayInfo>& displays);
 
     /** True when touches of a panel with these settings land somewhere now. */
     bool hasDisplay (const PanelSettings&) const;
