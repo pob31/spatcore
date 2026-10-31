@@ -9,7 +9,12 @@
 juce_add_console_app(spatcore-tests PRODUCT_NAME "spatcore-tests")
 
 target_sources(spatcore-tests PRIVATE
-    SpatcoreTests.cpp)
+    SpatcoreTests.cpp
+    # The touch registry is plain C++17 and POSIX (testTouchPanelRegistry), and
+    # lives in spatcore-controllers, which this target does not link - that
+    # library brings the evdev reader and libudev with it. Its one source is
+    # compiled here instead; on Windows it compiles to nothing.
+    ${CMAKE_CURRENT_SOURCE_DIR}/../controllers/touch/TouchPanelRegistry.cpp)
 
 # The JUCE modules arrive transitively through the libs' PUBLIC link
 # interface (their sources compile into this target, JUCE-module style).
