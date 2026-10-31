@@ -41,15 +41,48 @@ namespace
         return juce::String::toHexString ((int) rc).paddedLeft ('0', 8);
     }
 
+    // True when a USB device has a mouse or pointer HID interface: the
+    // panel's own mouse emulation, which a reset brings back. A panel without
+    // one (the iiyama's SiS 0457:1139 is a touch digitizer only) was never a
+    // mouse for macOS - macOS makes no pointer of a touch digitizer - so it has
+    // no mouse mode to return to, even after a cold replug (bench, 2026-10-31).
+    bool hasMouseInterface (io_registry_entry_t usbDevice)
+    {
+        io_iterator_t it = MACH_PORT_NULL;
+        if (IORegistryEntryCreateIterator (usbDevice, kIOServicePlane, kIORegistryIterateRecursively, &it) != KERN_SUCCESS)
+            return false;
+
+        bool found = false;
+        while (io_registry_entry_t e = IOIteratorNext (it))
+        {
+            if (! found && IOObjectConformsTo (e, "IOHIDDevice"))
+            {
+                long page = 0, usage = 0;
+                if (auto n = (CFNumberRef) IORegistryEntryCreateCFProperty (e, CFSTR (kIOHIDPrimaryUsagePageKey), kCFAllocatorDefault, 0))
+                    { CFNumberGetValue (n, kCFNumberLongType, &page); CFRelease (n); }
+                if (auto n = (CFNumberRef) IORegistryEntryCreateCFProperty (e, CFSTR (kIOHIDPrimaryUsageKey), kCFAllocatorDefault, 0))
+                    { CFNumberGetValue (n, kCFNumberLongType, &usage); CFRelease (n); }
+                found = page == 0x01 && (usage == 0x01 || usage == 0x02);   // Generic Desktop pointer or mouse
+            }
+            IOObjectRelease (e);
+        }
+        IOObjectRelease (it);
+        return found;
+    }
+
+    enum class Restore { done, noMouseMode, failed };
+
     // Re-enumerates the USB device a HID device belongs to: a software replug,
     // after which a panel comes back in its power-on (mouse emulation) mode.
     // Bench, 2026-10-30: open and re-enumerate succeed with no permission and
-    // the HID interfaces return at once.
-    bool reenumerateUsbDevice (IOHIDDeviceRef ref)
+    // the HID interfaces return at once. Skipped for a panel with no mouse
+    // emulation: nothing would come back, and the reset would only disconnect
+    // it under any other reader.
+    Restore reenumerateUsbDevice (IOHIDDeviceRef ref)
     {
         io_registry_entry_t entry = IOHIDDeviceGetService (ref);
         if (entry == MACH_PORT_NULL)
-            return false;
+            return Restore::failed;
         IOObjectRetain (entry);
 
         // Up the service plane from the HID interface to its USB device.
@@ -61,7 +94,13 @@ namespace
             entry = kr == KERN_SUCCESS ? parent : MACH_PORT_NULL;
         }
         if (entry == MACH_PORT_NULL)
-            return false;
+            return Restore::failed;
+
+        if (! hasMouseInterface (entry))
+        {
+            IOObjectRelease (entry);
+            return Restore::noMouseMode;
+        }
 
         bool ok = false;
         IOCFPlugInInterface** plug = nullptr;
@@ -82,7 +121,7 @@ namespace
             (*plug)->Release (plug);
         }
         IOObjectRelease (entry);
-        return ok;
+        return ok ? Restore::done : Restore::failed;
     }
 
     // Writes `value` into a field of a report buffer (body starts after the ID).
@@ -129,22 +168,44 @@ public:
 
         post ([this, restore]
         {
+            std::vector<std::pair<IOHIDDeviceRef, juce::String>> toRestore;
             for (auto& d : devices)
             {
                 closeDevice (*d);
-
-                // Back to mouse mode for the next application, or for none.
-                if (restore && d->switched && reenumerateUsbDevice (d->ref))
-                    restoredToMouse.add (d->name.isNotEmpty() ? d->name : d->key);
+                if (restore && d->switched)
+                {
+                    CFRetain (d->ref);
+                    toRestore.emplace_back (d->ref, d->name.isNotEmpty() ? d->name : d->key);
+                }
             }
             devices.clear();
+
+            // The manager goes before the reset: while it is open it sees the
+            // panel come back, and a reader switches it to multitouch again.
+            // On the bench the reset done with the manager still open was
+            // reported a success and left the ILITEK in multitouch mode; the
+            // same reset from outside any reader brought mouse mode back.
+            closeManager();
+
+            // Back to mouse mode for the next application, or for none.
+            for (auto& [ref, name] : toRestore)
+            {
+                const auto result = reenumerateUsbDevice (ref);
+                if (result == Restore::done)
+                    restoredToMouse.add (name);
+                else if (result == Restore::noMouseMode)
+                    noMouseMode.add (name);
+                CFRelease (ref);
+            }
+
             CFRunLoopStop (CFRunLoopGetCurrent());
         });
         thread.join();
     }
 
-    /** The panels re-enumerated back to mouse mode; read after shutdown(). */
-    juce::StringArray restoredToMouse;
+    /** The panels re-enumerated back to mouse mode, and those with no mouse
+        mode to return to; read after shutdown(). */
+    juce::StringArray restoredToMouse, noMouseMode;
     bool stopped = false;
 
     void post (std::function<void()> fn)
@@ -230,11 +291,21 @@ private:
         ready.signal();
         CFRunLoopRun();
 
+        closeManager();
+        CFRunLoopRemoveSource (runLoop, commandSource, kCFRunLoopDefaultMode);
+        CFRelease (commandSource);
+    }
+
+    void closeManager()
+    {
+        if (manager == nullptr)
+            return;
+        IOHIDManagerRegisterDeviceMatchingCallback (manager, nullptr, nullptr);
+        IOHIDManagerRegisterDeviceRemovalCallback (manager, nullptr, nullptr);
         IOHIDManagerUnscheduleFromRunLoop (manager, runLoop, kCFRunLoopDefaultMode);
         IOHIDManagerClose (manager, kIOHIDOptionsTypeNone);
         CFRelease (manager);
-        CFRunLoopRemoveSource (runLoop, commandSource, kCFRunLoopDefaultMode);
-        CFRelease (commandSource);
+        manager = nullptr;
     }
 
     void drainCommands()
@@ -651,6 +722,9 @@ MacHidTouchManager::~MacHidTouchManager()
         hidThread->shutdown (restore);
         if (! hidThread->restoredToMouse.isEmpty())
             log ("back in mouse mode for macOS: " + hidThread->restoredToMouse.joinIntoString (", "));
+        if (! hidThread->noMouseMode.isEmpty())
+            log ("no mouse mode to return to (a touch digitizer only, which macOS does not use as a pointer): "
+                 + hidThread->noMouseMode.joinIntoString (", "));
         else if (! restore)
             log ("left in multitouch mode: another application still reads the panels");
         hidThread.reset();
