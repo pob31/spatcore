@@ -882,10 +882,11 @@ std::vector<MacHidTouchManager::DisplayInfo> MacHidTouchManager::getDisplays()
         const auto serial = CGDisplaySerialNumber (did);
 
         DisplayInfo d;
-        d.id = juce::String::toHexString ((int) CGDisplayVendorNumber (did)) + ":"
-             + juce::String::toHexString ((int) CGDisplayModelNumber (did)) + ":"
-             + (serial != 0 ? juce::String::toHexString ((int) serial)
-                            : "u" + juce::String ((int) CGDisplayUnitNumber (did)));
+        const auto base = juce::String::toHexString ((int) CGDisplayVendorNumber (did)) + ":"
+                        + juce::String::toHexString ((int) CGDisplayModelNumber (did)) + ":";
+        const auto unit = juce::String ((int) CGDisplayUnitNumber (did));
+        d.id       = base + juce::String::toHexString ((int) serial) + "@u" + unit;
+        d.legacyId = base + (serial != 0 ? juce::String::toHexString ((int) serial) : "u" + unit);
         if (@available (macOS 10.15, *))
             d.name = juce::String::fromCFString ((__bridge CFStringRef) screen.localizedName);
 
@@ -902,6 +903,41 @@ std::vector<MacHidTouchManager::DisplayInfo> MacHidTouchManager::getDisplays()
     return result;
 }
 
+int MacHidTouchManager::findDisplay (const juce::String& savedId, const std::vector<DisplayInfo>& displays)
+{
+    if (savedId.isEmpty())
+        return -1;
+
+    for (size_t i = 0; i < displays.size(); ++i)
+        if (displays[i].id == savedId)
+            return (int) i;
+
+    int found = -1;
+    for (size_t i = 0; i < displays.size(); ++i)
+        if (displays[i].legacyId == savedId)
+        {
+            if (found >= 0)
+                return -1;   // two displays fit: it names neither
+            found = (int) i;
+        }
+    return found;
+}
+
+bool MacHidTouchManager::needsIdentify (const PanelSettings& s, const std::vector<DisplayInfo>& displays)
+{
+    if (s.displayId.isEmpty())
+        return s.displayIndex < 0;
+
+    if (findDisplay (s.displayId, displays) >= 0)
+        return false;
+
+    int fits = 0;
+    for (const auto& d : displays)
+        if (d.legacyId == s.displayId)
+            ++fits;
+    return fits > 1;
+}
+
 bool MacHidTouchManager::displayArea (const PanelSettings& s, juce::Rectangle<float>& out) const
 {
     if (s.displayId.isNotEmpty())
@@ -913,13 +949,11 @@ bool MacHidTouchManager::displayArea (const PanelSettings& s, juce::Rectangle<fl
             cachedDisplaysTime = now;
         }
 
-        for (const auto& d : cachedDisplays)
-            if (d.id == s.displayId)
-            {
-                out = d.bounds.toFloat();
-                return true;
-            }
-        return false;   // its display is not connected
+        const int index = findDisplay (s.displayId, cachedDisplays);
+        if (index < 0)
+            return false;   // its display is not connected, or cannot be told apart
+        out = cachedDisplays[(size_t) index].bounds.toFloat();
+        return true;
     }
 
     const auto& displays = juce::Desktop::getInstance().getDisplays().displays;
