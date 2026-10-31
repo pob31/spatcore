@@ -359,6 +359,7 @@ if(SPATCORE_CONTROLLERS)
         controllers/touch/linux/EvdevTouchDevice.cpp
         controllers/touch/linux/EvdevTouchManager.cpp
         controllers/touch/TouchInjector.cpp
+        controllers/touch/TouchPanelRegistry.cpp
     )
 
     # macOS USB touch panels: IOHIDManager reader + AppKit window lookup.

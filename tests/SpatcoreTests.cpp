@@ -222,6 +222,13 @@
 #include "spatcore/dsp/StereoDecomposer.h"
 #include "spatcore/controllers/touch/hid/HidContactTracker.h"
 #include "spatcore/controllers/touch/TouchCalibration.h"
+#include "spatcore/controllers/touch/TouchPanelRegistry.h"
+#if defined (__APPLE__) || defined (__linux__)
+ #include <fcntl.h>
+ #include <signal.h>
+ #include <sys/wait.h>
+ #include <unistd.h>
+#endif
 #ifdef SPATCORE_TEST_SOFA_FIXTURE
 #include "spatcore/binaural/SofaLoader.h"
 #include "spatcore/binaural/SofaHrtfRenderer.h"
@@ -738,6 +745,96 @@ static void testTouchCalibration()
     CHECK (! untouched.fit (line, line, 3));
     CHECK (untouched.isIdentity());
 }
+
+#if defined (__APPLE__) || defined (__linux__)
+static void testTouchPanelRegistry()
+{
+    using spatcore::controllers::TouchPanelRegistry;
+
+    // A folder of the test's own, so a real reader on this machine is never met.
+    char pattern[] = "/tmp/spatcore-touch-XXXXXX";
+    const char* made = ::mkdtemp (pattern);
+    CHECK (made != nullptr);
+    if (made == nullptr)
+        return;
+    const std::string folder = std::string (made) + "/touch";
+
+    {
+        // Two readers in one process: flock's locks are the open file's, so they exclude each other.
+        auto first = std::make_unique<TouchPanelRegistry> (folder, "1001");
+        TouchPanelRegistry second (folder, "1002");
+        CHECK (first->isReading() && second.isReading());
+
+        // One cursor driver: the first to ask.
+        CHECK (first->drivesPointer());
+        CHECK (! second.drivesPointer());
+        CHECK (first->drivesPointer());
+
+        // Each sees the other, and not itself.
+        CHECK (second.otherReaders() == std::vector<std::string> { "1001" });
+        CHECK (second.isOtherReader ("1001"));
+        CHECK (! second.isOtherReader ("1002"));
+        CHECK (! second.isOtherReader ("9999"));
+
+        // Neither is the last while both read.
+        CHECK (! first->lastToLeave());
+
+        // The first goes: the second drives the cursor, and is the last.
+        first.reset();
+        CHECK (second.otherReaders().empty());
+        CHECK (second.drivesPointer());
+        CHECK (second.lastToLeave());
+
+        // A file left by a reader that is gone, its lock free, is swept.
+        { const int fd = ::open ((folder + "/readers/1003.lock").c_str(), O_RDWR | O_CREAT, 0644); ::close (fd); }
+        CHECK (! second.isOtherReader ("1003"));
+        CHECK (second.otherReaders().empty());
+        CHECK (::access ((folder + "/readers/1003.lock").c_str(), F_OK) != 0);
+
+        CHECK (second.settingsPath() == folder + "/panels.settings");
+        { TouchPanelRegistry::SettingsLock held (second); }
+    }
+
+    {
+        // A reader killed outright: the kernel lets go of its locks, and the next reader takes over.
+        int ready[2];
+        CHECK (::pipe (ready) == 0);
+        const pid_t child = ::fork();
+
+        if (child == 0)
+        {
+            TouchPanelRegistry crashing (folder, "2001");
+            const bool drives = crashing.drivesPointer();
+            const char said = drives ? 'y' : 'n';
+            (void) ! ::write (ready[1], &said, 1);
+            for (;;)
+                ::pause();
+        }
+
+        char said = 0;
+        (void) ! ::read (ready[0], &said, 1);
+        CHECK (said == 'y');
+
+        TouchPanelRegistry survivor (folder, "2002");
+        CHECK (survivor.isOtherReader ("2001"));
+        CHECK (! survivor.drivesPointer());
+        CHECK (! survivor.lastToLeave());
+
+        ::kill (child, SIGKILL);
+        int status = 0;
+        ::waitpid (child, &status, 0);
+
+        CHECK (! survivor.isOtherReader ("2001"));
+        CHECK (survivor.drivesPointer());
+        CHECK (survivor.otherReaders().empty());
+        ::close (ready[0]);
+        ::close (ready[1]);
+    }
+
+    // Stopped, a reader leaves nothing behind it.
+    CHECK (::access ((folder + "/readers/2002.lock").c_str(), F_OK) != 0);
+}
+#endif
 
 static void testOnePoleSmoother()
 {
@@ -15672,6 +15769,9 @@ int main()
         testHidDigitizerDescriptorIlitek();
         testHidContactTracker();
         testTouchCalibration();
+#if defined (__APPLE__) || defined (__linux__)
+        testTouchPanelRegistry();   // early: it forks, so before any test starts a thread
+#endif
         testFastDecibels();
         testLfoPhasor();
         testFractionalDelayLine();
