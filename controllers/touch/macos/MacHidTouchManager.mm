@@ -964,7 +964,7 @@ bool MacHidTouchManager::displayArea (const PanelSettings& s, juce::Rectangle<fl
     if (! juce::isPositiveAndBelow (index, displays.size()))
         return false;
 
-    out = displays.getReference (index).totalArea.toFloat();
+    out = displays.getReference (index).logicalBounds;
     return true;
 }
 
