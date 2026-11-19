@@ -45,7 +45,7 @@ public:
 
     void reset()
     {
-        x1 = x2 = y1 = y2 = 0.0f;
+        x1 = x2 = y1 = y2 = 0.0;
     }
 
     //==========================================================================
@@ -102,124 +102,124 @@ public:
         gainDb = std::max (-24.0f, std::min (gainDb, 24.0f));
         shape  = std::max (0, std::min (shape, 7));
 
-        const float freq = freqHz;
+        const double freq = freqHz;
 
-        float b0 = 1.0f, b1 = 0.0f, b2 = 0.0f;
-        float a1 = 0.0f, a2 = 0.0f;
+        double b0 = 1.0, b1 = 0.0, b2 = 0.0;
+        double a1 = 0.0, a2 = 0.0;
 
         if (sampleRate <= 0.0 || shape == 0)
         {
-            b0 = 1.0f; b1 = 0.0f; b2 = 0.0f;
-            a1 = 0.0f; a2 = 0.0f;
+            b0 = 1.0; b1 = 0.0; b2 = 0.0;
+            a1 = 0.0; a2 = 0.0;
             return { b0, b1, b2, a1, a2, false };
         }
 
-        constexpr float pi = 3.14159265358979f;
-        float w0    = 2.0f * pi * freq / static_cast<float> (sampleRate);
-        float cosw0 = std::cos (w0);
-        float sinw0 = std::sin (w0);
+        constexpr double pi = 3.14159265358979323846;
+        double w0    = 2.0 * pi * freq / sampleRate;
+        double cosw0 = std::cos (w0);
+        double sinw0 = std::sin (w0);
 
-        float a0_inv = 1.0f;
+        double a0_inv = 1.0;
 
         switch (shape)
         {
             case 1: // LowCut (high-pass)
             {
-                float alpha = sinw0 / (2.0f * q);
-                a0_inv = 1.0f / (1.0f + alpha);
-                b0 =  ((1.0f + cosw0) / 2.0f) * a0_inv;
-                b1 = -(1.0f + cosw0) * a0_inv;
-                b2 =  ((1.0f + cosw0) / 2.0f) * a0_inv;
-                a1 = (-2.0f * cosw0) * a0_inv;
-                a2 = (1.0f - alpha) * a0_inv;
+                double alpha = sinw0 / (2.0 * q);
+                a0_inv = 1.0 / (1.0 + alpha);
+                b0 =  ((1.0 + cosw0) / 2.0) * a0_inv;
+                b1 = -(1.0 + cosw0) * a0_inv;
+                b2 =  ((1.0 + cosw0) / 2.0) * a0_inv;
+                a1 = (-2.0 * cosw0) * a0_inv;
+                a2 = (1.0 - alpha) * a0_inv;
                 break;
             }
 
             case 2: // LowShelf
             {
-                float A = std::pow (10.0f, gainDb / 40.0f);
-                float alpha = (sinw0 / 2.0f) * std::sqrt (
-                    (A + 1.0f / A) * (1.0f / slope - 1.0f) + 2.0f);
-                float sqrtA2alpha = 2.0f * std::sqrt (A) * alpha;
+                double A = std::pow (10.0, gainDb / 40.0);
+                double alpha = (sinw0 / 2.0) * std::sqrt (
+                    (A + 1.0 / A) * (1.0 / slope - 1.0) + 2.0);
+                double sqrtA2alpha = 2.0 * std::sqrt (A) * alpha;
 
-                a0_inv = 1.0f / ((A + 1.0f) + (A - 1.0f) * cosw0 + sqrtA2alpha);
-                b0 =       A * ((A + 1.0f) - (A - 1.0f) * cosw0 + sqrtA2alpha) * a0_inv;
-                b1 = 2.0f * A * ((A - 1.0f) - (A + 1.0f) * cosw0)              * a0_inv;
-                b2 =       A * ((A + 1.0f) - (A - 1.0f) * cosw0 - sqrtA2alpha) * a0_inv;
-                a1 = -2.0f *    ((A - 1.0f) + (A + 1.0f) * cosw0)              * a0_inv;
-                a2 =            ((A + 1.0f) + (A - 1.0f) * cosw0 - sqrtA2alpha) * a0_inv;
+                a0_inv = 1.0 / ((A + 1.0) + (A - 1.0) * cosw0 + sqrtA2alpha);
+                b0 =       A * ((A + 1.0) - (A - 1.0) * cosw0 + sqrtA2alpha) * a0_inv;
+                b1 = 2.0 * A * ((A - 1.0) - (A + 1.0) * cosw0)              * a0_inv;
+                b2 =       A * ((A + 1.0) - (A - 1.0) * cosw0 - sqrtA2alpha) * a0_inv;
+                a1 = -2.0 *    ((A - 1.0) + (A + 1.0) * cosw0)              * a0_inv;
+                a2 =            ((A + 1.0) + (A - 1.0) * cosw0 - sqrtA2alpha) * a0_inv;
                 break;
             }
 
             case 3: // Peak / Notch
             {
-                float A = std::pow (10.0f, gainDb / 40.0f);
-                float alpha = sinw0 / (2.0f * q);
+                double A = std::pow (10.0, gainDb / 40.0);
+                double alpha = sinw0 / (2.0 * q);
 
-                a0_inv = 1.0f / (1.0f + alpha / A);
-                b0 = (1.0f + alpha * A) * a0_inv;
-                b1 = (-2.0f * cosw0)    * a0_inv;
-                b2 = (1.0f - alpha * A) * a0_inv;
-                a1 = (-2.0f * cosw0)    * a0_inv;
-                a2 = (1.0f - alpha / A) * a0_inv;
+                a0_inv = 1.0 / (1.0 + alpha / A);
+                b0 = (1.0 + alpha * A) * a0_inv;
+                b1 = (-2.0 * cosw0)    * a0_inv;
+                b2 = (1.0 - alpha * A) * a0_inv;
+                a1 = (-2.0 * cosw0)    * a0_inv;
+                a2 = (1.0 - alpha / A) * a0_inv;
                 break;
             }
 
             case 4: // BandPass (constant 0 dB peak gain)
             {
-                float alpha = sinw0 / (2.0f * q);
-                a0_inv = 1.0f / (1.0f + alpha);
+                double alpha = sinw0 / (2.0 * q);
+                a0_inv = 1.0 / (1.0 + alpha);
                 b0 =  alpha            * a0_inv;
-                b1 =  0.0f;
+                b1 =  0.0;
                 b2 = -alpha            * a0_inv;
-                a1 = (-2.0f * cosw0)   * a0_inv;
-                a2 = (1.0f - alpha)    * a0_inv;
+                a1 = (-2.0 * cosw0)   * a0_inv;
+                a2 = (1.0 - alpha)    * a0_inv;
                 break;
             }
 
             case 5: // HighShelf
             {
-                float A = std::pow (10.0f, gainDb / 40.0f);
-                float alpha = (sinw0 / 2.0f) * std::sqrt (
-                    (A + 1.0f / A) * (1.0f / slope - 1.0f) + 2.0f);
-                float sqrtA2alpha = 2.0f * std::sqrt (A) * alpha;
+                double A = std::pow (10.0, gainDb / 40.0);
+                double alpha = (sinw0 / 2.0) * std::sqrt (
+                    (A + 1.0 / A) * (1.0 / slope - 1.0) + 2.0);
+                double sqrtA2alpha = 2.0 * std::sqrt (A) * alpha;
 
-                a0_inv = 1.0f / ((A + 1.0f) - (A - 1.0f) * cosw0 + sqrtA2alpha);
-                b0 =       A * ((A + 1.0f) + (A - 1.0f) * cosw0 + sqrtA2alpha) * a0_inv;
-                b1 = -2.0f * A * ((A - 1.0f) + (A + 1.0f) * cosw0)              * a0_inv;
-                b2 =       A * ((A + 1.0f) + (A - 1.0f) * cosw0 - sqrtA2alpha) * a0_inv;
-                a1 =  2.0f *    ((A - 1.0f) - (A + 1.0f) * cosw0)              * a0_inv;
-                a2 =            ((A + 1.0f) - (A - 1.0f) * cosw0 - sqrtA2alpha) * a0_inv;
+                a0_inv = 1.0 / ((A + 1.0) - (A - 1.0) * cosw0 + sqrtA2alpha);
+                b0 =       A * ((A + 1.0) + (A - 1.0) * cosw0 + sqrtA2alpha) * a0_inv;
+                b1 = -2.0 * A * ((A - 1.0) + (A + 1.0) * cosw0)              * a0_inv;
+                b2 =       A * ((A + 1.0) + (A - 1.0) * cosw0 - sqrtA2alpha) * a0_inv;
+                a1 =  2.0 *    ((A - 1.0) - (A + 1.0) * cosw0)              * a0_inv;
+                a2 =            ((A + 1.0) - (A - 1.0) * cosw0 - sqrtA2alpha) * a0_inv;
                 break;
             }
 
             case 6: // HighCut (low-pass)
             {
-                float alpha = sinw0 / (2.0f * q);
-                a0_inv = 1.0f / (1.0f + alpha);
-                b0 = ((1.0f - cosw0) / 2.0f) * a0_inv;
-                b1 =  (1.0f - cosw0)         * a0_inv;
-                b2 = ((1.0f - cosw0) / 2.0f) * a0_inv;
-                a1 = (-2.0f * cosw0)         * a0_inv;
-                a2 = (1.0f - alpha)          * a0_inv;
+                double alpha = sinw0 / (2.0 * q);
+                a0_inv = 1.0 / (1.0 + alpha);
+                b0 = ((1.0 - cosw0) / 2.0) * a0_inv;
+                b1 =  (1.0 - cosw0)         * a0_inv;
+                b2 = ((1.0 - cosw0) / 2.0) * a0_inv;
+                a1 = (-2.0 * cosw0)         * a0_inv;
+                a2 = (1.0 - alpha)          * a0_inv;
                 break;
             }
 
             case 7: // AllPass (2nd-order)
             {
-                float alpha = sinw0 / (2.0f * q);
-                a0_inv = 1.0f / (1.0f + alpha);
-                b0 = (1.0f - alpha)   * a0_inv;
-                b1 = (-2.0f * cosw0)  * a0_inv;
-                b2 = (1.0f + alpha)   * a0_inv;
-                a1 = (-2.0f * cosw0)  * a0_inv;
-                a2 = (1.0f - alpha)   * a0_inv;
+                double alpha = sinw0 / (2.0 * q);
+                a0_inv = 1.0 / (1.0 + alpha);
+                b0 = (1.0 - alpha)   * a0_inv;
+                b1 = (-2.0 * cosw0)  * a0_inv;
+                b2 = (1.0 + alpha)   * a0_inv;
+                a1 = (-2.0 * cosw0)  * a0_inv;
+                a2 = (1.0 - alpha)   * a0_inv;
                 break;
             }
 
             default:
-                b0 = 1.0f; b1 = 0.0f; b2 = 0.0f;
-                a1 = 0.0f; a2 = 0.0f;
+                b0 = 1.0; b1 = 0.0; b2 = 0.0;
+                a1 = 0.0; a2 = 0.0;
                 break;
         }
 
@@ -232,12 +232,14 @@ public:
         if (shape == 0)
             return input;
 
-        float output = b0 * input + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+        // Double state and coefficients (see BiquadCoefficients); float in and out.
+        const double in = input;
+        const double output = b0 * in + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
         x2 = x1;
-        x1 = input;
+        x1 = in;
         y2 = y1;
         y1 = output;
-        return output;
+        return static_cast<float> (output);
     }
 
     void processBlock (float* samples, int numSamples)
@@ -265,11 +267,11 @@ private:
     float slope  = 0.7f;
     double sampleRate = 48000.0;
 
-    float b0 = 1.0f, b1 = 0.0f, b2 = 0.0f;
-    float a1 = 0.0f, a2 = 0.0f;
+    double b0 = 1.0, b1 = 0.0, b2 = 0.0;
+    double a1 = 0.0, a2 = 0.0;
 
-    float x1 = 0.0f, x2 = 0.0f;
-    float y1 = 0.0f, y2 = 0.0f;
+    double x1 = 0.0, x2 = 0.0;
+    double y1 = 0.0, y2 = 0.0;
 };
 
 } // namespace spatcore::dsp

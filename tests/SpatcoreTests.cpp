@@ -2884,16 +2884,17 @@ struct RefBiquad
 
     float processSample (float input) noexcept
     {
-        float output = b0 * input + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
+        const double in = input;
+        const double output = b0 * in + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2;
         x2 = x1;
-        x1 = input;
+        x1 = in;
         y2 = y1;
         y1 = output;
-        return output;
+        return static_cast<float> (output);
     }
 
-    float b0 = 1.0f, b1 = 0.0f, b2 = 0.0f, a1 = 0.0f, a2 = 0.0f;
-    float x1 = 0.0f, x2 = 0.0f, y1 = 0.0f, y2 = 0.0f;
+    double b0 = 1.0, b1 = 0.0, b2 = 0.0, a1 = 0.0, a2 = 0.0;
+    double x1 = 0.0, x2 = 0.0, y1 = 0.0, y2 = 0.0;
 };
 
 //==============================================================================
@@ -6941,12 +6942,14 @@ static void testDistortionShelves()
     // 10^(gainDb/20), so 0.1 in gives 0.1, 0.398107 and 0.0251189. The
     // prototype's shelves can only ever BOOST (0 dB is +1.00 dB there, -12 dB
     // still +0.25 dB), so a faithful port fails the cut. 20000 samples is ~46
-    // time constants of a 20 Hz corner; 2 % covers the float32 steady state.
+    // time constants of a 20 Hz corner. 0.2 %: the shelves design and run in
+    // double now; in float the coefficient rounding alone put -12 dB 1-4 % off
+    // and -24 dB 8.6 % off, by a libm-dependent amount (a new CI image tripped it).
     {
-        const float gains[3]    = { 0.0f, 12.0f, -12.0f };
-        const float expected[3] = { 0.0f, 0.398107f, 0.0251189f };  // [0] unused: 0 dB takes the bit-exact branch
+        const float gains[4]    = { 0.0f, 12.0f, -12.0f, -24.0f };
+        const float expected[4] = { 0.0f, 0.398107f, 0.0251189f, 0.00630957f };  // [0] unused: 0 dB takes the bit-exact branch
 
-        for (int k = 0; k < 3; ++k)
+        for (int k = 0; k < 4; ++k)
         {
             DistortionModule m;
             m.prepare (module_test::config (48000.0, 256));
@@ -6960,7 +6963,7 @@ static void testDistortionShelves()
             if (k == 0)
                 CHECK (bitEqualFloat (buf[19999], 0.1f));   // 0 dB is OFF, not "nearly unity"
             else
-                CHECK (std::fabs (buf[19999] - expected[k]) < 0.02f * expected[k]);
+                CHECK (std::fabs (buf[19999] - expected[k]) < 0.002f * expected[k]);
         }
     }
 }
