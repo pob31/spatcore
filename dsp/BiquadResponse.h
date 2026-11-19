@@ -25,7 +25,12 @@ namespace spatcore::dsp {
 */
 struct BiquadCoefficients
 {
-    float b0 = 1.0f, b1 = 0.0f, b2 = 0.0f, a1 = 0.0f, a2 = 0.0f;
+    // Double: float coefficients are not precise enough for low corners. At
+    // 20 Hz / 48 kHz cos(w0) is 1 - 3.4e-6, so a shelf's DC gain is a ratio of
+    // two numbers near 1e-5, and float rounding moved it by up to 8.6 % (0.8 dB)
+    // - by a different amount on every libm, which is how a new CI runner image
+    // caught it. The filters design and run in double; the curve uses the same set.
+    double b0 = 1.0, b1 = 0.0, b2 = 0.0, a1 = 0.0, a2 = 0.0;
     bool active = false;
 };
 
@@ -38,8 +43,8 @@ struct BiquadCoefficients
         H(z) = (b0 + b1*z^-1 + b2*z^-2) / (1 + a1*z^-1 + a2*z^-2)
 
     This is *display* math, not audio math, so the evaluation is done in
-    double precision throughout even though the coefficients themselves are
-    the float values the audio path actually runs — precision beats speed
+    double precision throughout on the very coefficients the audio path
+    runs — precision beats speed
     here, and a smooth curve matters more than a cycle or two.
 
     Behaviour at the edges:
