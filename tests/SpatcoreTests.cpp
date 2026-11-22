@@ -8043,6 +8043,184 @@ static void testDynamicsVariantAndLatency()
     }
 }
 
+static void testDynamicsKeyedEntry()
+{
+    using namespace spatcore::effects;
+
+    // processKeyed: every channel of a signal under one gain, the detector fed
+    // by a key of at most two sides, the louder filtered side heard.
+    const auto keyed = [] (DynamicsModule& m, std::vector<std::vector<float>>& channels,
+                           const std::vector<const std::vector<float>*>& key, int chunk = 256)
+    {
+        const int n = (int) channels[0].size();
+
+        for (int at = 0; at < n; at += chunk)
+        {
+            const int len = std::min (chunk, n - at);
+            std::vector<float*> out;
+            std::vector<const float*> in;
+
+            for (auto& c : channels)
+                out.push_back (c.data() + at);
+
+            for (const auto* k : key)
+                in.push_back (k->data() + at);
+
+            m.processKeyed (out.data(), (int) out.size(), in.empty() ? nullptr : in.data(), (int) in.size(), len);
+        }
+    };
+
+    const auto settings = [] (bool rms)
+    {
+        EffectChannelParams p = dyntests::base();
+        p.dyn[0].compOn = 1;                p.dyn[0].expOn = 1;
+        p.dyn[0].detector = rms ? 1 : 0;
+        p.dyn[0].compThresholdDb = -20.0f;  p.dyn[0].compRatio = 4.0f;
+        p.dyn[0].compAttackMs = 5.0f;       p.dyn[0].compReleaseMs = 50.0f;
+        p.dyn[0].compKneeDb = 6.0f;         p.dyn[0].compDetectorDelayMs = 2.0f;
+        p.dyn[0].expThresholdDb = -50.0f;   p.dyn[0].expRatio = 3.0f;
+        p.dyn[0].expRangeDb = -40.0f;       p.dyn[0].expHoldMs = 10.0f;
+        p.dyn[0].compScLoCutHz = 80.0f;     p.dyn[0].compScHiCutHz = 12000.0f;
+        p.dyn[0].makeupDb = 3.0f;
+        return p;
+    };
+
+    // 1. KEYED BY THE SIGNAL ITSELF, ONE CHANNEL, IS process() TO THE BIT, peak
+    //    and RMS: the laws are the same code, split only at the filter.
+    for (int rms = 0; rms < 2; ++rms)
+    {
+        DynamicsModule plain, keyedOne;
+        plain.prepare (module_test::config());
+        keyedOne.prepare (module_test::config());
+        plain.applyParams (settings (rms != 0), 0);
+        keyedOne.applyParams (settings (rms != 0), 0);
+
+        std::vector<float> in = dyntests::sine (24000, 1000.0f, 0.5f);
+        for (int i = 8000; i < 16000; ++i)
+            in[(size_t) i] *= 0.001f;                       // a quiet stretch, for the expander
+
+        std::vector<float> a = in;
+        for (int at = 0; at < (int) a.size(); at += 256)
+            plain.process (a.data() + at, std::min (256, (int) a.size() - at));
+
+        std::vector<std::vector<float>> b { in };
+        keyed (keyedOne, b, { &in });
+
+        CHECK (eqtests::bitEqualBlock (a, b[0]));
+        CHECK (bitEqualFloat (plain.getMeterDb(), keyedOne.getMeterDb()));
+    }
+
+    EffectChannelParams comp = dyntests::base();
+    comp.dyn[0].compOn = 1;
+    comp.dyn[0].detector = 1;
+    comp.dyn[0].compThresholdDb = -20.0f;  comp.dyn[0].compRatio = 4.0f;
+    comp.dyn[0].compAttackMs = 5.0f;       comp.dyn[0].compReleaseMs = 50.0f;
+
+    const std::vector<float> loud = dyntests::sine (48000, 1000.0f, 0.5f);
+    const std::vector<float> soft = dyntests::sine (48000, 1000.0f, 0.05f);
+    const std::vector<float> nothing ((size_t) 48000, 0.0f);
+
+    // 2. AN EXTERNAL KEY: a soft signal under a loud key takes the key's law -
+    //    the gain testDynamicsCompressorLaw measures for the loud sine itself.
+    {
+        DynamicsModule m;
+        m.prepare (module_test::config());
+        m.applyParams (comp, 0);
+
+        std::vector<std::vector<float>> out { soft };
+        keyed (m, out, { &loud });
+
+        CHECK (std::fabs (dyntests::steadyGain (out[0], soft, 40000, 48000) - 0.38785f) <= 0.008f);
+        CHECK (std::fabs (m.getMeterDb() + 8.227f) <= 0.3f);
+    }
+
+    // 3. LINKED: two channels, loud and soft, keyed by themselves - one gain,
+    //    the louder side's, on both; the picture does not move.
+    {
+        DynamicsModule m;
+        m.prepare (module_test::config());
+        m.applyParams (comp, 0);
+
+        std::vector<std::vector<float>> out { loud, soft };
+        keyed (m, out, { &loud, &soft });
+
+        const float left = dyntests::steadyGain (out[0], loud, 40000, 48000);
+        const float right = dyntests::steadyGain (out[1], soft, 40000, 48000);
+        CHECK (std::fabs (left - 0.38785f) <= 0.008f);
+        CHECK (std::fabs (left - right) <= 1.0e-4f);
+    }
+
+    // 4. THE LOUDER SIDE IS HEARD, whichever side it is on.
+    {
+        DynamicsModule m;
+        m.prepare (module_test::config());
+        m.applyParams (comp, 0);
+
+        std::vector<std::vector<float>> out { soft };
+        keyed (m, out, { &nothing, &loud });
+        CHECK (std::fabs (dyntests::steadyGain (out[0], soft, 40000, 48000) - 0.38785f) <= 0.008f);
+    }
+
+    // 5. NO KEY IS A SILENT KEY: the compressor rests, to the bit...
+    {
+        DynamicsModule m;
+        m.prepare (module_test::config());
+        m.applyParams (comp, 0);
+
+        std::vector<std::vector<float>> out { loud, soft };
+        keyed (m, out, {});
+        CHECK (eqtests::bitEqualBlock (out[0], loud));
+        CHECK (eqtests::bitEqualBlock (out[1], soft));
+        CHECK (m.getMeterDb() == 0.0f);
+    }
+
+    //    ...and the expander closes to its range, as on a silent input: a gate
+    //    keyed by nothing is shut.
+    {
+        EffectChannelParams gate = dyntests::base();
+        gate.dyn[0].expOn = 1;
+        gate.dyn[0].expThresholdDb = -40.0f;  gate.dyn[0].expRatio = 10.0f;
+        gate.dyn[0].expRangeDb = -40.0f;      gate.dyn[0].expHoldMs = 10.0f;   // no chatter at the key's zero crossings
+        gate.dyn[0].expAttackMs = 1.0f;       gate.dyn[0].expReleaseMs = 20.0f;
+
+        DynamicsModule m;
+        m.prepare (module_test::config());
+        m.applyParams (gate, 0);
+
+        std::vector<std::vector<float>> out { loud };
+        keyed (m, out, { &nothing });
+        CHECK (std::fabs (dyntests::steadyGain (out[0], loud, 40000, 48000) - 0.01f) <= 0.001f);
+
+        //  Opened by a key above its threshold, though the signal is the same.
+        DynamicsModule open;
+        open.prepare (module_test::config());
+        open.applyParams (gate, 0);
+
+        std::vector<std::vector<float>> heard { soft };
+        keyed (open, heard, { &loud });
+        CHECK (std::fabs (dyntests::steadyGain (heard[0], soft, 40000, 48000) - 1.0f) <= 0.001f);
+    }
+
+    // 6. THE KEY'S FILTERS ARE THE STAGE'S: a 50 Hz key under a 500 Hz low cut
+    //    barely reaches the detector, where a 1 kHz one does.
+    {
+        EffectChannelParams cut = comp;
+        cut.dyn[0].compScLoCutHz = 500.0f;
+
+        DynamicsModule m;
+        m.prepare (module_test::config());
+        m.applyParams (cut, 0);
+
+        const std::vector<float> rumble = dyntests::sine (48000, 50.0f, 0.5f);
+        std::vector<std::vector<float>> out { soft, soft };
+        keyed (m, out, { &rumble, &rumble });
+        CHECK (dyntests::steadyGain (out[0], soft, 40000, 48000) > 0.9f);
+    }
+
+    // 7. AND process() IS WHAT IT WAS: nothing above touched it - the identity
+    //    and law tests before this one run unchanged.
+}
+
 static void testDynamicsSampleRates()
 {
     using namespace spatcore::effects;
@@ -15845,6 +16023,7 @@ int main()
         testDynamicsVariantAndLatency();
         testDynamicsSampleRates();
         testDynamicsExtremesAndDeterminism();
+        testDynamicsKeyedEntry();
         testModulationTransparency();
         testModulationThroughZeroAtMixZero();
         testModulationDelayLaw();

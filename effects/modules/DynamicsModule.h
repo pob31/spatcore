@@ -86,6 +86,21 @@ namespace spatcore::effects
     both wait for the slot to reach silence rather than stepping mid-signal.
 
     prepare() allocates the two delay lines; nothing else allocates.
+
+    A KEYED, LINKED ENTRY sits beside process(), for a host that applies one
+    gain to a whole multichannel signal and listens to a key of its own - a
+    sidechain from somewhere else, or the signal itself as the host chooses to
+    present it. processKeyed takes every channel of the signal and at most two
+    channels of key: each key side runs through the stage's own sidechain
+    filters (a second pair per stage, set from the same parameters, so the two
+    sides are filtered alike), the LOUDER filtered side feeds the detector, and
+    the one gain that results - compressor, expander, makeup - multiplies every
+    channel alike, so a stereo or wider picture does not move. No key at all is
+    a silent key: the compressor rests and the expander closes to its range, as
+    they would on a silent input. The keyed entry never delays the audio: a
+    host using it keeps lookaheadMs at 0, and the entry ignores a lookahead
+    that is set. Its gain laws are the very ones process() runs - the shared
+    part was only split at the filter - so process() is unchanged to the bit.
 */
 class DynamicsModule : public IEffectModule
 {
@@ -201,6 +216,8 @@ public:
                                                      detectorLine.getMaxDelaySamples()));
         compressor.loCut.setParameters (1, clamp (d.compScLoCutHz, 20.0f, 2000.0f), 0.0f, kSidechainQ, 0.7f);
         compressor.hiCut.setParameters (6, clamp (d.compScHiCutHz, scHiMin, scHiMax), 0.0f, kSidechainQ, 0.7f);
+        compressor.loCutB.setParameters (1, clamp (d.compScLoCutHz, 20.0f, 2000.0f), 0.0f, kSidechainQ, 0.7f);
+        compressor.hiCutB.setParameters (6, clamp (d.compScHiCutHz, scHiMin, scHiMax), 0.0f, kSidechainQ, 0.7f);
 
         expander.thresholdDb.setTarget (clamp (d.expThresholdDb, -90.0f, 0.0f));
         expander.slope.setTarget (clamp (d.expRatio, 1.0f, 100.0f) - 1.0f);   // never negative
@@ -210,6 +227,8 @@ public:
         expHoldSamples = static_cast<int> (clamp (d.expHoldMs, 0.0f, 500.0f) * 0.001f * sr + 0.5f);
         expander.loCut.setParameters (1, clamp (d.expScLoCutHz, 20.0f, 2000.0f), 0.0f, kSidechainQ, 0.7f);
         expander.hiCut.setParameters (6, clamp (d.expScHiCutHz, scHiMin, scHiMax), 0.0f, kSidechainQ, 0.7f);
+        expander.loCutB.setParameters (1, clamp (d.expScLoCutHz, 20.0f, 2000.0f), 0.0f, kSidechainQ, 0.7f);
+        expander.hiCutB.setParameters (6, clamp (d.expScHiCutHz, scHiMin, scHiMax), 0.0f, kSidechainQ, 0.7f);
 
         float makeup = clamp (d.makeupDb, -24.0f, 24.0f);
 
@@ -322,6 +341,58 @@ public:
                        std::memory_order_relaxed);
     }
 
+    /** THE KEYED, LINKED ENTRY (see the class comment). `channels` holds
+        `numChannels` pointers of `numSamples` frames, changed in place by one
+        gain; `key` holds `keyChannels` read-only pointers of the same length,
+        of which the first two are heard - none, or a null `key`, is a silent
+        key. Real-time safe as process() is: no allocation, no lock. */
+    void processKeyed (float* const* channels, int numChannels,
+                       const float* const* key, int keyChannels, int numSamples) noexcept
+    {
+        const bool compActive = compOn;
+        const bool expActive = expOn;
+
+        if (! compActive && ! expActive && makeupGain.isSettled() && makeupGain.getCurrent() == 1.0f)
+        {
+            meterDb.store (0.0f, std::memory_order_relaxed);
+            return;
+        }
+
+        const int sides = (key == nullptr) ? 0 : (keyChannels < 0 ? 0 : (keyChannels > 2 ? 2 : keyChannels));
+        float minGain = 1.0f;
+        compressor.scPeak = 0.0f;
+        expander.scPeak = 0.0f;
+
+        for (int i = 0; i < numSamples; ++i)
+        {
+            float gain = 1.0f;
+
+            if (compActive)
+                gain *= compressorGainOf (keySidechain (compressor, key, sides, i));
+
+            if (expActive)
+                gain *= expanderGainOf (keySidechain (expander, key, sides, i));
+
+            // One gain for every channel; a total of exactly one leaves them
+            // untouched, for process()'s reason.
+            const float g = gain * makeupGain.next();
+
+            if (g != 1.0f)
+                for (int c = 0; c < numChannels; ++c)
+                    if (channels[c] != nullptr)
+                        channels[c][i] *= g;
+
+            if (gain < minGain)
+                minGain = gain;
+        }
+
+        if (numSamples > 0)
+            flushSilentDetectors (compActive, expActive);
+
+        meterDb.store (minGain < 1.0f ? spatcore::dsp::FastDecibels::gainToDb (minGain) : 0.0f,
+                       std::memory_order_relaxed);
+    }
+
     int getLatencySamples() const noexcept override
     {
         return runningLookaheadSamples.load (std::memory_order_relaxed);
@@ -375,6 +446,7 @@ private:
     struct Stage
     {
         spatcore::dsp::OutputEQBiquadFilter loCut, hiCut;
+        spatcore::dsp::OutputEQBiquadFilter loCutB, hiCutB;     // a keyed entry's second side
         spatcore::dsp::EnvelopeFollower detector;
         spatcore::dsp::OnePoleSmoother thresholdDb, slope;
         GainRamp gain;
@@ -406,6 +478,8 @@ private:
     {
         s.loCut.prepare (sampleRate);
         s.hiCut.prepare (sampleRate);
+        s.loCutB.prepare (sampleRate);
+        s.hiCutB.prepare (sampleRate);
         s.detector.prepare (sampleRate);
         s.thresholdDb.setTimeConstant (sampleRate, kParamTauSeconds);
         s.thresholdDb.setSnapEpsilon (1.0e-3f);
@@ -417,6 +491,8 @@ private:
     {
         s.loCut.reset();
         s.hiCut.reset();
+        s.loCutB.reset();
+        s.hiCutB.reset();
         s.detector.reset();
         s.gain.snap (1.0f);                 // unity, so the first block is not attenuated
         s.scPeak = 0.0f;
@@ -471,7 +547,12 @@ private:
     {
         float sc = compressor.loCut.processSample (x);
         sc = compressor.hiCut.processSample (sc);
+        return compressorGainOf (sc);
+    }
 
+    /** The compressor's law on a sidechain sample already filtered. */
+    float compressorGainOf (float sc) noexcept
+    {
         const float mag = std::fabs (sc);
         if (mag > compressor.scPeak)
             compressor.scPeak = mag;
@@ -510,7 +591,12 @@ private:
     {
         float sc = expander.loCut.processSample (x);
         sc = expander.hiCut.processSample (sc);
+        return expanderGainOf (sc);
+    }
 
+    /** The expander's law on a sidechain sample already filtered. */
+    float expanderGainOf (float sc) noexcept
+    {
         const float mag = std::fabs (sc);
         if (mag > expander.scPeak)
             expander.scPeak = mag;
@@ -547,6 +633,23 @@ private:
         return expander.gain.next (spatcore::dsp::FastDecibels::dbToGain (gainDb));
     }
 
+    /** A KEY'S SIDECHAIN SAMPLE for one stage (processKeyed): each side
+        through its own filter pair, the louder filtered side kept, its sign
+        with it. A silent key is a sidechain of zero. */
+    static float keySidechain (Stage& s, const float* const* key, int sides, int i) noexcept
+    {
+        if (sides <= 0 || key[0] == nullptr)
+            return s.hiCut.processSample (s.loCut.processSample (0.0f));
+
+        const float a = s.hiCut.processSample (s.loCut.processSample (key[0][i]));
+
+        if (sides < 2 || key[1] == nullptr)
+            return a;
+
+        const float b = s.hiCutB.processSample (s.loCutB.processSample (key[1][i]));
+        return std::fabs (b) > std::fabs (a) ? b : a;
+    }
+
     /** The sidechain filters are the only state here that can spend a long time
         in denormals, and they feed nothing but the detector. Once a whole block
         has stayed below -500 dBFS, clearing them costs nothing audible and
@@ -568,9 +671,13 @@ private:
 
         compressor.loCut.reset();
         compressor.hiCut.reset();
+        compressor.loCutB.reset();
+        compressor.hiCutB.reset();
         compressor.detector.reset();
         expander.loCut.reset();
         expander.hiCut.reset();
+        expander.loCutB.reset();
+        expander.hiCutB.reset();
         expander.detector.reset();
     }
 
