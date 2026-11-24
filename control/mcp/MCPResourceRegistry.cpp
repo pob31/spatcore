@@ -86,6 +86,16 @@ namespace
             "by design, the three integrated algorithms (SDN, FDN, IR) and when to use each."
         },
         {
+            "wfs://knowledge/effects",
+            "knowledge_effects.md",
+            "Effects channels",
+            "What an effects channel is (inputs and other effects feed a chain of eleven modules whose "
+            "return is a WFS source on stage), what it is good for - spatial reverb returns, travelling "
+            "delay throws, echoes into a reverb, widening, parallel compression, movement - with the tool "
+            "sequence for each, link groups, the Effects Matrix and its loop guard, and which tools to use. "
+            "Read this before building or editing effects."
+        },
+        {
             "wfs://knowledge/gradient_maps",
             "knowledge_gradient_maps.md",
             "Gradient maps",
